@@ -1,0 +1,111 @@
+name: C/C++ CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [clang++, g++]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential \
+          cmake \
+          clang \
+          clang-tidy \
+          librocksdb-dev \
+          liblmdb-dev \
+          libtbb-dev \
+          libaio-dev \
+          gdb
+        # Pinned clang-format binary (PyPI bundles the exact LLVM build): the
+        # format gate must run the identical binary in CI and on dev machines
+        # (this repo: 18.1.3). Never use the distro's unversioned package here;
+        # its version drifts with the runner image and flags different lines.
+        python3 -m pip install --user "clang-format==18.1.3"
+
+    - name: Verify Code Formatting
+      run: |
+        # Run clang-format dry-run to check for style violations in C++ files
+        export PATH="$HOME/.local/bin:$PATH"
+        find src tests benchmark include example \( -name "*.cpp" -o -name "*.hpp" \) -print0 | xargs -0 clang-format --dry-run --Werror
+
+    - name: Configure CMake
+      run: |
+        cmake -S . -B build \
+          -DCMAKE_CXX_COMPILER=${{ matrix.compiler }} \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_WARN_DEPRECATED=OFF \
+          -DENABLE_ROCKSDB=ON \
+          -DENABLE_LMDB=ON \
+          -DENABLE_LEANSTORE=ON
+
+    - name: Run clang-tidy Static Analysis
+      if: matrix.compiler == 'clang++'
+      run: |
+        cmake --build build --target clang-tidy-check
+
+    - name: Build
+      run: |
+        cmake --build build --config Release
+
+    - name: Run Tests
+      run: |
+        cd build
+        # Watchdog: 300s is generously past the parallel suite's normal ~2-4min runtime but well
+        # short of ctest's own TIMEOUT below, so if a test binary is still alive at that point,
+        # it's stuck, not just slow -- dump every thread's backtrace via gdb before ctest's
+        # TIMEOUT kills it, since a killed process's buffered stdout is otherwise lost with no
+        # way to inspect it.
+        ( sleep 300
+          for pid in $(pgrep -f 'tests/test_'); do
+            echo "=== WATCHDOG: test binary (pid $pid) still running after 300s -- dumping backtraces ==="
+            sudo gdb -p "$pid" -batch -ex "thread apply all bt" -ex detach || true
+          done
+        ) &
+        watchdog_pid=$!
+        ctest --output-on-failure -j "$(nproc)"
+        ctest_exit=$?
+        kill "$watchdog_pid" 2>/dev/null || true
+        exit "$ctest_exit"
+
+  install-check:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential cmake g++
+
+    - name: Build and Install
+      run: |
+        cmake -S . -B build-install \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DENABLE_TESTS=OFF \
+          -DENABLE_BENCHMARK=OFF \
+          -DCMAKE_INSTALL_PREFIX="$HOME/vmemkv-install"
+        cmake --build build-install --parallel
+        cmake --install build-install
+
+    - name: Downstream find_package Smoke Test
+      run: |
+        cmake -S example -B /tmp/vmemkv-consumer/build \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_PREFIX_PATH="$HOME/vmemkv-install"
+        cmake --build /tmp/vmemkv-consumer/build --parallel
+        /tmp/vmemkv-consumer/build/vmemkv_example

@@ -1,0 +1,16 @@
+---
+Checks: >
+  -*,
+  bugprone-*,
+  performance-*,
+  modernize-*,
+  readability-*
+
+WarningsAsErrors: >
+  bugprone-*,
+  performance-*,
+  modernize-*,
+  readability-*
+
+HeaderFilterRegex: '(^|.*/)(src|include/vmemkv)/.*\.(hpp|cpp)$'
+FormatStyle: none

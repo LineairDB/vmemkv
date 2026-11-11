@@ -1,0 +1,74 @@
+# =============================
+# OS / file manager artifacts
+# =============================
+# Bare name (no slash) already matches at any depth, so no **/ duplicate.
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# =============================
+# Editor / IDE artifacts
+# =============================
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# =============================
+# C++ / build system artifacts
+# =============================
+# Bare dir names match at any depth (no **/ duplicate needed).
+build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+install_manifest.txt
+CTestTestfile.cmake
+# CTest output for in-source configures; out-of-source runs land under build/ above.
+Testing/
+
+Makefile
+*.ninja
+.ninja_*
+compile_commands.json
+
+# =============================
+# Compiled objects / binaries
+# =============================
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
+*.dSYM/
+
+# =============================
+# Logs / temporary files
+# =============================
+# *.log covers log files; the dir pattern below keeps the benchmark log dir itself ignored.
+*.log
+*.tmp
+*.temp
+*.bak
+
+# =============================
+# Markdown tooling cache
+# =============================
+.markdownlintcache
+
+# =============================
+# Python cache
+# =============================
+__pycache__/
+*.pyc
+
+# =============================
+# VMemKV Benchmark & DB Files
+# =============================
+*.bin
+*.db
+benchmark/logs/

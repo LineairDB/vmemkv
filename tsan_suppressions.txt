@@ -1,0 +1,27 @@
+# ThreadSanitizer suppressions for VMemKV.
+#
+# Usage: TSAN_OPTIONS="suppressions=$(pwd)/tsan_suppressions.txt" ./build_tsan/tests/test_kv_store
+# (this project has no TSan job in CI -- this file is for ad-hoc local investigation only.)
+#
+# Suppression matching requires symbolization, which needs a working external symbolizer
+# subprocess (llvm-symbolizer). In at least one sandboxed environment this hung indefinitely
+# ("Can't read from symbolizer at fd 5"); pointing TSAN_OPTIONS at `addr2line` instead worked:
+# TSAN_OPTIONS="suppressions=... external_symbolizer_path=$(which addr2line)"
+#
+# T2's seqlock-protected reads (read_t2_record_seqlock() in vmemkv_impl.hpp) copy a record's
+# key/value bytes with plain (non-atomic) reads while T2FlatFile::update_value_at() may be
+# concurrently overwriting the same bytes with a plain memcpy. This is a real race in the C++
+# abstract-machine sense, but the seqlock's version-check-before/after retry loop discards any
+# read that overlapped a concurrent write -- a torn read is never actually used, only retried.
+# `AnnotateBenignRaceSized` (the standard way to tell TSan this precisely) isn't available in
+# either toolchain this project builds with (checked clang-18 and gcc-13's sanitizer headers:
+# neither ships dynamic_annotations.h), hence a suppressions file instead of an inline annotation.
+#
+# Verified empirically (not just "believed safe"): extensive concurrent stress testing --
+# including 64KB values (widening the memcpy race window well beyond the 200B this project
+# normally uses for these tests) sustained for 5+ seconds per run, both plain and under this same
+# sanitizer, across update+get / update+scan / update+scan+reorganize combinations -- found zero
+# torn reads across many repeated runs. See read_t2_record_seqlock()'s doc comment in
+# vmemkv_impl.hpp.
+race:vmemkv::T2FlatFile::update_value_at
+race:vmemkv::read_t2_record_seqlock

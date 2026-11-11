@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.16)
+project(VMemKVExample LANGUAGES CXX)
+find_package(VMemKV REQUIRED)
+add_executable(vmemkv_example main.cpp)
+target_link_libraries(vmemkv_example PRIVATE VMemKV::vmemkv)
+target_compile_features(vmemkv_example PRIVATE cxx_std_23)
