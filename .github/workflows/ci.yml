@@ -8,7 +8,7 @@ on:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -29,18 +29,19 @@ jobs:
           liblmdb-dev \
           libtbb-dev \
           libaio-dev \
-          gdb
+          gdb \
+          python3-venv
         # Pinned clang-format binary (PyPI bundles the exact LLVM build): the
         # format gate must run the identical binary in CI and on dev machines
-        # (this repo: 18.1.3). Never use the distro's unversioned package here;
-        # its version drifts with the runner image and flags different lines.
-        python3 -m pip install --user "clang-format==18.1.3"
+        # (this repo: 18.1.3). Install in a venv because Ubuntu's system Python
+        # is externally managed (PEP 668).
+        python3 -m venv "$RUNNER_TEMP/clang-format-venv"
+        "$RUNNER_TEMP/clang-format-venv/bin/python" -m pip install --disable-pip-version-check "clang-format==18.1.3"
 
     - name: Verify Code Formatting
       run: |
         # Run clang-format dry-run to check for style violations in C++ files
-        export PATH="$HOME/.local/bin:$PATH"
-        find src tests benchmark include example \( -name "*.cpp" -o -name "*.hpp" \) -print0 | xargs -0 clang-format --dry-run --Werror
+        find src tests benchmark include example \( -name "*.cpp" -o -name "*.hpp" \) -print0 | xargs -0 "$RUNNER_TEMP/clang-format-venv/bin/clang-format" --dry-run --Werror
 
     - name: Configure CMake
       run: |
@@ -82,7 +83,7 @@ jobs:
         exit "$ctest_exit"
 
   install-check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
     - uses: actions/checkout@v4
