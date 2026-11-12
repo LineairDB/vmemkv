@@ -399,6 +399,13 @@ TEST_CASE("ShardedT1Index: cycling updates under tiny shards keep every key at i
   constexpr int kKeyRange = 400;
   constexpr int kRounds = 40;
   auto idx = make_index_with_target_size(kTargetShardSize, /*worker_threads=*/2);
+  // Seed the key set before starting the split pressure so every attempted split has live data,
+  // even when the splitter is not scheduled until after the update writers finish.
+  for (int i = 0; i < kKeyRange; ++i) {
+    REQUIRE(idx->put(to_span(ikey(i)), 0) == TestIndex::PutResult::Applied);
+  }
+  idx->split_shard_containing(to_span(ikey(0)));
+  REQUIRE(idx->shard_count() > 1);
 
   std::atomic<bool> stop{false};
   std::vector<std::thread> writers;
@@ -412,9 +419,8 @@ TEST_CASE("ShardedT1Index: cycling updates under tiny shards keep every key at i
       }
     });
   }
-  // Uncapped: a fast thread can burn a fixed budget before keys exist to split. Attempts
-  // spanning the whole write phase guarantee one lands post-existence (a win then always
-  // splits: aborts need fewer than kMinSplitEntries live entries).
+  // Keep explicit split requests active across the write phase; every target shard is already
+  // populated, so scheduling order cannot turn all attempts into empty-shard no-ops.
   std::thread splitter([&] {
     for (int round = 0; !stop.load(std::memory_order_relaxed); ++round) {
       idx->split_shard_containing(to_span(ikey((round * 37) % kKeyRange)));
@@ -427,15 +433,7 @@ TEST_CASE("ShardedT1Index: cycling updates under tiny shards keep every key at i
   stop.store(true, std::memory_order_relaxed);
   splitter.join();
 
-  size_t current = idx->shard_count();
-  // Wait for progress, not stability (see above): the timeout still fails a broken splitter.
-  for (int round = 0; round < 300 && current <= 1; ++round) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    current = idx->shard_count();
-  }
-  std::this_thread::sleep_for(std::chrono::milliseconds(200));
-
-  CHECK(current > 1);
+  CHECK(idx->shard_count() > 1);
   for (int i = 0; i < kKeyRange; ++i) {
     CHECK(idx->get(to_span(ikey(i))) == static_cast<uint64_t>(kRounds - 1));
   }
@@ -476,12 +474,14 @@ TEST_CASE("ShardedT1Index: dirty-shard visits re-drive split evaluation") {
     idx->for_each_dirty_shard([](std::span<const TestIndex::EntrySnapshot>) { return true; });
   }
 
+  // shard_count publishes before continue_split() finishes draining references and increments
+  // total_splits(), so wait for both before asserting the completed split.
   bool split_happened = false;
-  for (int attempt = 0; attempt < 200 && !split_happened; ++attempt) {
+  for (int attempt = 0; attempt < 1000 && !split_happened; ++attempt) {
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    split_happened = idx->shard_count() > 1;
+    split_happened = idx->shard_count() > 1 && idx->total_splits() > 0;
   }
-  CHECK(split_happened);
+  REQUIRE(split_happened);
   CHECK(idx->total_splits() > 0);
   check_scan_sorted_unique(*idx, 0, kRounds * kPerRound, static_cast<size_t>(kRounds * kPerRound));
 }
