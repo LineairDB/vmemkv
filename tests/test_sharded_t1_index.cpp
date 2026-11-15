@@ -315,18 +315,10 @@ TEST_CASE("ShardedT1Index: a split under concurrent writes loses no straggler en
   }
 }
 
-TEST_CASE("ShardedT1Index: maintenance_soft_threshold lowers only under scan at scale") {
-  // Production append capacity (2^21): normal threshold is half; an active scan pulls it to the
-  // L2 slot budget.
+TEST_CASE("ShardedT1Index: maintenance_soft_threshold is 50 percent of append capacity") {
   constexpr size_t kProdCap = size_t{1} << 21;
-  CHECK(TestIndex::maintenance_soft_threshold(kProdCap, false) == kProdCap / 2);
-  const size_t scan_threshold = TestIndex::maintenance_soft_threshold(kProdCap, true);
-  CHECK(scan_threshold ==
-        std::min(size_t{1024 * 1024} / vmemkv::T1Index<TinyAppendConfig>::append_slot_bytes(), kProdCap / 2));
-  CHECK(scan_threshold < kProdCap / 2);
-  // In-tree tiny capacities: the L2 budget never binds, so scan-active changes nothing.
-  CHECK(TestIndex::maintenance_soft_threshold(1024, false) == 512);
-  CHECK(TestIndex::maintenance_soft_threshold(1024, true) == 512);
+  CHECK(TestIndex::maintenance_soft_threshold(kProdCap) == kProdCap / 2);
+  CHECK(TestIndex::maintenance_soft_threshold(1024) == 512);
 }
 
 TEST_CASE("ShardedT1Index: delete pressure triggers maintenance below the occupancy threshold") {
@@ -722,4 +714,25 @@ TEST_CASE("ShardedT1Index: for_each_dirty_shard early stop releases unvisited pi
   }
   splitter.join();
   CHECK(idx->total_splits() == splits_before + 1);
+}
+
+TEST_CASE("ShardedT1Index: shard splits at kSegmentBytes even below entry-count threshold") {
+  auto idx = make_index_with_target_size(4096, /*worker_threads=*/1);
+  // 200 entries with 64KiB encoded size hint (~12.8MiB > 8MiB kSegmentBytes), far below the
+  // 8192-entry split threshold.
+  constexpr int kCount = 200;
+  constexpr uint64_t kBlockCount64K = (64ULL * 1024ULL) / 16ULL;
+  for (int i = 0; i < kCount; ++i) {
+    const uint64_t offset = static_cast<uint64_t>(i) * 64ULL * 1024ULL;
+    const uint64_t payload = offset | (kBlockCount64K << 48ULL);
+    CHECK(idx->put(to_span(ikey(i)), payload) == TestIndex::PutResult::Applied);
+  }
+  idx->drain_maintenance();
+  CHECK(idx->shard_count() >= 2);
+  CHECK(idx->total_splits() >= 1);
+  for (int i = 0; i < kCount; ++i) {
+    const uint64_t offset = static_cast<uint64_t>(i) * 64ULL * 1024ULL;
+    const uint64_t payload = offset | (kBlockCount64K << 48ULL);
+    CHECK(idx->get(to_span(ikey(i))) == payload);
+  }
 }

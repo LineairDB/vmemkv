@@ -146,19 +146,19 @@ For inline-eligible entries of 8 bytes or less, step 2. is skipped and the 64-bi
 
 - Update: locate the entry with `Get()`; rewrite the Tier 2 tail record in place when it fits. When the existing record resides in the immutable base region (`offset < base_boundary`), updates to keys $\le$ 16 bytes immediately redirect to out-of-place append without reading SSD base data (prefix containment guarantees full-key identity). Keys $> 16$ bytes verify the full key against the base record before appending.
 - Delete: locate the entry with `Get()`, tombstone the offset on Tier 1, then write the WAL. Tier 2 is untouched.
-- Scan: narrow the range on Tier 1 first, then collect value records on Tier 2 in key order. When non-ascending physical offsets (`curr_offset < prev_offset`) are encountered, the disordered segment is enqueued for background compaction on demand.
+- Scan: narrow the range on Tier 1 first, then collect value records on Tier 2 in key order. Scan is purely read-only.
 
 For inlined entries, Update / Delete / Scan complete on the Tier 1 payload alone.
 
-For offset-payload indexes, Update and Delete leave old Tier 2 records unreferenced. Physically reclaiming unreferenced Tier 2 segments via hole punching, and keeping frozen Tier 2 key-ordered, is handled by background jobs (see `background_jobs.md` and `t2_compaction_design.md`).
+For offset-payload indexes, Update and Delete leave old Tier 2 records unreferenced. Restoring 4KiB page locality within each T1 shard and reclaiming sparse Tier 2 segments via unified shard repacking and hole punching are handled by background jobs (see `background_jobs.md` and `t2_compaction_design.md`).
 
 ## 6. Background Jobs (Reorganize, Checkpoint, Compaction)
 
 vmemkv coordinates three decoupled background maintenance mechanisms to balance foreground latency with memory/disk reclamation:
 
-- **T1 Shard Reorganize**: Per-shard worker pool merges `append_region` into `sorted_region`, eliminating ordering fragmentation in memory and splitting shards as they grow.
+- **T1 Shard Reorganize**: Per-shard worker pool merges `append_region` into `sorted_region`, eliminating ordering fragmentation in memory and splitting shards when they reach one T2 segment ($8\,\text{MiB}$) of referenced live bytes or the entry-count threshold.
 - **Checkpoint Coordinator**: Pacing-gated coordinator synchronizes Tier 2's dirty tail to disk via chunked `msync(MS_SYNC)` with cooperative yielding, persists a T1 snapshot, advances `base_boundary`, and rotates the WAL.
-- **T2 Compaction & Autonomous Defragmentation**: Single-flight background worker repacks disordered T1 shards, evacuates live records from sparse base segments, and hole-punches empty 8MiB segments after an epoch gate.
+- **T2 Compaction & Unified Shard Repack**: Single-flight background worker repacks dirty T1 shards (and shards overlapping frozen segments below $50\%$ live bytes) contiguously in full-key order to the T2 append frontier, and hole-punches empty $8\,\text{MiB}$ segments after a two-checkpoint epoch gate.
 
 See [`background_jobs.md`](background_jobs.md) for the unified design and lifecycle guarantees.
 

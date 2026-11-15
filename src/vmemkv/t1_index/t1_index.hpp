@@ -862,6 +862,9 @@ class T1Index {
     [[nodiscard]] auto find_with_index(const AppendIndex &index,
                                        Key key,
                                        uint64_t hash) const noexcept -> const AppendSlot * {
+      if (tail_.load(std::memory_order_acquire) == 0) {
+        return nullptr;
+      }
       const auto slot_plus_one =
           index.find_slot_index(key, hash, [&](size_t slot_index) -> const AppendSlot & { return slots_[slot_index]; });
       if (slot_plus_one == AppendIndex::kNotFound) {

@@ -2,12 +2,12 @@
 //
 // Stripe protocol (type-enforced by with_key_stripe() + StripeResult): the key's stripe lock
 // is held only for the T1/T2 mutation and the WAL reservation (which fixes LSN order among
-// same-key writers). The multi-millisecond await_durable() wait and the reorg check run
-// after the lock is released -- holding the stripe through either would needlessly serialize
-// other writers on the same stripe, and holding a T2 write handle into
-// maybe_reorganize_if_needed() can deadlock against a concurrent reorganize cycle.
+// same-key writers). The multi-millisecond await_durable() wait runs after the lock is
+// released -- holding the stripe through it would needlessly serialize other writers on the
+// same stripe.
 #pragma once
 
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -25,12 +25,11 @@
 
 namespace vmemkv {
 
-// What a with_key_stripe() callback returns: applied or not, the WAL record reserved under
-// the stripe (awaited after release), and whether to reorg-check after release.
+// What a with_key_stripe() callback returns: applied or not, and the WAL record reserved under
+// the stripe (awaited after release).
 struct StripeResult {
   bool applied = false;
   Wal::PendingRecord *pending = nullptr;
-  bool need_reorg_check = false;
 };
 
 namespace write_path_debug {
@@ -47,14 +46,11 @@ inline void reset() noexcept {
 }
 }  // namespace write_path_debug
 
-// Holds the stripe lock for the callback, then awaits the WAL record and reorg-checks with
-// the lock released. Returns whether the mutation applied.
-template <typename LockStripe, typename AwaitDurable, typename CheckReorg, typename Fn>
-auto with_key_stripe(LockStripe &&lock_stripe,
-                     AwaitDurable &&await_durable,
-                     CheckReorg &&check_reorg,
-                     std::span<const std::byte> key,
-                     Fn &&func) -> bool {
+// Holds the stripe lock for the callback, then awaits the WAL record with the lock released.
+// Returns whether the mutation applied.
+template <typename LockStripe, typename AwaitDurable, typename Fn>
+auto with_key_stripe(LockStripe &&lock_stripe, AwaitDurable &&await_durable, std::span<const std::byte> key, Fn &&func)
+    -> bool {
   constexpr uint64_t kSampleMask = 0xFF;
   thread_local static uint64_t tl_counter = 0;
   const bool sample = ((++tl_counter) & kSampleMask) == 0;
@@ -95,9 +91,6 @@ auto with_key_stripe(LockStripe &&lock_stripe,
     write_path_debug::g_sample_count.fetch_add(1, std::memory_order_relaxed);
   }
 
-  if (result.need_reorg_check) {
-    check_reorg();
-  }
   return result.applied;
 }
 
@@ -136,60 +129,36 @@ auto try_make_inline_payload(std::span<const std::byte> full_key,
   return std::nullopt;
 }
 
-// Appends a (key, value) pair to T2 and publishes it in T1, retrying across AppendRegionFull.
-// The WAL reservation stays the caller's job, after the mutation applies.
-template <typename ConfigT, typename T1, typename MaybeReorg>
-auto write_entry_lockfree(T1 &tier1,
+// Appends a (key, value) pair to T2 and publishes it in T1 (ShardedT1Index::put() drains
+// full append regions internally). The WAL reservation stays the caller's job, after apply.
+template <typename ConfigT, typename T1>
+void write_entry_lockfree(T1 &tier1,
                           T2FlatFile &tier2,
                           T2Ownership<ConfigT> &own,
-                          MaybeReorg &&maybe_reorg,
                           std::span<const std::byte> full_key,
                           std::span<const std::byte> value,
-                          std::optional<typename T1::LookupResult> prev) -> bool {
-  // Shared publish tail for the inline and append paths: resolve the previous entry for
-  // segment accounting (callers that already looked it up pass it in; single-threaded WAL
-  // replay and bulk load fetch it here), then T1-put the new payload.
-  auto publish = [&](uint64_t new_payload, bool new_is_offset, bool new_is_inline, uint8_t inline_size) -> bool {
+                          std::optional<typename T1::LookupResult> prev) {
+  auto publish = [&](uint64_t new_payload, bool new_is_offset, bool new_is_inline, uint8_t inline_size) {
     typename T1::LookupResult old = prev.has_value() ? *prev : tier1.get_with_hash(full_key);
-    if (tier1.put(full_key, new_payload, new_is_inline, inline_size, /*mark_t2_dirty=*/true) !=
-        T1::PutResult::Applied) {
-      return false;
-    }
-    own.note_replace(old.payload_bits, old.raw_hash, new_is_offset, new_payload, true);
-    return true;
+    const bool is_new_key = (old.payload_bits == vmemkv::STORE_NOT_FOUND);
+    [[maybe_unused]] const auto res =
+        tier1.put(full_key, new_payload, new_is_inline, inline_size, /*mark_t2_dirty=*/is_new_key);
+    assert(res == T1::PutResult::Applied);
+    own.note_replace(old.payload_bits, old.raw_hash, new_is_offset, new_payload);
   };
-  while (true) {
-    uint8_t inline_size = 0;
-    if (const auto inline_payload = try_make_inline_payload<ConfigT>(full_key, value, inline_size)) {
-      if (publish(*inline_payload, /*new_is_offset=*/false, /*new_is_inline=*/true, inline_size)) {
-        return true;
-      }
-      // AppendRegionFull: retry from the top after maybe_reorg().
-      maybe_reorg();
-      continue;
-    }
 
-    // Block count checked pre-append (not just asserted post-append); see
-    // checked_block_count().
-    const uint64_t block_count = t2_detail::checked_block_count(full_key.size(), value.size());
-
-    // acquire_write_handle() (not plain get_memory()) defers while checkpoint_internal() holds
-    // new writers stopped -- and `mem` stays alive across the T2 append *and* the T1 publish
-    // below, not released in between, closing checkpoint_internal()'s residual-window race.
-    {
-      T2FlatFile::T2MemoryHandle mem = tier2.acquire_write_handle();
-      uint64_t offset = vmemkv::T2FlatFile::append_default(mem, full_key, value);
-      uint64_t encoded_payload = t2_detail::encode_offset_payload(offset, block_count);
-      if (publish(encoded_payload, /*new_is_offset=*/true, /*new_is_inline=*/false, 0)) {
-        return true;
-      }
-    }
-    // Released strictly before maybe_reorg(): that call can block on a concurrent reorganize()
-    // that is itself waiting for this handle to drain -- holding it longer deadlocks the two.
-    // AppendRegionFull: the appended T2 record becomes unreachable garbage for a future
-    // reorganize() to reclaim -- retry from the top.
-    maybe_reorg();
+  uint8_t inline_size = 0;
+  if (const auto inline_payload = try_make_inline_payload<ConfigT>(full_key, value, inline_size)) {
+    publish(*inline_payload, /*new_is_offset=*/false, /*new_is_inline=*/true, inline_size);
+    return;
   }
+
+  // Block count checked pre-append (not just asserted post-append); see checked_block_count().
+  const uint64_t block_count = t2_detail::checked_block_count(full_key.size(), value.size());
+  T2FlatFile::T2MemoryHandle mem = tier2.acquire_write_handle();
+  uint64_t offset = vmemkv::T2FlatFile::append_default(mem, full_key, value);
+  uint64_t encoded_payload = t2_detail::encode_offset_payload(offset, block_count);
+  publish(encoded_payload, /*new_is_offset=*/true, /*new_is_inline=*/false, 0);
 }
 
 // update_impl()'s in-place decision for a non-inline entry: applies it or conclusively falls

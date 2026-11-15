@@ -122,26 +122,7 @@ class ShardedT1Index {
         if (result == PutResult::AppendRegionFull || slot->superseded.load(std::memory_order_acquire) != nullptr) {
           return std::nullopt;
         }
-        if (mark_t2_dirty && value != STORE_NOT_FOUND && !is_inline) {
-          slot->t2_dirty.store(true, std::memory_order_relaxed);
-          const uint64_t prefix_hi = t1_detail::prefix_high_u64(prefix);
-          const uint64_t prefix_lo = t1_detail::prefix_low_u64(prefix);
-          const uint64_t prev_hi = slot->last_t2_prefix_hi.load(std::memory_order_relaxed);
-          const uint64_t prev_lo = slot->last_t2_prefix_lo.load(std::memory_order_relaxed);
-          if (slot->has_last_t2_prefix.load(std::memory_order_relaxed) &&
-              (prefix_hi < prev_hi || (prefix_hi == prev_hi && prefix_lo < prev_lo))) {
-            slot->t2_inversion.store(true, std::memory_order_relaxed);
-          }
-          slot->last_t2_prefix_hi.store(prefix_hi, std::memory_order_relaxed);
-          slot->last_t2_prefix_lo.store(prefix_lo, std::memory_order_relaxed);
-          slot->has_last_t2_prefix.store(true, std::memory_order_relaxed);
-        }
-        if (value == STORE_NOT_FOUND) {
-          slot->tombstones_since_maintenance.fetch_add(1, std::memory_order_relaxed);
-          // Re-check post-increment: the final delete of a quiet workload must still trip the
-          // trigger without another write after it.
-          request_maintenance_if_needed(slot);
-        }
+        note_put_applied(slot, value, is_inline, mark_t2_dirty);
         return result;
       });
       if (attempted.has_value()) {
@@ -151,15 +132,10 @@ class ShardedT1Index {
     }
   }
 
-  // Set while a scan is in flight (cleared after). While set, the soft threshold drops to
-  // keep append regions L2-sized, so the scan's linear pass stays cache-resident.
-  void set_scan_active(bool active) const noexcept { scan_active_.store(active, std::memory_order_relaxed); }
-
-  // Append entries allowed before maintenance: half capacity normally, L2-capped while a scan
-  // is active. Pure function, unit-testable at production capacities.
+  // Append entries allowed before maintenance: half capacity. Pure function, unit-testable.
   static constexpr size_t kPercentScale = sharded_detail::kPercentScale;
-  static auto maintenance_soft_threshold(size_t append_cap, bool scan_active) -> size_t {
-    return sharded_detail::maintenance_soft_threshold(append_cap, scan_active, Shard::append_slot_bytes());
+  static auto maintenance_soft_threshold(size_t append_cap) noexcept -> size_t {
+    return sharded_detail::maintenance_soft_threshold(append_cap);
   }
 
   // Range scan over [lo_bytes, hi_bytes). Structural completeness + per-key freshness only;
@@ -322,9 +298,18 @@ class ShardedT1Index {
       if (slot->index->append_size() == 0 && !slot->index->has_immutable()) {
         slot->index->dump_sorted_region(dumped);
         offset_mapper(std::span<EntrySnapshot>(dumped));
+        slot->approx_t2_bytes.store(sharded_detail::sum_entries_t2_bytes(std::span<const EntrySnapshot>(dumped)),
+                                    std::memory_order_relaxed);
         per_shard_writer(dumped);
       } else {
-        reorganize_until_captured(*slot->index, offset_mapper, per_shard_writer, /*parallel_sort=*/true);
+        reorganize_until_captured(
+            *slot->index,
+            offset_mapper,
+            [&](std::span<const EntrySnapshot> merged) {
+              slot->approx_t2_bytes.store(sharded_detail::sum_entries_t2_bytes(merged), std::memory_order_relaxed);
+              per_shard_writer(merged);
+            },
+            /*parallel_sort=*/true);
         slot->tombstones_since_maintenance.store(0, std::memory_order_relaxed);
       }
       const auto shard_elapsed = std::chrono::steady_clock::now() - shard_start;
@@ -335,8 +320,8 @@ class ShardedT1Index {
       // Same re-drive as for_each_dirty_shard: checkpoint merges drain appends without
       // splitting, so a big shard must re-enter maintenance here. Approximate post-merge
       // size is enough as a gate; maintenance re-merges and confirms the exact size.
-      if (slot->index->approx_entry_count() >=
-          split_threshold(target_shard_size_, Config::kShardSplitThresholdPercent)) {
+      if (should_split_shard(slot->index->approx_entry_count(),
+                             slot->approx_t2_bytes.load(std::memory_order_relaxed))) {
         queue_.push_if_live(slot);
       }
     }
@@ -355,9 +340,14 @@ class ShardedT1Index {
     for (const auto &entries : per_shard_entries) {
       auto shard = std::make_unique<Shard>(append_cap_);
       shard->load_sorted_region_from_checkpoint(entries);
-      new_dir->shards.push_back(new ShardSlot(std::move(shard)));
+      auto *slot = new ShardSlot(std::move(shard));
+      slot->approx_t2_bytes.store(sharded_detail::sum_entries_t2_bytes(std::span<const EntrySnapshot>(entries)),
+                                  std::memory_order_relaxed);
+      new_dir->shards.push_back(slot);
     }
 
+    queue_.clear();
+    dirty_queue_.clear();
     Directory *old_dir = directory_.load(std::memory_order_relaxed);
     for (ShardSlot *slot : old_dir->shards) {
       delete slot;
@@ -371,32 +361,18 @@ class ShardedT1Index {
   void mark_t2_shard_state(size_t shard_index, bool dirty) {
     Directory *dir = directory_.load(std::memory_order_relaxed);
     assert(shard_index < dir->shards.size());
-    dir->shards[shard_index]->t2_dirty.store(dirty, std::memory_order_relaxed);
+    if (dirty) {
+      dirty_queue_.push_if_live(dir->shards[shard_index]);
+    }
   }
 
   [[nodiscard]] auto dirty_shard_count() const -> size_t {
-    return with_routing_guard([&]() -> size_t {
-      size_t count = 0;
-      for (ShardSlot *slot : directory_.load(std::memory_order_acquire)->shards) {
-        count += static_cast<size_t>(slot->t2_dirty.load(std::memory_order_relaxed));
-      }
-      return count;
-    });
+    return dirty_queue_.size() + active_dirty_visits_.load(std::memory_order_acquire);
   }
 
   // True when any live shard has uncompacted T2 writes or dead T2 records.
-  [[nodiscard]] auto has_dirty_shard() const -> bool {
-    return with_routing_guard([&]() -> bool {
-      Directory *dir = directory_.load(std::memory_order_acquire);
-      return std::ranges::any_of(dir->shards,
-                                 [](const ShardSlot *slot) { return slot->t2_dirty.load(std::memory_order_relaxed); });
-    });
-  }
+  [[nodiscard]] auto has_dirty_shard() const -> bool { return dirty_shard_count() != 0; }
 
-  // Visits dirty shards in ascending key-range order. For each dirty shard, atomically clears
-  // its dirty/garbage flags and captures live EntrySnapshots. The visitor receives both flags.
-  // Returning false or throwing restores the dirty state, leaving the shard eligible for a
-  // later cycle.
   // Spins until no shard is mid-split (Closing or Split published but not yet drained).
   // Splits are paused above us, so this only waits out splits that won Closing earlier.
   void wait_until_no_split() const {
@@ -416,11 +392,12 @@ class ShardedT1Index {
   }
 
   void drain_maintenance() {
-    const size_t threshold = split_threshold(target_shard_size_, Config::kShardSplitThresholdPercent);
     with_routing_guard([&] {
       Directory *dir = directory_.load(std::memory_order_acquire);
       for (ShardSlot *slot : dir->shards) {
-        if (slot->index->approx_entry_count() >= threshold || slot->index->append_size() > 0) {
+        if (should_split_shard(slot->index->approx_entry_count(),
+                               slot->approx_t2_bytes.load(std::memory_order_relaxed)) ||
+            slot->index->append_size() > 0) {
           queue_.push_if_live(slot);
         }
       }
@@ -440,35 +417,65 @@ class ShardedT1Index {
 
   template <typename Visitor>
   void for_each_dirty_shard(Visitor &&visitor) {
+    std::vector<EntrySnapshot> entries;
+    const size_t max_visits = dirty_queue_.size();
+    for (size_t visited = 0; visited < max_visits; ++visited) {
+      ShardSlot *slot =
+          with_routing_guard([&]() -> ShardSlot * { return dirty_queue_.pop_and_pin(active_dirty_visits_); });
+      if (slot == nullptr) {
+        break;
+      }
+      if (visit_dirty_shard(slot, entries, visitor, /*from_dirty_queue=*/true, nullptr) == DirtyShardVisit::kStop) {
+        break;
+      }
+    }
+  }
+
+  template <typename Visitor>
+  auto for_each_shard_for_compaction(Visitor &&visitor) -> bool {
     std::vector<ShardSlot *> snapshot;
     with_routing_guard([&] {
       Directory *dir = directory_.load(std::memory_order_acquire);
       snapshot.reserve(dir->shards.size());
       for (ShardSlot *slot : dir->shards) {
-        if (slot->t2_dirty.load(std::memory_order_relaxed) &&
-            slot->superseded.load(std::memory_order_acquire) == nullptr) {
+        if (slot->superseded.load(std::memory_order_acquire) == nullptr) {
           slot->outside_refs.fetch_add(1, std::memory_order_relaxed);
           snapshot.push_back(slot);
         }
       }
     });
+    if (snapshot.empty()) {
+      return true;
+    }
+    const size_t start = compaction_cursor_.load(std::memory_order_relaxed) % snapshot.size();
+    if (start != 0) {
+      std::rotate(snapshot.begin(), snapshot.begin() + static_cast<std::ptrdiff_t>(start), snapshot.end());
+    }
 
     std::vector<EntrySnapshot> entries;
     size_t next = 0;
+    bool all_visited = true;
     try {
       for (; next < snapshot.size(); ++next) {
-        if (visit_dirty_shard(snapshot[next], entries, visitor) == DirtyShardVisit::kStop) {
+        if (visit_dirty_shard(snapshot[next], entries, visitor, /*from_dirty_queue=*/false, &all_visited) ==
+            DirtyShardVisit::kStop) {
+          if (next + 1 < snapshot.size()) {
+            all_visited = false;
+          }
           ++next;
           break;
         }
       }
     } catch (...) {
+      compaction_cursor_.store((start + next + 1) % snapshot.size(), std::memory_order_relaxed);
       // The throwing visit already released its own pin; only later slots still hold theirs.
       release_snapshot_tail(snapshot, next + 1);
       throw;
     }
+    compaction_cursor_.store((start + next) % snapshot.size(), std::memory_order_relaxed);
     // The unvisited tail holds snapshot pins until released here.
     release_snapshot_tail(snapshot, next);
+    return all_visited;
   }
 
  private:
@@ -481,10 +488,8 @@ class ShardedT1Index {
     ShardSlot *high = nullptr;
   };
 
-  // Split pause is a refcount, not a flag: checkpoint_all_shards() and
-  // for_each_dirty_shard() pause independently and may overlap; whoever exits
-  // last resumes. (A shared bool would let the first exiter re-enable splits
-  // while the other pauser is still inside.)
+  // Split pause is a refcount, not a flag: checkpoint_all_shards() pauses splits
+  // for its duration and resumes when the last guard exits.
   struct SplitPause {
     std::atomic<int> *count = nullptr;
     explicit SplitPause(std::atomic<int> &guarded) noexcept : count(&guarded) {
@@ -514,13 +519,10 @@ class ShardedT1Index {
     // Tombstone puts since the last reorganize() (which merges them away). Delete-pressure
     // trigger; relaxed heuristic -- a racing reset only delays the next trigger one round.
     std::atomic<uint64_t> tombstones_since_maintenance{0};
-    // T2 compaction flags: t2_dirty marks uncompacted T2 appends; t2_inversion marks out-of-order
-    // key appends within this shard.
+    // Approximate live T2 bytes referenced by this shard (sum of payload size hints).
+    std::atomic<uint64_t> approx_t2_bytes{0};
+    // True while this shard is queued for T2 compaction.
     std::atomic<bool> t2_dirty{false};
-    std::atomic<bool> t2_inversion{false};
-    std::atomic<uint64_t> last_t2_prefix_hi{0};
-    std::atomic<uint64_t> last_t2_prefix_lo{0};
-    std::atomic<bool> has_last_t2_prefix{false};
     std::atomic<bool> split_paused{false};
     // Hazard refs for unguarded worker/checkpoint touches; continue_split() waits for zero.
     std::atomic<int> outside_refs{0};
@@ -529,31 +531,40 @@ class ShardedT1Index {
   // Outcome of one dirty-shard visit: keep scanning shards or stop at this one.
   enum class DirtyShardVisit : std::uint8_t { kContinue, kStop };
 
-  // Captures one dirty shard and releases its snapshot pin on every return path.
+  // Captures one shard and releases its snapshot pin on every return path.
   template <typename Visitor>
-  auto visit_dirty_shard(ShardSlot *slot, std::vector<EntrySnapshot> &entries, Visitor &&visitor) -> DirtyShardVisit {
-    slot->split_paused.store(true, std::memory_order_seq_cst);
+  auto visit_dirty_shard(ShardSlot *slot,
+                         std::vector<EntrySnapshot> &entries,
+                         Visitor &&visitor,
+                         bool from_dirty_queue = true,
+                         bool *out_all_visited = nullptr) -> DirtyShardVisit {
+    if (!from_dirty_queue) {
+      slot->split_paused.store(true, std::memory_order_seq_cst);
+    }
     auto finish_visit = [&](bool check_split) {
       slot->split_paused.store(false, std::memory_order_release);
-      if (check_split && entries.size() >= split_threshold(target_shard_size_, Config::kShardSplitThresholdPercent)) {
-        queue_.push_if_live(slot);
+      if (check_split) {
+        const uint64_t merged_t2_bytes = sharded_detail::sum_entries_t2_bytes(std::span<const EntrySnapshot>(entries));
+        slot->approx_t2_bytes.store(merged_t2_bytes, std::memory_order_relaxed);
+        if (should_split_shard(entries.size(), merged_t2_bytes)) {
+          queue_.push_if_live(slot);
+        }
       }
       slot->outside_refs.fetch_sub(1, std::memory_order_release);
+      if (from_dirty_queue) {
+        active_dirty_visits_.fetch_sub(1, std::memory_order_release);
+      }
     };
-    if (slot->superseded.load(std::memory_order_seq_cst) != nullptr) {
-      finish_visit(false);
-      return DirtyShardVisit::kContinue;
-    }
-    const bool had_dirty = slot->t2_dirty.exchange(false, std::memory_order_acq_rel);
-    const bool had_inversion = slot->t2_inversion.exchange(false, std::memory_order_acq_rel);
-    if (!had_dirty && !had_inversion) {
+    if (!from_dirty_queue && slot->superseded.load(std::memory_order_seq_cst) != nullptr) {
+      if (out_all_visited != nullptr) {
+        *out_all_visited = false;
+      }
       finish_visit(false);
       return DirtyShardVisit::kContinue;
     }
     auto restore = [&](bool check_split) {
-      slot->t2_dirty.store(true, std::memory_order_release);
-      if (had_inversion) {
-        slot->t2_inversion.store(true, std::memory_order_release);
+      if (from_dirty_queue) {
+        dirty_queue_.push_if_live(slot);
       }
       finish_visit(check_split);
     };
@@ -561,10 +572,6 @@ class ShardedT1Index {
       if (slot->index->append_size() == 0 && !slot->index->has_immutable()) {
         slot->index->dump_sorted_region(entries);
       } else {
-        if (!had_inversion) {
-          finish_visit(false);
-          return DirtyShardVisit::kContinue;
-        }
         reorganize_until_captured(
             *slot->index,
             [](std::span<EntrySnapshot> /*merged*/) {},
@@ -573,7 +580,7 @@ class ShardedT1Index {
         slot->tombstones_since_maintenance.store(0, std::memory_order_relaxed);
       }
       if (!visitor(std::span<const EntrySnapshot>(entries))) {
-        restore(true);
+        finish_visit(true);
         return DirtyShardVisit::kStop;
       }
     } catch (...) {
@@ -596,15 +603,29 @@ class ShardedT1Index {
     return sharded_detail::split_threshold(target_shard_size, percent);
   }
 
-  // Queue ownership shared by request_maintenance_if_needed()/run_maintenance()/continue_split().
+  // True when a shard has reached either the entry-count split threshold or one T2 segment worth
+  // of referenced payload bytes. A shard needs at least 2 entries to split.
+  [[nodiscard]] auto should_split_shard(size_t entry_count, uint64_t t2_bytes) const noexcept -> bool {
+    if (entry_count < 2) {
+      return false;
+    }
+    return entry_count >= split_threshold(target_shard_size_, Config::kShardSplitThresholdPercent) ||
+           t2_bytes >= Config::kSegmentBytes;
+  }
+
+  // Queue ownership shared by maintenance and dirty-shard compaction queues.
+  template <std::atomic<bool> ShardSlot::*PendingFlag>
   struct ShardQueue {
-    std::mutex mutex;
+    mutable std::mutex mutex;
     std::deque<ShardSlot *> queue;
     // Enqueues slot if live: CASes pending false->true, then under lock re-checks superseded
     // (same mutex continue_split() purges under, making push vs purge race-free).
     void push_if_live(ShardSlot *slot) {
+      if ((slot->*PendingFlag).load(std::memory_order_relaxed)) {
+        return;
+      }
       bool expected = false;
-      if (!slot->maintenance_pending.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+      if (!(slot->*PendingFlag).compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
         return;
       }
       const std::lock_guard<std::mutex> lock(mutex);
@@ -621,16 +642,43 @@ class ShardedT1Index {
       }
       ShardSlot *slot = queue.front();
       queue.pop_front();
-      slot->maintenance_pending.store(false, std::memory_order_release);
+      (slot->*PendingFlag).store(false, std::memory_order_release);
       return slot;
+    }
+    // Pops one non-splitting shard, pausing splits on it before clearing its pending flag so
+    // continue_split() never misses a dirty flag on a concurrently splitting shard.
+    auto pop_and_pin(std::atomic<size_t> &active_visits) -> ShardSlot * {
+      const std::lock_guard<std::mutex> lock(mutex);
+      while (!queue.empty()) {
+        ShardSlot *slot = queue.front();
+        queue.pop_front();
+        slot->split_paused.store(true, std::memory_order_seq_cst);
+        if (slot->superseded.load(std::memory_order_seq_cst) != nullptr) {
+          slot->split_paused.store(false, std::memory_order_release);
+          continue;
+        }
+        (slot->*PendingFlag).store(false, std::memory_order_release);
+        slot->outside_refs.fetch_add(1, std::memory_order_relaxed);
+        active_visits.fetch_add(1, std::memory_order_acq_rel);
+        return slot;
+      }
+      return nullptr;
     }
     void purge(ShardSlot *target) {
       const std::lock_guard<std::mutex> lock(mutex);
       queue.erase(std::remove(queue.begin(), queue.end(), target), queue.end());
     }
-    [[nodiscard]] auto empty() -> bool {
+    void clear() {
+      const std::lock_guard<std::mutex> lock(mutex);
+      queue.clear();
+    }
+    [[nodiscard]] auto empty() const -> bool {
       const std::lock_guard<std::mutex> lock(mutex);
       return queue.empty();
+    }
+    [[nodiscard]] auto size() const -> size_t {
+      const std::lock_guard<std::mutex> lock(mutex);
+      return queue.size();
     }
   };
 
@@ -669,15 +717,11 @@ class ShardedT1Index {
                         std::span<const std::byte> hi_bytes,
                         Callback callback,
                         bool &stopped) const -> size_t {
-    std::vector<ShardSlot *> leaves;
-    ShardSetView{dir}.for_each_leaf_in_range(lower, upper, [&](ShardSlot *leaf) { leaves.push_back(leaf); });
     size_t total = 0;
-    for (ShardSlot *leaf : leaves) {
+    ShardSetView{dir}.for_each_leaf_in_range(lower, upper, [&](ShardSlot *leaf) -> bool {
       total += leaf->index->scan(lo_bytes, hi_bytes, callback);
-      if (stopped) {
-        break;
-      }
-    }
+      return !stopped;
+    });
     return total;
   }
 
@@ -723,21 +767,23 @@ class ShardedT1Index {
         if (i > 0 && !(dir->boundaries[i - 1] < upper)) {
           break;
         }
-        collect_into(dir->shards[i], lower, upper, visit);
+        if (!collect_into(dir->shards[i], lower, upper, visit)) {
+          break;
+        }
       }
     }
-    static void collect_into(ShardSlot *slot, const Key &lower, const Key &upper, auto &&visit) {
+    static auto collect_into(ShardSlot *slot, const Key &lower, const Key &upper, auto &&visit) -> bool {
       Split *split = slot->superseded.load(std::memory_order_acquire);
       if (split == nullptr || split == kClosingSentinel) {
-        visit(slot);  // Closing reads through the splitting slot directly.
-        return;
+        return visit(slot);  // Closing reads through the splitting slot directly.
       }
-      if (lower < split->boundary) {
-        collect_into(split->low, lower, upper, visit);
+      if (lower < split->boundary && !collect_into(split->low, lower, upper, visit)) {
+        return false;
       }
-      if (split->boundary < upper) {
-        collect_into(split->high, lower, upper, visit);
+      if (split->boundary < upper && !collect_into(split->high, lower, upper, visit)) {
+        return false;
       }
+      return true;
     }
   };
 
@@ -770,7 +816,9 @@ class ShardedT1Index {
 
     // Purge `target`'s queue entry under push_if_live()'s mutex: no worker dequeues it after
     // this point. Already-dequeued workers hold outside_refs, drained before `delete target`.
+    const bool was_dirty = target->t2_dirty.load(std::memory_order_acquire);
     queue_.purge(target);
+    dirty_queue_.purge(target);
 
     // Second reorganize() after Closing is visible: captures "no new writer resolves target"
     // state (in-flight put()s drain via T1Index's own epoch mechanism). A writer that resolved
@@ -790,7 +838,7 @@ class ShardedT1Index {
                                    // T1Index::reorganize()'s own doc comment on this parameter.
 
     constexpr size_t kMinSplitEntries = 2;
-    if (merged_entries.size() < kMinSplitEntries) {
+    if (merged_entries.size() < kMinSplitEntries || !(merged_entries.front().key < merged_entries.back().key)) {
       // Too small (callback fired: real state, not a lost race) -- resume normal operation.
       // Reset superseded *before* maintenance_pending: request_maintenance_if_needed() CASes the
       // flag then checks superseded, so the reverse order could strand the flag true forever on
@@ -798,26 +846,45 @@ class ShardedT1Index {
       // (never dequeued) entry's flag would otherwise never clear.
       target->superseded.store(nullptr, std::memory_order_release);
       target->maintenance_pending.store(false, std::memory_order_relaxed);
+      target->t2_dirty.store(false, std::memory_order_relaxed);
+      if (was_dirty) {
+        dirty_queue_.push_if_live(target);
+      }
       target->tombstones_since_maintenance.store(0, std::memory_order_relaxed);
       return;
     }
 
-    const size_t mid = merged_entries.size() / 2;
+    size_t mid = merged_entries.size() / 2;
+    if (!(merged_entries[mid - 1].key < merged_entries[mid].key)) {
+      size_t right = mid + 1;
+      while (right < merged_entries.size() && !(merged_entries[right - 1].key < merged_entries[right].key)) {
+        ++right;
+      }
+      size_t left = mid - 1;
+      while (left > 0 && !(merged_entries[left - 1].key < merged_entries[left].key)) {
+        --left;
+      }
+      if (right < merged_entries.size() && (left == 0 || (right - mid) <= (mid - left))) {
+        mid = right;
+      } else {
+        mid = left;
+      }
+    }
     const Key boundary = merged_entries[mid].key;
+    const std::span<const EntrySnapshot> low_entries(merged_entries.data(), mid);
+    const std::span<const EntrySnapshot> high_entries(merged_entries.data() + mid, merged_entries.size() - mid);
+    const uint64_t low_t2_bytes = sharded_detail::sum_entries_t2_bytes(low_entries);
+    const uint64_t high_t2_bytes = sharded_detail::sum_entries_t2_bytes(high_entries);
     auto low_shard = std::make_unique<Shard>(target->index->append_capacity());
     auto high_shard = std::make_unique<Shard>(target->index->append_capacity());
-    low_shard->load_sorted_region_from_checkpoint(std::span<const EntrySnapshot>(merged_entries.data(), mid));
-    high_shard->load_sorted_region_from_checkpoint(
-        std::span<const EntrySnapshot>(merged_entries.data() + mid, merged_entries.size() - mid));
+    low_shard->load_sorted_region_from_checkpoint(low_entries);
+    high_shard->load_sorted_region_from_checkpoint(high_entries);
 
     auto *low_slot = new ShardSlot(std::move(low_shard));
     auto *high_slot = new ShardSlot(std::move(high_shard));
-    const bool dirty = target->t2_dirty.load(std::memory_order_relaxed);
-    const bool inversion = target->t2_inversion.load(std::memory_order_relaxed);
-    low_slot->t2_dirty.store(dirty, std::memory_order_relaxed);
-    high_slot->t2_dirty.store(dirty, std::memory_order_relaxed);
-    low_slot->t2_inversion.store(inversion, std::memory_order_relaxed);
-    high_slot->t2_inversion.store(inversion, std::memory_order_relaxed);
+    const bool dirty = was_dirty || target->t2_dirty.load(std::memory_order_relaxed);
+    low_slot->approx_t2_bytes.store(low_t2_bytes, std::memory_order_relaxed);
+    high_slot->approx_t2_bytes.store(high_t2_bytes, std::memory_order_relaxed);
     low_slot->outside_refs.store(1, std::memory_order_relaxed);
     high_slot->outside_refs.store(1, std::memory_order_relaxed);
 
@@ -838,11 +905,15 @@ class ShardedT1Index {
     last_split_pause_end_ns_.store(static_cast<uint64_t>(split_pause_end.time_since_epoch().count()),
                                    std::memory_order_relaxed);
 
-    const size_t threshold = split_threshold(target_shard_size_, Config::kShardSplitThresholdPercent);
-    if (mid >= threshold && merged_entries.front().key < merged_entries[mid - 1].key) {
+    if (dirty) {
+      dirty_queue_.push_if_live(low_slot);
+      dirty_queue_.push_if_live(high_slot);
+    }
+    if (should_split_shard(mid, low_t2_bytes) && merged_entries.front().key < merged_entries[mid - 1].key) {
       queue_.push_if_live(low_slot);
     }
-    if (merged_entries.size() - mid >= threshold && merged_entries[mid].key < merged_entries.back().key) {
+    if (should_split_shard(merged_entries.size() - mid, high_t2_bytes) &&
+        merged_entries[mid].key < merged_entries.back().key) {
       queue_.push_if_live(high_slot);
     }
     low_slot->outside_refs.fetch_sub(1, std::memory_order_release);
@@ -902,7 +973,26 @@ class ShardedT1Index {
     return std::max<size_t>(1, (hardware_threads == 0 ? 4 : hardware_threads) / 4);
   }
 
-  // Enqueues past the soft threshold (scan-aware) or a shard's worth of tombstones -- deletes
+  void note_put_applied(ShardSlot *slot, Payload value, bool is_inline, bool mark_t2_dirty) {
+    if (mark_t2_dirty && value != STORE_NOT_FOUND && !is_inline) {
+      dirty_queue_.push_if_live(slot);
+      const uint64_t rec_bytes = sharded_detail::payload_t2_bytes(value, is_inline);
+      if (rec_bytes > 0) {
+        const uint64_t prev_bytes = slot->approx_t2_bytes.fetch_add(rec_bytes, std::memory_order_relaxed);
+        if (prev_bytes + rec_bytes >= Config::kSegmentBytes) {
+          request_maintenance_if_needed(slot);
+        }
+      }
+    }
+    if (value == STORE_NOT_FOUND) {
+      slot->tombstones_since_maintenance.fetch_add(1, std::memory_order_relaxed);
+      // Re-check post-increment: the final delete of a quiet workload must still trip the
+      // trigger without another write after it.
+      request_maintenance_if_needed(slot);
+    }
+  }
+
+  // Enqueues past the soft threshold or a shard's worth of tombstones -- deletes
   // only retarget T1 offsets, so delete-heavy workloads need the tombstone half to ever fire.
   // Push-vs-purge race-freedom comes from push_if_live()'s mutex-serialized superseded
   // re-check: ordered-before-purge gets cleaned; ordered-after sees set superseded and backs
@@ -910,9 +1000,11 @@ class ShardedT1Index {
   void request_maintenance_if_needed(ShardSlot *slot) {
     const size_t size = slot->index->append_size();
     const size_t cap = slot->index->append_capacity();
-    const bool over_soft = size >= maintenance_soft_threshold(cap, scan_active_.load(std::memory_order_relaxed));
+    const bool over_soft = size >= maintenance_soft_threshold(cap);
     const bool delete_heavy = slot->tombstones_since_maintenance.load(std::memory_order_relaxed) >= target_shard_size_;
-    if (!over_soft && !delete_heavy) {
+    const bool over_t2_bytes =
+        size > 0 && slot->approx_t2_bytes.load(std::memory_order_relaxed) >= Config::kSegmentBytes;
+    if (!over_soft && !delete_heavy && !over_t2_bytes) {
       return;
     }
     queue_.push_if_live(slot);
@@ -934,8 +1026,11 @@ class ShardedT1Index {
   // (caller must then drop its own outside_refs pin before continue_split(), which drains
   // pins). The caller must already pin `slot` (routing guard or outside_refs); no extra
   // guard is taken here.
-  [[nodiscard]] auto try_claim_split(ShardSlot *slot, size_t merged_size) -> bool {
-    if (merged_size < split_threshold(target_shard_size_, Config::kShardSplitThresholdPercent)) {
+  [[nodiscard]] auto try_claim_split(ShardSlot *slot,
+                                     std::span<const EntrySnapshot> merged_entries,
+                                     uint64_t merged_t2_bytes) -> bool {
+    if (!should_split_shard(merged_entries.size(), merged_t2_bytes) ||
+        !(merged_entries.front().key < merged_entries.back().key)) {
       return false;
     }
     if (splits_paused_.load(std::memory_order_acquire) != 0 || slot->split_paused.load(std::memory_order_seq_cst)) {
@@ -1000,9 +1095,7 @@ class ShardedT1Index {
     // compaction worker (the pause holder) busy -- waiting would deadlock bulk loads.
     const bool pause_active =
         splits_paused_.load(std::memory_order_acquire) != 0 || slot->split_paused.load(std::memory_order_acquire);
-    if (pause_active &&
-        slot->index->append_size() <
-            maintenance_soft_threshold(slot->index->append_capacity(), scan_active_.load(std::memory_order_relaxed))) {
+    if (pause_active && slot->index->append_size() < maintenance_soft_threshold(slot->index->append_capacity())) {
       slot->outside_refs.fetch_sub(1, std::memory_order_relaxed);
       queue_.push_if_live(slot);
       return false;
@@ -1016,12 +1109,16 @@ class ShardedT1Index {
                               reorganized = true;
                             },
                             /*parallel_sort=*/false);
+    uint64_t merged_t2_bytes = 0;
     if (reorganized) {
+      merged_t2_bytes = sharded_detail::sum_entries_t2_bytes(merged_entries);
+      slot->approx_t2_bytes.store(merged_t2_bytes, std::memory_order_relaxed);
       slot->tombstones_since_maintenance.store(0, std::memory_order_relaxed);
     }
 
-    const bool won = try_claim_split(slot, merged_entries.size());
-    if (!won && merged_entries.size() >= split_threshold(target_shard_size_, Config::kShardSplitThresholdPercent) &&
+    const bool won = try_claim_split(slot, merged_entries, merged_t2_bytes);
+    if (!won && should_split_shard(merged_entries.size(), merged_t2_bytes) &&
+        merged_entries.front().key < merged_entries.back().key &&
         slot->superseded.load(std::memory_order_acquire) == nullptr) {
       // Lost to a pause (or a lost reorganize race another round will retry): re-drive
       // instead of dropping the signal.
@@ -1034,8 +1131,6 @@ class ShardedT1Index {
     return true;
   }
 
-  // See set_scan_active().
-  mutable std::atomic<bool> scan_active_{false};
   mutable ThreadReferenceTracker<uint64_t> routing_epochs_;
   std::atomic<uint64_t> routing_epoch_{1};
   std::atomic<uint64_t> total_splits_{0};
@@ -1044,7 +1139,10 @@ class ShardedT1Index {
   std::atomic<Directory *> directory_{nullptr};
   size_t append_cap_;
   size_t target_shard_size_;
-  ShardQueue queue_;
+  ShardQueue<&ShardSlot::maintenance_pending> queue_;
+  ShardQueue<&ShardSlot::t2_dirty> dirty_queue_;
+  std::atomic<size_t> active_dirty_visits_{0};
+  std::atomic<size_t> compaction_cursor_{0};
   std::vector<std::jthread> workers_;
   // Set for checkpoint_all_shards()' duration: directory stays stable (splits initiate only
   // at the Closing CAS, which checks this); in-flight splits are unaffected.

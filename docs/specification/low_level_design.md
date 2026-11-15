@@ -116,7 +116,7 @@ struct VMemKV {
     Wal wal;
     T2Ownership t2_own;   // segment live-byte accounting, checkpoint watermark, in-place barrier
     ReorgState reorg;     // checkpoint/reorganize single-flight state
-    // + key stripe 256, background workers (reorg/compaction/T1 pool), bulk-load throttle
+    // + key stripe 256, background workers (T1 pool + single T2 maintenance worker), bulk-load throttle
 };
 ```
 
@@ -211,13 +211,12 @@ flowchart TD
 
 **Procedure**
 
-1. Acquire a `ScanActiveGuard`. While held, the shard maintenance soft threshold drops to the L2 cache size cap.
-2. Walk all of Tier 1's `append_region`, gathering in-range `IndexEntry`s as candidates.
-3. Binary-search Tier 1's `sorted_region` by `key_prefix`, enumerating in-range candidates.
-4. Confirm `payload_bits != STORE_NOT_FOUND` per candidate. Inline entries restore the value by byte-copying `payload_bits` per `inline_size`, restoring the key by trimming trailing zeros of the 16-byte prefix.
-5. Read T2 records sequentially for non-inline candidates in T1's yield (key) order.
-6. Fetch Tier 2 records from `payload_bits`.
-7. Compare full keys, returning only in-range records.
+1. Walk Tier 1's `append_region`, gathering in-range `IndexEntry`s as candidates.
+2. Binary-search Tier 1's `sorted_region` by `key_prefix`, enumerating in-range candidates.
+3. Confirm `payload_bits != STORE_NOT_FOUND` per candidate. Inline entries restore the value by byte-copying `payload_bits` per `inline_size`, restoring the key by trimming trailing zeros of the 16-byte prefix.
+4. Read T2 records sequentially for non-inline candidates in T1's yield (key) order.
+5. Fetch Tier 2 records from `payload_bits`.
+6. Compare full keys, returning only in-range records.
 
 **Notes**
 
@@ -342,15 +341,15 @@ $$\text{Checkpoint\_Trigger} = \text{WAL\_Bytes} \ge \text{WAL\_MAX\_BYTES} \lor
 
 ### 4.5 T2 Compaction
 
-The background compaction worker operates in two distinct execution modes:
-- **Immediate drain**: When on-demand segment repair requests (`dirty_segments`) or shard key-order repairs (`dirty_shard`) are present, the worker loops continuously without delay to restore sequential scan performance.
-- **Rate-limited defragmentation**: During steady-state write workloads without scan requests, the worker evacuates garbage segments at a paced 1-second cadence (`find_garbage_segment()`), preventing compaction loops from consuming writer bandwidth.
+The T2 maintenance worker restores 4KiB page locality for scans and reclaims sparse 8MiB segments through a single primitive: **whole-shard key-ordered repack (`repack_dirty_shard`)**.
+- **Dirty-shard repack (`dirty_queue_`)**: Shards receiving T2 offset writes are enqueued in $O(1)$ on their first write. The worker checks in RAM whether the shard's live entries are already 4KiB-page-local; if not (or if any entry overlaps a frozen garbage segment), the entire shard is rewritten contiguously in full-key order to the T2 append frontier.
+- **Garbage-segment evacuation (`garbage_head_`)**: When overwrites or deletes reduce a segment's live bytes below 50% of `kSegmentBytes` ($< 4\,\text{MiB}$), `subtract_segment()` pushes the segment onto `garbage_head_` in $O(1)$. The worker visits T1 shards and runs the same `repack_dirty_shard()` on any shard overlapping a frozen garbage segment, emptying the source segment.
 
 Relocations update T1 via stripe-locked CAS without emitting WAL records. Hole punching reclaims 8MiB segments whose live-byte count is zero after an epoch gate (two completed checkpoints). See `t2_compaction_design.md` and `background_jobs.md` for full design and coordination details.
 
 ### 4.6 T1 Reorganize Auto-Trigger
 
-Each shard's `append_region` is watched independently by a dedicated background worker thread pool. When a shard's `append_size()` reaches `maintenance_soft_threshold(append_capacity, scan_active)`, only that shard enters the maintenance queue, and a worker runs `reorganize()` (splitting as needed). Neither other shards nor caller threads block. For delete-heavy cases where append never swells, `tombstones_since_maintenance >= target_shard_size` also enqueues. See [`t1_sharding_design.md`](t1_sharding_design.md)'s background-worker-thread-pool section.
+Each shard's `append_region` is watched independently by a dedicated background worker thread pool. When a shard's `append_size()` reaches `maintenance_soft_threshold(append_capacity)` or its referenced T2 bytes reach `kSegmentBytes` (8 MiB), that shard enters the maintenance queue, and a worker runs `reorganize()` (splitting when live entries exceed the entry-count threshold or `kSegmentBytes` of referenced T2 bytes). Neither other shards nor caller threads block. For delete-heavy cases where append never swells, `tombstones_since_maintenance >= target_shard_size` also enqueues. See [`t1_sharding_design.md`](t1_sharding_design.md)'s background-worker-thread-pool section.
 
 ## 5. Checkpoint Reload
 
@@ -580,12 +579,12 @@ For LTM operation, classic LRU (MGLRU disabled) is recommended. MGLRU (Multi-Gen
 | Parameter | Meaning |
 | --- | --- |
 | `kAppendCapacityEntries` | Per-shard `append_region` capacity (entries) |
-| `kShardTargetSizeEntries` | Target live entries per shard. Background workers split shards reaching `kShardSplitThresholdPercent`% of this value |
+| `kShardTargetSizeEntries` | Fallback target live entries per shard (for inline/standalone T1). Background workers split shards reaching `kShardSplitThresholdPercent`% of this value or `kSegmentBytes` of referenced T2 live bytes |
 | `kShardSplitThresholdPercent` | Split-fire threshold (%) against `kShardTargetSizeEntries` |
 | `kDefaultCapacityBytes` | Tier 2 maximum virtual address space |
 | `kMaxBytesSinceCheckpoint` | Cap on WAL-accumulated bytes since the last checkpoint. Exceeding promotes to checkpoint() |
-| `kSegmentBytes` | Tier 2 fixed segment length. Not a tuning knob |
+| `kSegmentBytes` | Tier 2 fixed segment length (8 MiB) and T1 shard T2-byte split threshold. Not a tuning knob |
 | `kCompactionMaxMoveBytesPerCycle` | Per-compaction-cycle T2 relocation budget (bytes). A single T1 shard is the indivisible unit |
-| `maintenance_soft_threshold` | 50% of shard append capacity. Drops to the L2 cache size cap during Scan holds. Background maintenance enqueue threshold |
+| `maintenance_soft_threshold` | 50% of shard append capacity. Background maintenance enqueue threshold |
 | `kWalCheckStride` | WAL size-trigger sampling interval. Every 64 writes |
 | `T1` background worker pool size | No configuration knob. Default max(1, hardware_concurrency/4) |

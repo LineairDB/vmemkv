@@ -26,7 +26,7 @@ The directory applies one level up the RCU-style pattern T1Index itself already 
 **2-phase protocol (Closing → Split)**:
 
 1. A normal `reorganize()` completes;
-if the resulting (`merged`) size exceeds the target shard size threshold (e.g. 2x), the shard qualifies for split.
+if the resulting (`merged`) live entries reach either `kSegmentBytes` (8 MiB) of referenced T2 payload bytes or the entry-count fallback threshold (`kShardTargetSizeEntries × kShardSplitThresholdPercent`), the shard qualifies for split.
 2. Set the target shard's `ShardSlot.superseded` to `Closing` (S1/S2 don't exist yet; merely a mark of "accept no further new writes"). put/remove check `superseded` and spin-wait on `Closing` without writing (get/scan may keep reading the target shard directly — data is intact, only writes stop).
 3. Call the target shard's `reorganize()` once more. It folds writes that were in flight on the target shard when `Closing` was set into `merged`. New writes arriving after `Closing` are stopped by (2), so this second `merged` is that shard's complete final state.
 4. Split this final `merged` in the middle, building new shards from each half (empty append region + split sorted region).
@@ -41,11 +41,11 @@ if the resulting (`merged`) size exceeds the target shard size threshold (e.g. 2
           Cost is amortized O(1) /
           insert; worst-case one-shot cost is O(shard size), independent of total corpus size (the second `reorganize()` is also O(shard size), adding only a constant factor). Even with monotonically increasing keys like `bench_helpers.hpp`'s `ikey()` (`"k"` + 15 hex digits), only the rightmost shard keeps growing, so this property holds.
 
-## APPEND_CAP Handling
+## APPEND_CAP and Byte-Bounded Shard Splitting
 
-Each shard's `APPEND_CAP` is fixed and bears no proportional relation to the shard target size. New shards inherit the parent shard's `append_capacity()`. The default is `Config::kAppendCapacityEntries` (16K entries); the soft maintenance threshold (half of it) equals the 8K-entry split threshold of the default shard target (`kShardTargetSizeEntries` = 4K entries), so a shard spans about one 8 MiB T2 segment of 1KB values.
+Each shard's `APPEND_CAP` is fixed and bears no proportional relation to the shard target size. New shards inherit the parent shard's `append_capacity()`. The default is `Config::kAppendCapacityEntries` (16K entries).
 
-Split decisions use live entry counts of `kShardTargetSizeEntries` × `kShardSplitThresholdPercent`, independent of `APPEND_CAP`. Tuning knobs remain shard target size, split threshold, and `APPEND_CAP` individually — they are not aggregated into a single "shard target size".
+Split decisions use `should_split_shard(entry_count, t2_bytes)`: a shard splits when its referenced T2 live bytes reach `Config::kSegmentBytes` (8 MiB, matching the T2 hole-punch segment size regardless of record value size) or when its live entry count reaches `kShardTargetSizeEntries` × `kShardSplitThresholdPercent` (fallback for inline-only or standalone T1 workloads). This guarantees that repacking a single T1 shard moves at most one 8 MiB T2 segment's worth of data.
 
 Splits all run independently and concurrently per shard via the mechanism in the "background worker thread pool" section. Only directory updates serialize through CAS on the shared object.
 

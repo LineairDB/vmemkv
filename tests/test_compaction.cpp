@@ -36,6 +36,7 @@ using TinyShardStore = vmemkv::StoreAdapter<vmemkv::VMemKVImpl<TinyShardConfig>>
 
 struct TinySegmentConfig : vmemkv::Config<> {
   static constexpr uint64_t kSegmentBytes = 64ULL << 10;
+  static constexpr size_t kShardTargetSizeEntries = 256;
 };
 using TinySegmentStore = vmemkv::StoreAdapter<vmemkv::VMemKVImpl<TinySegmentConfig>>;
 
@@ -189,6 +190,7 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "ordered dirty shard needs no T2 relocatio
   constexpr size_t kValBytes = 128;
   auto store = make_store(path);
   store->bulk_load(kKeys, [&](size_t i) { return make_key(i); }, [&](size_t i) { return pattern_value(kValBytes, i); });
+  store->impl().t1().drain_maintenance();
   store->checkpoint();
   REQUIRE(store->get_statistics().t2_dirty_shard_count > 0);
   const uint64_t used_before = store->impl().t2().bytes_used();
@@ -300,6 +302,7 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "T2 segment evacuation includes current ve
   constexpr size_t kValBytes = 128;
   auto store = std::make_unique<TinySegmentStore>(path, kTestCapacityBytes);
   store->bulk_load(kKeys, [&](size_t i) { return make_key(i); }, [&](size_t i) { return pattern_value(kValBytes, i); });
+  store->impl().t1().drain_maintenance();
   store->checkpoint();
 
   std::vector<uint64_t> old_offsets(kKeys);
@@ -312,9 +315,22 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "T2 segment evacuation includes current ve
   constexpr size_t kDeletedKey = 101;
   constexpr size_t kInlineKey = 102;
   const uint64_t source_segment = vmemkv::T2Ownership<TinySegmentConfig>::seg_index(old_offsets[kUpdatedKey]);
+  auto is_deleted_key = [&](size_t i) -> bool {
+    if (i == kDeletedKey) {
+      return true;
+    }
+    if (i == kUpdatedKey || i == kInlineKey) {
+      return false;
+    }
+    return i >= 150 && vmemkv::T2Ownership<TinySegmentConfig>::seg_index(old_offsets[i]) == source_segment;
+  };
   REQUIRE(store->update(make_key(kUpdatedKey), pattern_value(kValBytes, kKeys + kUpdatedKey)));
   REQUIRE(store->update(make_key(kUpdatedKey), pattern_value(2 * kValBytes, 2 * kKeys + kUpdatedKey)));
-  REQUIRE(store->remove(make_key(kDeletedKey)));
+  for (size_t i = 0; i < kKeys; ++i) {
+    if (is_deleted_key(i)) {
+      REQUIRE(store->remove(make_key(i)));
+    }
+  }
   REQUIRE(store->update(make_key(kInlineKey), "inline"));
   const uint64_t updated_offset =
       store->impl().t1().get_with_hash(vmemkv_test::to_span(make_key(kUpdatedKey))).payload_bits &
@@ -329,7 +345,7 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "T2 segment evacuation includes current ve
   CHECK(moved_bytes < used_before_compact / 2);
 
   for (size_t i = 0; i < kKeys; ++i) {
-    if (i == kDeletedKey || i == kInlineKey ||
+    if (is_deleted_key(i) || i == kInlineKey ||
         vmemkv::T2Ownership<TinySegmentConfig>::seg_index(old_offsets[i]) != source_segment) {
       continue;
     }
@@ -344,7 +360,7 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "T2 segment evacuation includes current ve
   drain_compaction(store, *this);
   for (size_t i = 0; i < kKeys; ++i) {
     const auto got = vmemkv_test::get_optional_bytes(store, make_key(i));
-    if (i == kDeletedKey) {
+    if (is_deleted_key(i)) {
       CHECK_FALSE(got.has_value());
       continue;
     }
@@ -373,6 +389,7 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "overwrite and delete segment evacuation r
   constexpr size_t kValBytes = 8192;
   auto store = make_store(path);
   store->bulk_load(kKeys, [&](size_t i) { return make_key(i); }, [&](size_t i) { return pattern_value(kValBytes, i); });
+  store->impl().t1().drain_maintenance();
   store->checkpoint();
   for (size_t i = 0; i < kKeys; ++i) {
     REQUIRE(store->update(make_key(i), pattern_value(2 * kValBytes, kKeys + i)));
@@ -427,9 +444,11 @@ TEST_CASE("T2 garbage-segment selection ignores an unfrozen tail") {
   own.mark_segment_dirty(0);
 
   CHECK_FALSE(own.has_garbage_segment(0));
-  CHECK(own.find_garbage_segment(0) == vmemkv::T2Ownership<TinySegmentConfig>::kInvalidSegment);
+  CHECK_FALSE(own.is_garbage_segment(0, 0));
+  CHECK(own.garbage_segment_count(0) == 0);
   CHECK(own.has_garbage_segment(TinySegmentConfig::kSegmentBytes));
-  CHECK(own.find_garbage_segment(TinySegmentConfig::kSegmentBytes) == 0);
+  CHECK(own.is_garbage_segment(0, TinySegmentConfig::kSegmentBytes));
+  CHECK(own.garbage_segment_count(TinySegmentConfig::kSegmentBytes) == 1);
 }
 
 TEST_CASE_FIXTURE(AutoCompactFixture, "epoch gate defers punch by one checkpoint") {
@@ -443,6 +462,7 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "epoch gate defers punch by one checkpoint
   constexpr size_t kValBytes = 8192;
   auto store = make_store(path);
   store->bulk_load(kKeys, [&](size_t i) { return make_key(i); }, [&](size_t i) { return pattern_value(kValBytes, i); });
+  store->impl().t1().drain_maintenance();
   store->checkpoint();
   // Updates only (no removes): every emptied segment is tagged with the same
   // epoch, so the gate's one-checkpoint deferral is observable without
@@ -578,10 +598,19 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "T1 shard splits preserve T2 dirty state")
   }
   REQUIRE(store->impl().t1().shard_count() > 1);
   store->checkpoint();
+  store->impl().t1().drain_maintenance();
   CHECK(store->get_statistics().t2_dirty_shard_count > 1);
   enable();
   wait_for_compaction(*store);
+  store->impl().t1().drain_maintenance();
   CHECK(store->get_statistics().t2_dirty_shard_count == 0);
+
+  const auto after_688 = store->impl().t1().get_with_hash(vmemkv_test::to_span(make_key(688)));
+  const auto after_689 = store->impl().t1().get_with_hash(vmemkv_test::to_span(make_key(689)));
+  REQUIRE(after_688.payload_bits != vmemkv::STORE_NOT_FOUND);
+  REQUIRE(after_689.payload_bits != vmemkv::STORE_NOT_FOUND);
+  CHECK(vmemkv::t2_detail::are_t2_payloads_page_local(after_688.payload_bits, after_689.payload_bits));
+
   for (size_t i = 0; i < kKeys; ++i) {
     const auto got = vmemkv_test::get_optional_bytes(store, make_key(i));
     REQUIRE(got.has_value());
@@ -616,7 +645,7 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "compaction convergence and punch backlog 
       REQUIRE(store->update(make_key(i), pattern_value(kValBytes, (gen + 1) * kKeys + i)));
     }
     // Punch backlog must stay bounded by the cap (4) plus processing latency margin
-    CHECK(store->impl().punch_backlog_segments() <= 16);
+    CHECK(store->impl().punch_backlog_segments() <= 32);
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
   }
 

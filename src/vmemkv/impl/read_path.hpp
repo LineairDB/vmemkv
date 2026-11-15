@@ -332,13 +332,4 @@ inline auto scan_bounds_clean(std::span<const std::byte> lower_bound,
   return bound_is_clean(lower_bound) && bound_is_clean(upper_bound);
 }
 
-// Lowers ShardedT1Index's maintenance soft threshold for the scan's duration, keeping append
-// regions L2-cache-sized while the scan linearly passes over them.
-template <typename T1>
-struct ScanActiveGuard {
-  const T1 &t1;
-  explicit ScanActiveGuard(const T1 &index) : t1(index) { t1.set_scan_active(true); }
-  ~ScanActiveGuard() { t1.set_scan_active(false); }
-};
-
 }  // namespace vmemkv

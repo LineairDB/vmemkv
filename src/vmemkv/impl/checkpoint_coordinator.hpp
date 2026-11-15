@@ -35,15 +35,7 @@ namespace vmemkv {
 // a manifest (docs/specification/low_level_design.md 5.2, 5.5). Re-exported as VMemKVImpl's nested ReorgMode.
 enum class ReorgMode : std::uint8_t { T1Only, Checkpoint };
 
-// Single-flight and trigger state for reorganize/checkpoint cycles.
-struct ReorgTrigger {
-  std::atomic<bool> requested{false};
-  std::atomic<bool> running{false};
-  // Strides wal_over_threshold() sampling below (an fstat(), too dear per write).
-  mutable std::atomic<uint64_t> wal_check_counter{0};
-};
-
-// Cycle accounting: published stats for get_statistics().
+// Cycle accounting and single-flight state for reorganize/checkpoint cycles.
 struct ReorgStats {
   mutable std::atomic<uint64_t> checkpoint_count{0};
   mutable std::atomic<uint64_t> total_wait_us{0};
@@ -53,7 +45,7 @@ struct ReorgStats {
 };
 
 struct ReorgState {
-  ReorgTrigger trigger;
+  std::atomic<bool> running{false};
   ReorgStats stats;
 };
 
@@ -98,25 +90,13 @@ inline auto checkpoint_due(const Wal &wal, const T2Ownership<ConfigT> &own) -> b
   return wal_over_threshold(wal) || punch_backlog_over_cap<ConfigT>(own);
 }
 
-template <typename ConfigT>
-inline void maybe_reorganize_if_needed(ReorgTrigger &trigger, const Wal &wal, const T2Ownership<ConfigT> &own) {
-  // Sampled once every kWalCheckStride writes: the delay past the byte threshold is bounded by
-  // kWalCheckStride writes' worth of bytes, a rounding error against the threshold itself.
-  constexpr uint64_t kWalCheckStride = 64;
-  if (trigger.wal_check_counter.fetch_add(1, std::memory_order_relaxed) % kWalCheckStride == 0) {
-    if (wal_over_threshold(wal) || punch_backlog_over_cap<ConfigT>(own)) {
-      trigger.requested.store(true, std::memory_order_release);
-    }
-  }
-}
-
 // Bounded poll, not atomic::wait(): no timed overload to bound a missed wakeup. Callers only
 // arrive with a cycle already in flight, so the wait is already bounded by a reorganize's own
 // duration. Serializes explicit reorganize()/checkpoint() callers only; writes never call this.
 inline void wait_until_reorg_not_running(const ReorgState &state) {
   constexpr auto kIdlePollInterval = kDefaultPoll10ms;
   const auto wait_start = std::chrono::steady_clock::now();
-  while (state.trigger.running.load(std::memory_order_acquire)) {
+  while (state.running.load(std::memory_order_acquire)) {
     std::this_thread::sleep_for(kIdlePollInterval);
   }
   // Summed explicit-caller wait (not the checkpoint's own overlapped duration).
@@ -442,7 +422,7 @@ void run_reorganize(ReorgState &state,
       return;
     }
 
-    if (auto guard = SingleFlightGuard::try_acquire(state.trigger.running); guard.holds) {
+    if (auto guard = SingleFlightGuard::try_acquire(state.running); guard.holds) {
       reorganize_internal(state, tier1, tier2, wal, own, t2_path, recovering, mode, pre_stop_hook, pre_finish_hook);
       return;
     }

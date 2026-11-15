@@ -199,10 +199,7 @@ class VMemKVImpl {
     t1_.drain_maintenance();
     SpinBackoff backoff;
     for (;;) {
-      const T2Memory *mem = t2_.get_memory();
-      const uint64_t base = mem != nullptr ? mem->base_boundary.load(std::memory_order_acquire) : 0;
-      if (!t2_own_.has_dirty_segments() && !t2_own_.has_garbage_segment(base) && !t1_.has_dirty_shard() &&
-          !compact_.running.load(std::memory_order_acquire)) {
+      if (!has_garbage_segments() && !t1_.has_dirty_shard() && !compact_.running.load(std::memory_order_acquire)) {
         break;
       }
       if (!run_compaction_cycle()) {
@@ -221,7 +218,17 @@ class VMemKVImpl {
   auto pending_segment_count() const -> size_t {
     const T2Memory *mem = t2_.get_memory();
     const uint64_t base = mem != nullptr ? mem->base_boundary.load(std::memory_order_acquire) : 0;
-    return t2_own_.dirty_segment_count() + static_cast<size_t>(t2_own_.has_garbage_segment(base));
+    const uint64_t used = mem != nullptr ? mem->bytes_used.load(std::memory_order_acquire) : 0;
+    return t2_own_.garbage_segment_count(base, used);
+  }
+  auto has_garbage_segments() const -> bool {
+    const T2Memory *mem = t2_.get_memory();
+    const uint64_t base = mem != nullptr ? mem->base_boundary.load(std::memory_order_acquire) : 0;
+    const uint64_t used = mem != nullptr ? mem->bytes_used.load(std::memory_order_acquire) : 0;
+    return t2_own_.has_garbage_segment(base, used);
+  }
+  auto has_compaction_work() const -> bool {
+    return t2_own_.has_punch_candidates() || t1_.has_dirty_shard() || has_garbage_segments();
   }
   auto punch_backlog_segments() const -> size_t { return t2_own_.punch_backlog_segments(); }
   auto compaction_running() const noexcept -> bool { return compact_.running.load(std::memory_order_acquire); }
@@ -248,23 +255,19 @@ class VMemKVImpl {
   // dangling offsets for concurrent readers); WAL append comes last, only after the mutation
   // succeeds (logging first would persist a never-happened write; replay would re-throw on
   // every restart, bricking the store -- unlogged failure is safe since T1/T2 rebuild from
-  // the WAL). WAL wait and reorg check run after the stripe releases.
+  // the WAL). WAL wait runs after the stripe releases.
   auto insert_impl(std::span<const std::byte> full_key, std::span<const std::byte> value) -> bool {
-    auto check = maybe_reorg_fn();
     return vmemkv::with_key_stripe(
         lock_stripe_fn(),
         [this](Wal::PendingRecord *pending) { wal_.await_durable(pending); },
-        check,
         full_key,
         [&]() -> vmemkv::StripeResult {
           const auto old = t1_.get_with_hash(full_key);
           if (old.payload_bits != vmemkv::STORE_NOT_FOUND) {
             return {};
           }
-          if (vmemkv::write_entry_lockfree<ConfigT>(t1_, t2_, t2_own_, check, full_key, value, old)) {
-            return {true, wal_.reserve_insert(full_key, value), true};
-          }
-          return {false, nullptr, true};
+          vmemkv::write_entry_lockfree<ConfigT>(t1_, t2_, t2_own_, full_key, value, old);
+          return {true, wal_.reserve_insert(full_key, value)};
         });
   }
 
@@ -324,14 +327,12 @@ class VMemKVImpl {
   }
 
   // Updates an existing key: in-place on T2 when the allocation fits, else append + T1
-  // repoint. WAL append only after the mutation applies. Stripe-guarded; WAL wait and reorg
-  // check run after release.
+  // repoint. WAL append only after the mutation applies. Stripe-guarded; WAL wait runs after
+  // release.
   auto update_impl(std::span<const std::byte> full_key, std::span<const std::byte> value) -> bool {
-    auto check = maybe_reorg_fn();
     return vmemkv::with_key_stripe(
         lock_stripe_fn(),
         [this](Wal::PendingRecord *pending) { wal_.await_durable(pending); },
-        check,
         full_key,
         [&]() -> vmemkv::StripeResult {
           // Ungated lookup: when the *current* value is inline this call never touches T2
@@ -341,10 +342,8 @@ class VMemKVImpl {
             return {};
           }
           if (t1_detail::is_inline(quick.raw_hash)) {
-            if (vmemkv::write_entry_lockfree<ConfigT>(t1_, t2_, t2_own_, check, full_key, value, quick)) {
-              return {true, wal_.reserve_update(full_key, value), true};
-            }
-            return {false, nullptr, true};
+            vmemkv::write_entry_lockfree<ConfigT>(t1_, t2_, t2_own_, full_key, value, quick);
+            return {true, wal_.reserve_update(full_key, value)};
           }
           const vmemkv::InPlaceUpdateResult result =
               vmemkv::try_in_place_update<ConfigT>(t1_, t2_, t2_own_, wal_, full_key, value);
@@ -352,12 +351,10 @@ class VMemKVImpl {
             return {};
           }
           if (result.outcome == vmemkv::InPlaceOutcome::Applied) {
-            return {true, result.pending, false};
+            return {true, result.pending};
           }
-          if (vmemkv::write_entry_lockfree<ConfigT>(t1_, t2_, t2_own_, check, full_key, value, quick)) {
-            return {true, wal_.reserve_update(full_key, value), true};
-          }
-          return {false, nullptr, true};
+          vmemkv::write_entry_lockfree<ConfigT>(t1_, t2_, t2_own_, full_key, value, quick);
+          return {true, wal_.reserve_update(full_key, value)};
         });
   }
 
@@ -367,21 +364,15 @@ class VMemKVImpl {
     return vmemkv::with_key_stripe(
         lock_stripe_fn(),
         [this](Wal::PendingRecord *pending) { wal_.await_durable(pending); },
-        maybe_reorg_fn(),
         full_key,
         [&]() -> vmemkv::StripeResult {
           const auto old = t1_.get_with_hash(full_key);
           if (old.payload_bits == vmemkv::STORE_NOT_FOUND) {
             return {};
           }
-          const bool old_t2 = !t1_detail::is_inline(old.raw_hash);
-          if (t1_.put(full_key,
-                      vmemkv::STORE_NOT_FOUND,
-                      /*is_inline=*/false,
-                      0,
-                      /*mark_t2_dirty=*/old_t2) == T1IndexT::PutResult::Applied) {
-            t2_own_.note_replace(old.payload_bits, old.raw_hash, /*new_is_offset=*/false, 0, true);
-            return {true, wal_.reserve_delete(full_key), false};
+          if (t1_.put(full_key, vmemkv::STORE_NOT_FOUND) == T1IndexT::PutResult::Applied) {
+            t2_own_.note_replace(old.payload_bits, old.raw_hash, /*new_is_offset=*/false, 0);
+            return {true, wal_.reserve_delete(full_key)};
           }
           return {};
         });
@@ -393,16 +384,13 @@ class VMemKVImpl {
   // Not safe concurrently with other writers.
   template <typename KeyFn, typename ValueFn>
   void bulk_load_impl(std::size_t count, KeyFn &&make_key, ValueFn &&make_value) {
-    auto check = maybe_reorg_fn();
     for (std::size_t index = 0; index < count; ++index) {
-      maybe_reorganize_if_needed();
       const std::string key = make_key(index);
       const std::string value = make_value(index);
       vmemkv::write_entry_lockfree<ConfigT>(
           t1_,
           t2_,
           t2_own_,
-          check,
           std::span<const std::byte>(reinterpret_cast<const std::byte *>(key.data()), key.size()),
           std::span<const std::byte>(reinterpret_cast<const std::byte *>(value.data()), value.size()),
           std::nullopt);
@@ -413,12 +401,11 @@ class VMemKVImpl {
   // Range scan invoking callback(key, val) per live match. Concurrently readable: t1_.scan()
   // holds one self-consistent epoch-guarded snapshot for the whole call, including callbacks.
   template <typename Callback>
+  // NOLINTNEXTLINE(readability-function-cognitive-complexity)
   auto scan_impl(std::span<const std::byte> lower_bound,
                  std::span<const std::byte> upper_bound,
                  Callback callback) const -> size_t {
     size_t total_count = 0;
-
-    vmemkv::ScanActiveGuard<T1IndexT> scan_active_guard(t1_);
 
     // Bounds are constant per call: check once whether prefix containment already implies
     // full-key containment, skipping the per-entry recheck when it does.
@@ -492,43 +479,12 @@ class VMemKVImpl {
 
  private:
   auto run_compaction_cycle() -> bool {
-    return compaction_detail::compact_cycle<ConfigT>(
-        compact_, t1_, t2_, t2_own_, t2_path(), lock_stripe_fn(), maybe_reorg_fn());
-  }
-
-  void compaction_worker_loop(std::stop_token stop_token) {
-    poll_worker_until_stop(stop_token, kCompactionPoll1s, [&] {
-      if (recovering_ || vmemkv::auto_compact_suppressed()) {
-        return false;
-      }
-      const T2Memory *mem = t2_.get_memory();
-      const uint64_t base = mem != nullptr ? mem->base_boundary.load(std::memory_order_acquire) : 0;
-      const bool has_work = t2_own_.has_dirty_segments() || t2_own_.has_punch_candidates() || t1_.has_dirty_shard() ||
-                            t2_own_.has_garbage_segment(base);
-      if (!has_work) {
-        return false;
-      }
-      try {
-        run_compaction_cycle();
-        // NOLINTNEXTLINE(bugprone-empty-catch)
-      } catch (...) {
-        // Intentionally swallowed: background loop; foreground propagation would terminate
-        // the worker. Retry next poll.
-      }
-      const uint64_t post_base = mem != nullptr ? mem->base_boundary.load(std::memory_order_acquire) : 0;
-      return t2_own_.has_dirty_segments() || t1_.has_dirty_shard() || t2_own_.has_garbage_segment(post_base);
-    });
+    return compaction_detail::compact_cycle<ConfigT>(compact_, t1_, t2_, t2_own_, t2_path(), lock_stripe_fn());
   }
 
   void run_reorganize(ReorgMode mode) {
     checkpoint_detail::run_reorganize(
         reorg_, t1_, t2_, wal_, t2_own_, t2_path(), recovering_, mode, NoOpPreStopHook{}, NoOpPreFinishHook{});
-  }
-
-  void maybe_reorganize_if_needed() { checkpoint_detail::maybe_reorganize_if_needed(reorg_.trigger, wal_, t2_own_); }
-
-  auto maybe_reorg_fn() {
-    return [this] { maybe_reorganize_if_needed(); };
   }
 
   auto lock_stripe_fn() {
@@ -537,59 +493,13 @@ class VMemKVImpl {
 
   auto t2_path() const -> std::filesystem::path { return t2_.path(); }
 
-  // Phase 4 of construction: start background workers after recovery completes.
-  void spawn_background_workers() {
-    reorg_worker_ = std::jthread(&VMemKVImpl::reorg_worker_loop, this);
-    compact_worker_ = std::jthread(&VMemKVImpl::compaction_worker_loop, this);
-  }
+  // Phase 4 of construction: start the unified T2 maintenance worker after recovery completes.
+  void spawn_background_workers() { t2_worker_ = std::jthread(&VMemKVImpl::t2_maintenance_loop, this); }
 
   // Manifest-named live T2 bytes for T2FlatFile's adopt-constructor. Static: runs in the
   // constructor's initializer list before t2_ exists. Delegates to recovery_detail.
   static auto adopted_t2_bytes_used(const std::filesystem::path &t2_path) -> std::optional<uint64_t> {
     return recovery_detail::adopted_t2_bytes_used(t2_path);
-  }
-
-  [[nodiscard]] auto shard_pages_local(const std::vector<typename T1IndexT::EntrySnapshot> &entries) const -> bool {
-    const T2Memory *mem = t2_.get_memory();
-    auto is_live = [&](size_t index) -> bool {
-      return entries[index].payload_bits != vmemkv::STORE_NOT_FOUND && !t1_detail::is_inline(entries[index].hash);
-    };
-    const size_t count = entries.size();
-    size_t lead = 0;
-    while (lead < count && !is_live(lead)) {
-      ++lead;
-    }
-    while (lead < count) {
-      size_t next = lead + 1;
-      while (next < count && !is_live(next)) {
-        ++next;
-      }
-      if (next >= count) {
-        break;
-      }
-      if (!t2_detail::are_t2_payloads_page_local(entries[lead].payload_bits, entries[next].payload_bits)) {
-        return false;
-      }
-      const auto &lead_key = entries[lead].key;
-      const auto &next_key = entries[next].key;
-      if (lead_key < next_key) {
-        lead = next;
-        continue;
-      }
-      if (next_key < lead_key) {
-        return false;
-      }
-      const uint64_t lead_off = entries[lead].payload_bits & t2_detail::kPayloadOffsetMask;
-      const uint64_t next_off = entries[next].payload_bits & t2_detail::kPayloadOffsetMask;
-      const std::span<const std::byte> lead_full = T2FlatFile::at(lead_off, mem).key;
-      const std::span<const std::byte> next_full = T2FlatFile::at(next_off, mem).key;
-      if (std::lexicographical_compare_three_way(
-              lead_full.begin(), lead_full.end(), next_full.begin(), next_full.end()) >= 0) {
-        return false;
-      }
-      lead = next;
-    }
-    return true;
   }
 
   // Fast-boot (docs/specification/low_level_design.md 5.3): with a committed manifest, adopt its T1 sorted region
@@ -627,7 +537,7 @@ class VMemKVImpl {
           t2_own_.note_replace(vmemkv::STORE_NOT_FOUND, 0, /*new_is_offset=*/true, entry.payload_bits);
         }
       }
-      shard_local.push_back(shard_pages_local(entries));
+      shard_local.push_back(compaction_detail::shard_pages_local<EntrySnapshot>(entries, t2_.get_memory()));
       per_shard_entries.push_back(std::move(entries));
     }
 
@@ -646,12 +556,11 @@ class VMemKVImpl {
   }
 
   // Replays wal_ into T1 (and via the append path, T2) -- full history or post-checkpoint
-  // tail, transparently. Runs before reorg_worker_ starts (constructor order), so no
-  // VMemKVImpl-level thread can touch reorg state yet -- no single-flight needed against a
-  // nonexistent competitor. t1_'s own pool already runs (started post-checkpoint-load,
-  // pre-replay): replay leans on it for AppendRegionFull drainage like live traffic does.
+  // tail, transparently. Runs before t2_worker_ starts (constructor order), so no
+  // VMemKVImpl-level thread can touch T2 maintenance state yet. t1_'s own pool already runs
+  // (started post-checkpoint-load, pre-replay): replay leans on it for AppendRegionFull
+  // drainage like live traffic does.
   void recover_from_wal() {
-    auto check = maybe_reorg_fn();
     wal_.replay([&](vmemkv::WalRecordType type,
                     std::span<const std::byte> key,
                     std::span<const std::byte> value,
@@ -660,17 +569,12 @@ class VMemKVImpl {
         case vmemkv::WalRecordType::Insert:
         case vmemkv::WalRecordType::Update:
           // put() overwrites in place: Insert and Update replay identically, last-writer-wins.
-          vmemkv::write_entry_lockfree<ConfigT>(t1_, t2_, t2_own_, check, key, value, std::nullopt);
+          vmemkv::write_entry_lockfree<ConfigT>(t1_, t2_, t2_own_, key, value, std::nullopt);
           break;
         case vmemkv::WalRecordType::Delete: {
           const auto old = t1_.get_with_hash(key);
-          const bool old_t2 = old.payload_bits != vmemkv::STORE_NOT_FOUND && !t1_detail::is_inline(old.raw_hash);
-          if (t1_.put(key,
-                      vmemkv::STORE_NOT_FOUND,
-                      /*is_inline=*/false,
-                      0,
-                      /*mark_t2_dirty=*/old_t2) == T1IndexT::PutResult::Applied) {
-            t2_own_.note_replace(old.payload_bits, old.raw_hash, /*new_is_offset=*/false, 0, true);
+          if (t1_.put(key, vmemkv::STORE_NOT_FOUND) == T1IndexT::PutResult::Applied) {
+            t2_own_.note_replace(old.payload_bits, old.raw_hash, /*new_is_offset=*/false, 0);
           }
           break;
         }
@@ -681,47 +585,69 @@ class VMemKVImpl {
   // get_impl()/scan_impl()'s inline stack buffers are sized by T1Index's own cap -- the single
   // source of truth, so T1Index can never accept a payload wider than these buffers.
   static_assert(t1_detail::kInlineValueByteCount == sizeof(uint64_t));
-  void reorg_worker_loop(std::stop_token stop_token) {
-    // Fixed-interval poll, not a condvar: bounds shutdown latency and reaction time with no
-    // wakeup signal; imperceptible against a multi-millisecond reorganize.
-    constexpr auto kIdlePollInterval = kDefaultPoll10ms;
-    poll_worker_until_stop(stop_token, kIdlePollInterval, [&] {
-      // Auto-checkpoint check: WAL-size threshold or emergency punch-backlog cap.
-      if (!checkpoint_detail::auto_reorg_suppressed() && checkpoint_detail::checkpoint_due<ConfigT>(wal_, t2_own_)) {
-        reorg_.trigger.requested.store(true, std::memory_order_release);
-      }
-      if (!reorg_.trigger.requested.load(std::memory_order_acquire)) {
+  auto maybe_run_auto_checkpoint() -> bool {
+    if (checkpoint_detail::auto_reorg_suppressed() || !checkpoint_detail::checkpoint_due<ConfigT>(wal_, t2_own_)) {
+      return false;
+    }
+    auto guard = SingleFlightGuard::try_acquire(reorg_.running);
+    if (!guard.holds) {
+      return false;
+    }
+    try {
+      checkpoint_detail::reorganize_internal(reorg_,
+                                             t1_,
+                                             t2_,
+                                             wal_,
+                                             t2_own_,
+                                             t2_path(),
+                                             recovering_,
+                                             ReorgMode::Checkpoint,
+                                             NoOpPreStopHook{},
+                                             NoOpPreFinishHook{});
+      // NOLINTNEXTLINE(bugprone-empty-catch)
+    } catch (...) {
+      // Background loop; retry next poll without terminating worker.
+    }
+    return true;
+  }
+
+  void maybe_run_auto_compaction(std::chrono::steady_clock::time_point &next_compact_at, uint64_t &observed_chk_count) {
+    const uint64_t chk_now = reorg_.stats.checkpoint_count.load(std::memory_order_acquire);
+    if (chk_now != observed_chk_count) {
+      observed_chk_count = chk_now;
+      next_compact_at = std::chrono::steady_clock::now();
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (vmemkv::auto_compact_suppressed() || now < next_compact_at || !has_compaction_work()) {
+      return;
+    }
+    try {
+      run_compaction_cycle();
+      // NOLINTNEXTLINE(bugprone-empty-catch)
+    } catch (...) {
+      // Background loop; retry next cadence without terminating worker.
+    }
+    next_compact_at = has_garbage_segments() ? std::chrono::steady_clock::now()
+                                             : std::chrono::steady_clock::now() + kCompactionPoll1s;
+  }
+
+  // Unified T2 storage maintenance loop: checkpoints (10ms poll when WAL >= 64MiB or punch
+  // backlog >= cap) plus compaction and hole punching (1s idle cadence; zero wait while
+  // frozen garbage segments remain or right after any checkpoint advances).
+  void t2_maintenance_loop(std::stop_token stop_token) {
+    auto next_compact_at = std::chrono::steady_clock::now();
+    uint64_t observed_chk_count = reorg_.stats.checkpoint_count.load(std::memory_order_acquire);
+    poll_worker_until_stop(stop_token, kDefaultPoll10ms, [&] {
+      if (recovering_) {
         return false;
       }
+      maybe_run_auto_checkpoint();
       if (stop_token.stop_requested()) {
         return true;
       }
-      reorg_.trigger.requested.store(false, std::memory_order_release);
-
-      // Single-flight against explicit callers sharing reorg_.trigger.running; skip when held.
-      auto running_guard = SingleFlightGuard::try_acquire(reorg_.trigger.running);
-      if (!running_guard.holds) {
-        return true;
-      }
-      try {
-        if (checkpoint_detail::checkpoint_due<ConfigT>(wal_, t2_own_) && !checkpoint_detail::auto_reorg_suppressed()) {
-          checkpoint_detail::reorganize_internal(reorg_,
-                                                 t1_,
-                                                 t2_,
-                                                 wal_,
-                                                 t2_own_,
-                                                 t2_path(),
-                                                 recovering_,
-                                                 ReorgMode::Checkpoint,
-                                                 NoOpPreStopHook{},
-                                                 NoOpPreFinishHook{});
-        }
-        // NOLINTNEXTLINE(bugprone-empty-catch)
-      } catch (...) {
-        // Intentionally swallowed: background loop; foreground propagation would terminate
-        // the worker. Retry next poll; reorg stats counted on the success path.
-      }
-      return true;
+      maybe_run_auto_compaction(next_compact_at, observed_chk_count);
+      return has_garbage_segments() ||
+             (!checkpoint_detail::auto_reorg_suppressed() && checkpoint_detail::checkpoint_due<ConfigT>(wal_, t2_own_));
     });
   }
 
@@ -751,11 +677,9 @@ class VMemKVImpl {
 
   bool recovering_ = false;  // True only during the constructor's initial WAL replay.
 
-  // Declared last: destruction joins workers before their state. jthread joins on destruct;
-  // loops poll stop_token, bounding shutdown latency to one interval.
-  // Background workers join before stripes release.
-  std::jthread reorg_worker_;
-  std::jthread compact_worker_;
+  // Declared last: destruction joins the worker before its state. jthread joins on destruct;
+  // loop polls stop_token, bounding shutdown latency to one interval.
+  std::jthread t2_worker_;
 };
 
 using vmemkv = VMemKVImpl<vmemkv::Config<>>;

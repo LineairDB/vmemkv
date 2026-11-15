@@ -731,7 +731,7 @@ TEST_CASE("vmemkv: exception before T1 publish during a T2 rebuild leaves the st
                                       /*pre_stop_hook=*/vmemkv::NoOpPreStopHook{},
                                       /*pre_finish_hook=*/[] { throw InjectedFault{}; });
   } catch (const InjectedFault &) {
-    threw = true;  // Mirrors reorg_worker_loop()'s catch (...) {} -- swallow and move on.
+    threw = true;  // Mirrors t2_maintenance_loop()'s catch (...) {} -- swallow and move on.
   }
   REQUIRE(threw);
 

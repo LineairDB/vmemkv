@@ -10,28 +10,42 @@
 #include <cstdint>
 #include <iostream>
 #include <span>
+#include <vmemkv/config.hpp>
 #include <vmemkv/core/spin_backoff.hpp>
+#include <vmemkv/t1_index/t1_codec.hpp>
 
 namespace vmemkv::sharded_detail {
 
 inline constexpr size_t kPercentScale = 100;
+inline constexpr uint64_t kPayloadSizeShift = 48;
+inline constexpr uint64_t kRecordBlockAlignment = 16;
 
 // Pure split-size threshold shared by run_maintenance().
 inline auto split_threshold(size_t target_shard_size, uint32_t percent) noexcept -> size_t {
   return (target_shard_size * percent) / kPercentScale;
 }
 
-// Append entries allowed before maintenance: half capacity normally, L2-capped while a scan
-// is active. Pure function, unit-testable at production capacities. `append_slot_bytes`
-// is the caller shard's per-slot footprint (Shard::append_slot_bytes()).
-inline auto maintenance_soft_threshold(size_t append_cap, bool scan_active, size_t append_slot_bytes) -> size_t {
-  constexpr size_t kSoftThresholdPercent = 50;
-  constexpr size_t kL2CacheSizeBytes = size_t{1024} * 1024;
-  const size_t normal = (append_cap * kSoftThresholdPercent) / kPercentScale;
-  if (!scan_active) {
-    return normal;
+// Extracts the aligned T2 byte footprint encoded in a T1 offset payload (0 for tombstones or inline entries).
+inline auto payload_t2_bytes(uint64_t payload_bits, bool is_inline) noexcept -> uint64_t {
+  if (payload_bits == STORE_NOT_FOUND || is_inline) {
+    return 0;
   }
-  return std::min(kL2CacheSizeBytes / append_slot_bytes, normal);
+  return (payload_bits >> kPayloadSizeShift) * kRecordBlockAlignment;
+}
+
+template <typename EntryRange>
+inline auto sum_entries_t2_bytes(const EntryRange &entries) noexcept -> uint64_t {
+  uint64_t total = 0;
+  for (const auto &entry : entries) {
+    total += payload_t2_bytes(entry.payload_bits, t1_detail::is_inline(entry.hash));
+  }
+  return total;
+}
+
+// Append entries allowed before maintenance (50% of append capacity).
+inline auto maintenance_soft_threshold(size_t append_cap) noexcept -> size_t {
+  constexpr size_t kSoftThresholdPercent = 50;
+  return (append_cap * kSoftThresholdPercent) / kPercentScale;
 }
 
 // Retries reorganize() until `on_merged` fires. A racing concurrent reorganize() makes a call

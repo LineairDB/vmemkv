@@ -31,18 +31,17 @@ struct ReadPolicyPreadOnly {};
 // Single-responsibility value groups. Config<...> below aggregates them.
 // Flat names re-exported for ConfigT::X uses.
 struct T1Config {
-  // Append-region capacity (ablation knob). Power of two for cache-friendly masking. Every
-  // AppendRegion mmaps capacity * sizeof(AppendSlot) unconditionally and open-addressing drives
-  // it near-full resident even at low load -- so this trades RSS against burst headroom before
-  // a reorganize() drains it.
-  static constexpr size_t kAppendCapacityLog2 = 14;
+  // Append-region capacity (ablation knob). Power of two for cache-friendly masking.
+  // Empty append regions skip probing AppendIndex (tail_ == 0 check), so unused shards do not
+  // fault index pages while active hot shards retain burst headroom during checkpoint pauses.
+  static constexpr size_t kAppendCapacityLog2 = 15;
   static constexpr size_t kAppendCapacityEntries = size_t{1} << kAppendCapacityLog2;
 
-  // Per-shard live-entry target for ShardedT1Index: maintenance splits past
-  // kShardSplitThresholdPercent% of it. A shard at the split threshold spans about one
-  // T2 segment (kSegmentBytes) of 1KB values, so a shard repack stays within a segment.
+  // Fallback per-shard live-entry target for ShardedT1Index (inline-only or standalone T1):
+  // T2-backed shards split once their referenced T2 bytes reach Config::kSegmentBytes (8 MiB),
+  // while inline-only shards split past kShardSplitThresholdPercent% of kShardTargetSizeEntries.
   // See docs/specification/t1_sharding_design.md for the relation.
-  static constexpr size_t kShardTargetSizeEntries = size_t{1} << 12;
+  static constexpr size_t kShardTargetSizeEntries = size_t{1} << 20;
   static constexpr size_t kShardSplitThresholdPercent = 200;
 };
 

@@ -1517,7 +1517,7 @@ show_help() {
   echo "  --scenario in_memory|ltm|all  Limit which scenario(s) run (default: all)"
   echo "  --value-size SIZE  Limit to one value-size combo within the active scenario(s)"
   echo "                   (e.g. 8B, 1KB, 64KB)"
-  echo "  --ltm-mglru-mode MODE  LTM paging policy: on (default), split, off, or both"
+  echo "  --ltm-mglru-mode MODE  LTM paging policy: split (default: vmemkv classic-LRU, rivals distro-default), on, off, or both"
   echo "                   both runs counterbalanced ON/OFF pairs on one instance"
   echo "  --ltm-mglru-pairs N  ON/OFF pairs for mode=both (default 1, range 1..5)"
   echo "  --repetitions N  Google Benchmark repetitions per matrix cell (default: 3)."
@@ -1584,7 +1584,7 @@ WITHOUT_RIVALS=false
 LEANSTORE_ONLY=false
 YCSB_ONLY=false
 ROCKSDB_ONLY=false
-LTM_MGLRU_MODE="on"
+LTM_MGLRU_MODE="split"
 LTM_MGLRU_PAIRS=1
 
 while [[ $# -gt 0 ]]; do
@@ -2263,7 +2263,7 @@ ssh_tee_logs() {
 run_ltm_isolated_groups() {
   local scenario_key="$1" discover_filter="$2" out_prefix="$3" repetitions="$4"
   local merge_dest="$5" stdout_log="$6" stderr_log="$7" label="$8"
-  local ltm_mglru_mode="${VMEMKV_LTM_MGLRU_ACTIVE_MODE:-on}"
+  local ltm_mglru_mode="${VMEMKV_LTM_MGLRU_ACTIVE_MODE:-split}"
 
   case "$ltm_mglru_mode" in
     split|on|off) ;;
@@ -2502,8 +2502,8 @@ run_scenario_once() {
   scenario_env_prefix="$(vmemkv_matrix::scenario_env_prefix "$scenario_key")"
   scenario_context_prefix="$(scenario_context_env_prefix "$scenario_key")"
   scenario_result_path="$(vmemkv_matrix::scenario_result_path "$scenario_key")"
-  if [[ "$scenario_key" == "ltm" && ( "${VMEMKV_LTM_MGLRU_ACTIVE_MODE:-on}" != "on" || -n "${VMEMKV_LTM_MGLRU_PASS_ID:-}" ) ]]; then
-    result_mode_suffix="_mglru_${VMEMKV_LTM_MGLRU_ACTIVE_MODE}"
+  if [[ "$scenario_key" == "ltm" && ( "${VMEMKV_LTM_MGLRU_ACTIVE_MODE:-split}" != "on" || -n "${VMEMKV_LTM_MGLRU_PASS_ID:-}" ) ]]; then
+    result_mode_suffix="_mglru_${VMEMKV_LTM_MGLRU_ACTIVE_MODE:-split}"
     if [[ -n "${VMEMKV_LTM_MGLRU_PASS_ID:-}" ]]; then
       result_mode_suffix+="_pass${VMEMKV_LTM_MGLRU_PASS_ID}"
     fi
@@ -3077,9 +3077,11 @@ if [[ "$failed" -eq 0 ]]; then
   if [[ " ${extra_flags[*]} " =~ " --without-rivals " ]]; then
     without_rivals_suffix="_vmemkv_only"
   fi
-  local mglru_suffix=""
+  local mglru_suffix="_mglru_split"
   if [[ " ${extra_flags[*]} " =~ " --ltm-mglru-mode off " ]]; then
     mglru_suffix="_mglru_off"
+  elif [[ " ${extra_flags[*]} " =~ " --ltm-mglru-mode on " ]]; then
+    mglru_suffix=""
   elif [[ " ${extra_flags[*]} " =~ " --ltm-mglru-mode split " ]]; then
     mglru_suffix="_mglru_split"
   fi

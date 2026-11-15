@@ -2275,7 +2275,7 @@ auto parse_args(int argc, char **argv) -> ProbeArgs {
 // Every caller must terminate via std::_Exit(), not a normal return, once this returns: on
 // timeout, the worker thread above is still inside reorganize()/checkpoint() touching the store,
 // so returning normally and running destructors (in particular the store's, which would join
-// reorg_worker_) could itself block forever. _Exit() is also the simplest way to avoid that same
+// t2_worker_) could itself block forever. _Exit() is also the simplest way to avoid that same
 // destructor path racing the now-finished-but-still-detached worker thread on a non-timeout exit.
 template <typename Fn>
 auto timed_run(Fn &&fn) -> std::pair<double, bool> {
@@ -3195,23 +3195,10 @@ auto scan_layout(Store &store, const std::vector<std::size_t> &starts) -> ScanLa
       << ",\"pending_segments_after_compaction\":" << pending_segments_after_compaction
       << ",\"compaction_running_after_compaction\":" << (compaction_running_after_compaction ? "true" : "false")
       << ",\"probe_segment_visits\":" << compaction_metrics.probe_segment_visits.load()
-      << ",\"probe_source_candidates\":" << compaction_metrics.probe_source_candidates.load()
-      << ",\"probe_tracked_keys\":" << compaction_metrics.probe_tracked_keys.load()
-      << ",\"probe_tracked_live\":" << compaction_metrics.probe_tracked_live.load()
-      << ",\"probe_lookup_stale\":" << compaction_metrics.probe_lookup_stale.load()
-      << ",\"probe_candidates_deduplicated\":" << compaction_metrics.probe_candidates_deduplicated.load()
       << ",\"probe_relocated\":" << compaction_metrics.probe_relocated.load()
       << ",\"probe_stale\":" << compaction_metrics.probe_stale.load()
       << ",\"probe_moved_bytes\":" << compaction_metrics.probe_moved_bytes.load()
-      << ",\"probe_collect_ms\":" << compaction_metrics.probe_collect_ns.load() / 1e6
-      << ",\"probe_scan_ms\":" << compaction_metrics.probe_scan_ns.load() / 1e6
-      << ",\"probe_scan_entries\":" << compaction_metrics.probe_scan_entries.load()
-      << ",\"probe_scan_matched\":" << compaction_metrics.probe_scan_matched.load()
-      << ",\"probe_copy_bytes\":" << compaction_metrics.probe_copy_bytes.load()
-      << ",\"probe_lookup_ms\":" << compaction_metrics.probe_lookup_ns.load() / 1e6
-      << ",\"probe_sort_ms\":" << compaction_metrics.probe_sort_ns.load() / 1e6
       << ",\"probe_sort_candidates\":" << compaction_metrics.probe_sort_candidates.load()
-      << ",\"probe_t2_key_reads\":" << compaction_metrics.probe_t2_key_reads.load()
       << ",\"probe_punched_segments\":" << compaction_metrics.probe_punched_segments.load()
       << ",\"probe_punched_bytes\":" << compaction_metrics.probe_punched_bytes.load()
       << ",\"probe_relocate_ms\":" << compaction_metrics.probe_relocate_ns.load() / 1e6
