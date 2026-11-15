@@ -44,9 +44,11 @@
 #include <tuple>
 #include <type_traits>
 #include <vector>
+#include <vmemkv/checkpoint/paths.hpp>
 #include <vmemkv/core/env.hpp>
 #include <vmemkv/core/io.hpp>
 #include <vmemkv/variants.hpp>
+#include <vmemkv/wal/wal.hpp>
 
 #include "bench_helpers.hpp"
 
@@ -3341,8 +3343,8 @@ auto scan_layout(Store &store, const std::vector<std::size_t> &starts) -> ScanLa
   std::size_t last_updated = 0;
   double last_t = 0.0;
 
-  const std::string t2_file = path;
-  const std::string wal_file = path + ".wal";
+  const std::filesystem::path t2_file = vmemkv::derive_t2_chk_path(path);
+  const std::filesystem::path wal_base = vmemkv::derive_wal_path(path);
 
   while (elapsed_sec() < duration_sec) {
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -3360,8 +3362,11 @@ auto scan_layout(Store &store, const std::vector<std::size_t> &starts) -> ScanLa
     if (::stat(t2_file.c_str(), &st_t2) == 0) {
       t2_blocks = st_t2.st_blocks;
     }
-    if (::stat(wal_file.c_str(), &st_wal) == 0) {
-      wal_blocks = st_wal.st_blocks;
+    for (const uint64_t gen : vmemkv::Wal::discover_segments(wal_base)) {
+      const std::filesystem::path seg_path = vmemkv::derive_wal_segment_path(wal_base, gen);
+      if (::stat(seg_path.c_str(), &st_wal) == 0) {
+        wal_blocks += st_wal.st_blocks;
+      }
     }
     const uint64_t physical_bytes = (t2_blocks + wal_blocks) * 512;
     const auto stats = store->get_statistics();

@@ -148,7 +148,7 @@ inline const std::array<std::byte, 16> kScanHi = [] {
 }();
 
 template <typename S>
-auto inversion_rate(S &store) -> double {
+auto count_inversions(S &store, uint64_t *out_pairs = nullptr) -> uint64_t {
   uint64_t pairs = 0;
   uint64_t inversions = 0;
   uint64_t prev_off = 0;
@@ -167,6 +167,16 @@ auto inversion_rate(S &store) -> double {
                             prev_off = off;
                             have_prev = true;
                           });
+  if (out_pairs != nullptr) {
+    *out_pairs = pairs;
+  }
+  return inversions;
+}
+
+template <typename S>
+auto inversion_rate(S &store) -> double {
+  uint64_t pairs = 0;
+  const uint64_t inversions = count_inversions(store, &pairs);
   return pairs == 0 ? 0.0 : static_cast<double>(inversions) / static_cast<double>(pairs);
 }
 
@@ -689,4 +699,72 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "16-byte keys with shared upper 8 bytes de
   wait_for_compaction(*store);
   CHECK(store->get_statistics().t2_dirty_shard_count == 0);
   CHECK(inversion_rate(store) == 0.0);
+}
+
+TEST_CASE_FIXTURE(AutoCompactFixture, "64KB shuffled bulk load bounds T2 write amplification and reclaims segments") {
+  if (vmemkv_test::punch_capable_root().empty()) {
+    MESSAGE("skipped: no non-tmpfs temp root; hole punch unsupported");
+    return;
+  }
+  const auto path =
+      vmemkv_test::ScopedTempPath("vmemkv_compact_64k", vmemkv::remove_store_files, vmemkv_test::punch_capable_root());
+  constexpr size_t kKeys = 384;
+  constexpr size_t kValBytes = 64ULL * 1024ULL;
+  auto store = make_store(path);
+  const auto order = shuffled_order(kKeys);
+  store->bulk_load(
+      kKeys,
+      [&](size_t i) { return make_key(order[i]); },
+      [&](size_t i) { return pattern_value(kValBytes, order[i]); });
+  store->impl().t1().drain_maintenance();
+  REQUIRE(store->impl().t1().shard_count() > 1);
+  REQUIRE(inversion_rate(store) > 0.3);
+
+  const uint64_t used_after_load = store->impl().t2().bytes_used();
+  REQUIRE(used_after_load > 2 * vmemkv::Config<>::kSegmentBytes);
+  store->checkpoint();
+
+  drain_compaction(store, *this);
+  CHECK(store->get_statistics().t2_dirty_shard_count == 0);
+  // Dirty shards compact independently in FIFO order, so only shard boundaries can invert.
+  CHECK(count_inversions(store) < store->impl().t1().shard_count());
+
+  const uint64_t used_after_compact = store->impl().t2().bytes_used();
+  const uint64_t relocated_bytes = used_after_compact - used_after_load;
+  CHECK(relocated_bytes <= (used_after_load * 11) / 10);
+
+  const uint64_t blocks_before_punch = file_blocks(t2_data_path(path));
+  store->checkpoint();
+  store->checkpoint();
+  wait_for([&] { return store->impl().punch_backlog_segments() == 0; });
+
+  const uint64_t blocks_after_punch = file_blocks(t2_data_path(path));
+  CHECK(blocks_after_punch < blocks_before_punch);
+  CHECK(blocks_after_punch * 512 <= (used_after_load * 3) / 2);
+
+  // Growing-value updates (out-of-place appends) across 75% of keys must trigger
+  // garbage-segment evacuation and hole punching without unbounded T2 growth.
+  constexpr size_t kGrownValBytes = kValBytes + 512;
+  const uint64_t used_before_updates = store->impl().t2().bytes_used();
+  for (size_t i = 0; i < kKeys; ++i) {
+    if (i % 4 != 0) {
+      REQUIRE(store->update(make_key(i), pattern_value(kGrownValBytes, kKeys + i)));
+    }
+  }
+  drain_compaction(store, *this);
+  const uint64_t used_after_updates = store->impl().t2().bytes_used();
+  CHECK((used_after_updates - used_before_updates) <= (used_after_load * 3) / 2);
+
+  store->checkpoint();
+  store->checkpoint();
+  wait_for([&] { return store->impl().punch_backlog_segments() == 0; });
+  CHECK(file_blocks(t2_data_path(path)) * 512 <= used_after_load * 2);
+
+  for (size_t i = 0; i < kKeys; i += 31) {
+    const auto got = vmemkv_test::get_optional_bytes(store, make_key(i));
+    REQUIRE(got.has_value());
+    const size_t expected_len = (i % 4 != 0) ? kGrownValBytes : kValBytes;
+    const size_t expected_idx = (i % 4 != 0) ? (kKeys + i) : i;
+    CHECK(vmemkv_test::span_to_string(vmemkv_test::as_span(*got)) == pattern_value(expected_len, expected_idx));
+  }
 }
