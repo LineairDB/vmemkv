@@ -499,10 +499,12 @@ TEST_CASE("checkpoint: sharded T1 survives checkpoint and restart with multiple 
     for (int i = 0; i < kKeyCount; ++i) {
       REQUIRE(store->insert("k" + std::to_string(i), vmemkv_test::indexed_value(i)));
     }
-    // Give the background worker pool time to notice and split.
+    // Give the background worker pool time to notice and split, then drain in-flight splits
+    // before snapshotting shard_count_before_restart.
     for (int attempt = 0; attempt < 200 && store->impl().t1().shard_count() == 1; ++attempt) {
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
+    store->impl().t1().drain_maintenance();
     shard_count_before_restart = store->impl().t1().shard_count();
     REQUIRE(shard_count_before_restart > 1);
     store->checkpoint();

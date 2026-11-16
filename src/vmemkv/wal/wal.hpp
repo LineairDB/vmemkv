@@ -184,6 +184,13 @@ class Wal {
   // the release window, instead of stranding that record.
   auto release_leadership(uint64_t observed_target) -> bool;
 
+  // Claims flush leadership when no segment rotation is pending.
+  auto try_claim_flush_leader() noexcept -> bool;
+
+  // Waits for settlement up to lsn, claiming leadership on timeout or after rotation finishes
+  // if no leader is active; returns true if the caller became the flush leader.
+  auto await_settlement_or_claim_leader(uint64_t lsn) -> bool;
+
   // pread_exact wrappers for scan_and_validate()/replay(), which read arbitrary segments
   // (not just the active fd_).
   [[nodiscard]] static auto read_header_at(int segment_fd, uint64_t offset) -> WalRecordHeader;
@@ -208,6 +215,9 @@ class Wal {
   // Leader-only (flushing_ == true); no atomic needed.
   uint64_t next_to_flush_ = 1;
   std::atomic<bool> flushing_{false};  // Exchange-elected leader flag.
+  // Non-zero while rotate_segment() is waiting to take or holding flushing_ leadership;
+  // writers check this before claiming leadership so rotation does not starve.
+  std::atomic<uint64_t> rotate_waiters_{0};
   // Highest LSN safe to read PendingRecord::error for ("settled", not necessarily durable).
   // Followers check this atomically before waiting on settled_cv_.
   mutable std::mutex settled_mutex_;

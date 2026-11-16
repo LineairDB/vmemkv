@@ -3309,7 +3309,106 @@ auto scan_layout(Store &store, const std::vector<std::size_t> &starts) -> ScanLa
   std::_Exit(0);
 }
 
+struct ChurnCgroupSnapshot {
+  uint64_t current_bytes = 0;
+  uint64_t anon_bytes = 0;
+  uint64_t file_bytes = 0;
+  uint64_t dirty_bytes = 0;
+  uint64_t wb_bytes = 0;
+  uint64_t pgscan = 0;
+  uint64_t pgsteal = 0;
+  uint64_t high_events = 0;
+  uint64_t mem_psi_some_us = 0;
+  uint64_t io_psi_some_us = 0;
+};
+
+static inline std::string find_self_cgroup_dir() {
+  std::ifstream f("/proc/self/cgroup");
+  std::string line;
+  while (std::getline(f, line)) {
+    if (line.rfind("0::", 0) == 0) {
+      std::string sub = line.substr(3);
+      if (!sub.empty() && sub.front() == '/') {
+        sub.erase(sub.begin());
+      }
+      return (std::filesystem::path("/sys/fs/cgroup") / sub).string();
+    }
+  }
+  return {};
+}
+
+static inline uint64_t read_psi_some_total_us(const std::string &path) {
+  std::ifstream f(path);
+  std::string line;
+  while (std::getline(f, line)) {
+    if (line.rfind("some ", 0) == 0) {
+      const auto pos = line.find("total=");
+      if (pos != std::string::npos) {
+        return std::strtoull(line.c_str() + pos + 6, nullptr, 10);
+      }
+    }
+  }
+  return 0;
+}
+
+static inline ChurnCgroupSnapshot read_churn_cgroup(const std::string &cg_dir) {
+  ChurnCgroupSnapshot out{};
+  if (cg_dir.empty()) {
+    return out;
+  }
+  {
+    std::ifstream fc(cg_dir + "/memory.current");
+    fc >> out.current_bytes;
+  }
+  {
+    std::ifstream fs(cg_dir + "/memory.stat");
+    std::string key;
+    uint64_t val = 0;
+    while (fs >> key >> val) {
+      if (key == "anon") {
+        out.anon_bytes = val;
+      } else if (key == "file") {
+        out.file_bytes = val;
+      } else if (key == "file_dirty") {
+        out.dirty_bytes = val;
+      } else if (key == "file_writeback") {
+        out.wb_bytes = val;
+      } else if (key == "pgscan") {
+        out.pgscan = val;
+      } else if (key == "pgsteal") {
+        out.pgsteal = val;
+      }
+    }
+  }
+  {
+    std::ifstream fe(cg_dir + "/memory.events");
+    std::string key;
+    uint64_t val = 0;
+    while (fe >> key >> val) {
+      if (key == "high") {
+        out.high_events = val;
+      }
+    }
+  }
+  out.mem_psi_some_us = read_psi_some_total_us(cg_dir + "/memory.pressure");
+  out.io_psi_some_us = read_psi_some_total_us(cg_dir + "/io.pressure");
+  if (out.mem_psi_some_us == 0) {
+    out.mem_psi_some_us = read_psi_some_total_us("/proc/pressure/memory");
+  }
+  if (out.io_psi_some_us == 0) {
+    out.io_psi_some_us = read_psi_some_total_us("/proc/pressure/io");
+  }
+  return out;
+}
+
+static inline void atomic_update_max(std::atomic<uint64_t> &dst, uint64_t val) {
+  uint64_t cur = dst.load(std::memory_order_relaxed);
+  while (val > cur && !dst.compare_exchange_weak(cur, val, std::memory_order_relaxed)) {
+  }
+}
+
 [[noreturn]] void run_compaction_churn_probe(const ProbeArgs &args) {
+  ::setenv("VMEMKV_SEGMENT_PROBE", "1", 1);
   using Store = vmemkv::variants::VMemKV_Default;
   const std::string path = reorg_probe_path(args, "compaction_churn");
   const std::size_t writer_threads = resolve_writer_threads();
@@ -3324,6 +3423,9 @@ auto scan_layout(Store &store, const std::vector<std::size_t> &starts) -> ScanLa
 
   std::atomic<bool> stop{false};
   std::atomic<std::size_t> updated_count{0};
+  std::atomic<uint64_t> max_op_us_window{0};
+  std::atomic<uint64_t> ops_gt_1ms{0};
+  std::atomic<uint64_t> ops_gt_10ms{0};
   std::vector<std::thread> workers;
   workers.reserve(writer_threads);
   for (std::size_t t = 0; t < writer_threads; ++t) {
@@ -3332,7 +3434,17 @@ auto scan_layout(Store &store, const std::vector<std::size_t> &starts) -> ScanLa
       bench_help::ZipfDistribution zipf({key_count, 1.0});
       while (!stop.load(std::memory_order_relaxed)) {
         const std::size_t idx = zipf(rng);
+        const auto op_t0 = std::chrono::steady_clock::now();
         store->update(bench_help::make_key(idx), bench_help::make_value_for_key(idx, val_size));
+        const uint64_t op_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - op_t0).count());
+        atomic_update_max(max_op_us_window, op_us);
+        if (op_us >= 1000) {
+          ops_gt_1ms.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (op_us >= 10000) {
+          ops_gt_10ms.fetch_add(1, std::memory_order_relaxed);
+        }
         updated_count.fetch_add(1, std::memory_order_relaxed);
       }
     });
@@ -3342,6 +3454,37 @@ auto scan_layout(Store &store, const std::vector<std::size_t> &starts) -> ScanLa
   auto elapsed_sec = [&]() { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); };
   std::size_t last_updated = 0;
   double last_t = 0.0;
+  const std::string cg_dir = find_self_cgroup_dir();
+  ChurnCgroupSnapshot prev_cg = read_churn_cgroup(cg_dir);
+  struct rusage prev_ru {};
+  ::getrusage(RUSAGE_SELF, &prev_ru);
+  uint64_t prev_1ms = 0;
+  uint64_t prev_10ms = 0;
+
+  const auto &cstate = store->impl().compaction_probe_state();
+  uint64_t prev_cycles_ran = cstate.probe_cycles_ran.load(std::memory_order_relaxed);
+  uint64_t prev_cycle_ns = cstate.probe_cycle_ns.load(std::memory_order_relaxed);
+  uint64_t prev_punch_ns = cstate.probe_punch_ns.load(std::memory_order_relaxed);
+  uint64_t prev_dirty_ns = cstate.probe_dirty_pass_ns.load(std::memory_order_relaxed);
+  uint64_t prev_garbage_ns = cstate.probe_garbage_pass_ns.load(std::memory_order_relaxed);
+  uint64_t prev_collect_ns = cstate.probe_collect_ns.load(std::memory_order_relaxed);
+  uint64_t prev_prefetch_ns = cstate.probe_prefetch_ns.load(std::memory_order_relaxed);
+  uint64_t prev_relocate_ns = cstate.probe_relocate_ns.load(std::memory_order_relaxed);
+  uint64_t prev_validate_ns = cstate.probe_validate_ns.load(std::memory_order_relaxed);
+  uint64_t prev_movedata_ns = cstate.probe_movedata_ns.load(std::memory_order_relaxed);
+  uint64_t prev_publish_ns = cstate.probe_publish_ns.load(std::memory_order_relaxed);
+  uint64_t prev_moved_bytes = cstate.probe_moved_bytes.load(std::memory_order_relaxed);
+  uint64_t prev_relocated = cstate.probe_relocated.load(std::memory_order_relaxed);
+  uint64_t prev_stale = cstate.probe_stale.load(std::memory_order_relaxed);
+  uint64_t prev_punched_segs = cstate.probe_punched_segments.load(std::memory_order_relaxed);
+  uint64_t prev_visits = cstate.probe_segment_visits.load(std::memory_order_relaxed);
+  uint64_t prev_wp_lock_ns = vmemkv::write_path_debug::g_stripe_lock_ns.load(std::memory_order_relaxed);
+  uint64_t prev_wp_mut_ns = vmemkv::write_path_debug::g_mutation_ns.load(std::memory_order_relaxed);
+  uint64_t prev_wp_await_ns = vmemkv::write_path_debug::g_await_durable_ns.load(std::memory_order_relaxed);
+  uint64_t prev_wp_samples = vmemkv::write_path_debug::g_sample_count.load(std::memory_order_relaxed);
+  uint64_t prev_wal_fsync_ns = vmemkv::wal_debug::g_fsync_ns.load(std::memory_order_relaxed);
+  uint64_t prev_wal_fsync_cnt = vmemkv::wal_debug::g_fsync_count.load(std::memory_order_relaxed);
+  uint64_t prev_wal_batch_recs = vmemkv::wal_debug::g_batch_records.load(std::memory_order_relaxed);
 
   const std::filesystem::path t2_file = vmemkv::derive_t2_chk_path(path);
   const std::filesystem::path wal_base = vmemkv::derive_wal_path(path);
@@ -3354,6 +3497,30 @@ auto scan_layout(Store &store, const std::vector<std::size_t> &starts) -> ScanLa
     const double qps = dt > 0 ? static_cast<double>(cur_updated - last_updated) / dt : 0.0;
     last_t = now;
     last_updated = cur_updated;
+
+    const uint64_t win_max_op_us = max_op_us_window.exchange(0, std::memory_order_relaxed);
+    const uint64_t cur_1ms = ops_gt_1ms.load(std::memory_order_relaxed);
+    const uint64_t cur_10ms = ops_gt_10ms.load(std::memory_order_relaxed);
+    const uint64_t d_1ms = cur_1ms - prev_1ms;
+    const uint64_t d_10ms = cur_10ms - prev_10ms;
+    prev_1ms = cur_1ms;
+    prev_10ms = cur_10ms;
+
+    struct rusage cur_ru {};
+    ::getrusage(RUSAGE_SELF, &cur_ru);
+    const long d_majflt = cur_ru.ru_majflt - prev_ru.ru_majflt;
+    const long d_minflt = cur_ru.ru_minflt - prev_ru.ru_minflt;
+    const long d_inblock = cur_ru.ru_inblock - prev_ru.ru_inblock;
+    const long d_oublock = cur_ru.ru_oublock - prev_ru.ru_oublock;
+    prev_ru = cur_ru;
+
+    const ChurnCgroupSnapshot cur_cg = read_churn_cgroup(cg_dir);
+    const uint64_t d_pgscan = cur_cg.pgscan - prev_cg.pgscan;
+    const uint64_t d_pgsteal = cur_cg.pgsteal - prev_cg.pgsteal;
+    const uint64_t d_cg_high = cur_cg.high_events - prev_cg.high_events;
+    const uint64_t d_mem_psi_us = cur_cg.mem_psi_some_us - prev_cg.mem_psi_some_us;
+    const uint64_t d_io_psi_us = cur_cg.io_psi_some_us - prev_cg.io_psi_some_us;
+    prev_cg = cur_cg;
 
     struct stat st_t2 {
     }, st_wal{};
@@ -3371,6 +3538,43 @@ auto scan_layout(Store &store, const std::vector<std::size_t> &starts) -> ScanLa
     const uint64_t physical_bytes = (t2_blocks + wal_blocks) * 512;
     const auto stats = store->get_statistics();
     const uint64_t punch_backlog = store->impl().punch_backlog_segments();
+    const uint64_t pending_segs = store->impl().pending_segment_count();
+    const auto *mem = store->impl().t2().get_memory();
+    const uint64_t t2_used = mem != nullptr ? mem->bytes_used.load(std::memory_order_acquire) : 0;
+    const uint64_t t2_base = mem != nullptr ? mem->base_boundary.load(std::memory_order_acquire) : 0;
+
+    auto delta = [](const std::atomic<uint64_t> &a, uint64_t &prev) -> uint64_t {
+      const uint64_t cur = a.load(std::memory_order_relaxed);
+      const uint64_t d = cur - prev;
+      prev = cur;
+      return d;
+    };
+    const uint64_t d_cycles_ran = delta(cstate.probe_cycles_ran, prev_cycles_ran);
+    const double d_cycle_ms = static_cast<double>(delta(cstate.probe_cycle_ns, prev_cycle_ns)) / 1e6;
+    const double d_punch_ms = static_cast<double>(delta(cstate.probe_punch_ns, prev_punch_ns)) / 1e6;
+    const double d_dirty_ms = static_cast<double>(delta(cstate.probe_dirty_pass_ns, prev_dirty_ns)) / 1e6;
+    const double d_garbage_ms = static_cast<double>(delta(cstate.probe_garbage_pass_ns, prev_garbage_ns)) / 1e6;
+    const double d_collect_ms = static_cast<double>(delta(cstate.probe_collect_ns, prev_collect_ns)) / 1e6;
+    const double d_prefetch_ms = static_cast<double>(delta(cstate.probe_prefetch_ns, prev_prefetch_ns)) / 1e6;
+    const double d_relocate_ms = static_cast<double>(delta(cstate.probe_relocate_ns, prev_relocate_ns)) / 1e6;
+    const double d_validate_ms = static_cast<double>(delta(cstate.probe_validate_ns, prev_validate_ns)) / 1e6;
+    const double d_movedata_ms = static_cast<double>(delta(cstate.probe_movedata_ns, prev_movedata_ns)) / 1e6;
+    const double d_publish_ms = static_cast<double>(delta(cstate.probe_publish_ns, prev_publish_ns)) / 1e6;
+    const uint64_t d_moved_bytes = delta(cstate.probe_moved_bytes, prev_moved_bytes);
+    const uint64_t d_relocated = delta(cstate.probe_relocated, prev_relocated);
+    const uint64_t d_stale = delta(cstate.probe_stale, prev_stale);
+    const uint64_t d_punched_segs = delta(cstate.probe_punched_segments, prev_punched_segs);
+    const uint64_t d_visits = delta(cstate.probe_segment_visits, prev_visits);
+    const double d_wp_lock_ms =
+        static_cast<double>(delta(vmemkv::write_path_debug::g_stripe_lock_ns, prev_wp_lock_ns)) / 1e6;
+    const double d_wp_mut_ms =
+        static_cast<double>(delta(vmemkv::write_path_debug::g_mutation_ns, prev_wp_mut_ns)) / 1e6;
+    const double d_wp_await_ms =
+        static_cast<double>(delta(vmemkv::write_path_debug::g_await_durable_ns, prev_wp_await_ns)) / 1e6;
+    const uint64_t d_wp_samples = delta(vmemkv::write_path_debug::g_sample_count, prev_wp_samples);
+    const double d_wal_fsync_ms = static_cast<double>(delta(vmemkv::wal_debug::g_fsync_ns, prev_wal_fsync_ns)) / 1e6;
+    const uint64_t d_wal_fsync_cnt = delta(vmemkv::wal_debug::g_fsync_count, prev_wal_fsync_cnt);
+    const uint64_t d_wal_batch_recs = delta(vmemkv::wal_debug::g_batch_records, prev_wal_batch_recs);
 
     std::cout << "{\"probe\":\"compaction_churn\"," << "\"scenario\":\"" << (args.is_ltm ? "ltm" : "in_memory") << "\","
               << "\"value_size\":" << val_size << "," << "\"key_count\":" << key_count << ","
@@ -3378,7 +3582,37 @@ auto scan_layout(Store &store, const std::vector<std::size_t> &starts) -> ScanLa
               << "," << "\"checkpoint_count\":" << stats.checkpoint_count << ","
               << "\"compaction_count\":" << stats.compaction_cycle_count << "," << "\"punch_backlog\":" << punch_backlog
               << "," << "\"physical_bytes\":" << physical_bytes << ","
-              << "\"dirty_shards\":" << stats.t2_dirty_shard_count << "}" << std::endl;
+              << "\"dirty_shards\":" << stats.t2_dirty_shard_count << "," << "\"t2_used_bytes\":" << t2_used << ","
+              << "\"t2_base_bytes\":" << t2_base << "," << "\"pending_segs\":" << pending_segs << ","
+              << "\"t1_splits\":" << stats.t1_split_count << ","
+              << "\"t1_split_pause_us\":" << stats.t1_last_split_pause_us << ","
+              << "\"last_ckpt_us\":" << stats.last_checkpoint_duration_us << ","
+              << "\"last_msync_us\":" << stats.last_checkpoint_msync_duration_us << ","
+              << "\"last_t1_us\":" << stats.last_checkpoint_t1_reorganize_duration_us << ","
+              << "\"last_stop_us\":" << stats.last_checkpoint_stop_writers_duration_us << ","
+              << "\"last_rotate_us\":" << stats.last_checkpoint_wal_rotate_duration_us << ","
+              << "\"last_synced_bytes\":" << stats.last_checkpoint_bytes_synced << ","
+              << "\"max_op_us\":" << win_max_op_us << "," << "\"ops_gt_1ms\":" << d_1ms << ","
+              << "\"ops_gt_10ms\":" << d_10ms << "," << "\"d_cycles_ran\":" << d_cycles_ran << ","
+              << "\"d_cycle_ms\":" << d_cycle_ms << "," << "\"d_punch_ms\":" << d_punch_ms << ","
+              << "\"d_dirty_ms\":" << d_dirty_ms << "," << "\"d_garbage_ms\":" << d_garbage_ms << ","
+              << "\"d_collect_ms\":" << d_collect_ms << "," << "\"d_prefetch_ms\":" << d_prefetch_ms << ","
+              << "\"d_relocate_ms\":" << d_relocate_ms << "," << "\"d_validate_ms\":" << d_validate_ms << ","
+              << "\"d_movedata_ms\":" << d_movedata_ms << "," << "\"d_publish_ms\":" << d_publish_ms << ","
+              << "\"d_moved_bytes\":" << d_moved_bytes << "," << "\"d_relocated\":" << d_relocated << ","
+              << "\"d_stale\":" << d_stale << "," << "\"d_punched_segs\":" << d_punched_segs << ","
+              << "\"d_visits\":" << d_visits << "," << "\"d_majflt\":" << d_majflt << "," << "\"d_minflt\":" << d_minflt
+              << "," << "\"d_inblock\":" << d_inblock << "," << "\"d_oublock\":" << d_oublock << ","
+              << "\"cgroup_mem_bytes\":" << cur_cg.current_bytes << "," << "\"cgroup_anon_bytes\":" << cur_cg.anon_bytes
+              << "," << "\"cgroup_file_bytes\":" << cur_cg.file_bytes << ","
+              << "\"cgroup_dirty_bytes\":" << cur_cg.dirty_bytes << "," << "\"cgroup_wb_bytes\":" << cur_cg.wb_bytes
+              << "," << "\"d_pgscan\":" << d_pgscan << "," << "\"d_pgsteal\":" << d_pgsteal << ","
+              << "\"d_cg_high\":" << d_cg_high << "," << "\"d_mem_psi_ms\":" << static_cast<double>(d_mem_psi_us) / 1e3
+              << "," << "\"d_io_psi_ms\":" << static_cast<double>(d_io_psi_us) / 1e3 << ","
+              << "\"d_wp_lock_ms\":" << d_wp_lock_ms << "," << "\"d_wp_mut_ms\":" << d_wp_mut_ms << ","
+              << "\"d_wp_await_ms\":" << d_wp_await_ms << "," << "\"d_wp_samples\":" << d_wp_samples << ","
+              << "\"d_wal_fsync_ms\":" << d_wal_fsync_ms << "," << "\"d_wal_fsync_cnt\":" << d_wal_fsync_cnt << ","
+              << "\"d_wal_batch_recs\":" << d_wal_batch_recs << "}" << std::endl;
   }
 
   stop.store(true, std::memory_order_relaxed);

@@ -274,6 +274,9 @@ class T2Ownership {
     return punch_head_.load(std::memory_order_relaxed) != kInvalidSegment;
   }
 
+  // Takes all queued punch candidates while keeping punch_candidate_count_ accounting for
+  // them until each is either retired (punched / non-empty) or re-queued via
+  // requeue_deferred_punch_candidates().
   auto take_punch_candidates() const -> std::vector<PunchCandidate> {
     uint64_t curr = punch_head_.exchange(kInvalidSegment, std::memory_order_acquire);
     std::vector<PunchCandidate> out;
@@ -285,15 +288,29 @@ class T2Ownership {
       punch_nodes_[curr].next.store(kInvalidSegment, std::memory_order_relaxed);
       curr = next;
     }
-    punch_candidate_count_.fetch_sub(out.size(), std::memory_order_relaxed);
     return out;
   }
 
-  // Requeues with epochs preserved: re-tagging with the current count would defer
-  // eligibility every time a checkpoint completes between cycles.
-  void requeue_punch_candidates(std::span<const PunchCandidate> candidates) const {
+  void retire_punch_candidates(uint64_t count) const noexcept {
+    if (count > 0) {
+      punch_candidate_count_.fetch_sub(count, std::memory_order_release);
+    }
+  }
+
+  // Requeues taken candidates without incrementing punch_candidate_count_ for them, since
+  // take_punch_candidates() preserves their count while in flight.
+  void requeue_deferred_punch_candidates(std::span<const PunchCandidate> candidates) const {
     for (const PunchCandidate &candidate : candidates) {
-      queue_punch_candidate_with_epoch(candidate.segment, candidate.evacuated_epoch);
+      if (candidate.segment >= segment_count_) {
+        retire_punch_candidates(1);
+        continue;
+      }
+      if (punch_pending_[candidate.segment].exchange(true, std::memory_order_acq_rel)) {
+        // Already re-queued concurrently with its own count increment; drop the in-flight token.
+        retire_punch_candidates(1);
+        continue;
+      }
+      push_node(candidate.segment, candidate.evacuated_epoch);
     }
   }
 
@@ -332,7 +349,7 @@ class T2Ownership {
   // trigger alongside the WAL-size trigger: without relocation WAL records, the
   // WAL alone no longer paces punch drainage.
   auto punch_backlog_segments() const noexcept -> uint64_t {
-    return punch_candidate_count_.load(std::memory_order_relaxed);
+    return punch_candidate_count_.load(std::memory_order_acquire);
   }
 
   static auto hint_bytes(uint64_t payload_bits) noexcept -> uint64_t {
@@ -388,13 +405,17 @@ class T2Ownership {
     std::atomic<uint64_t> next{kInvalidSegment};
   };
 
-  void push_punch(uint64_t seg, uint64_t epoch) const noexcept {
+  void push_node(uint64_t seg, uint64_t epoch) const noexcept {
     punch_nodes_[seg].evacuated_epoch = epoch;
     uint64_t head = punch_head_.load(std::memory_order_relaxed);
     do {
       punch_nodes_[seg].next.store(head, std::memory_order_relaxed);
     } while (!punch_head_.compare_exchange_weak(head, seg, std::memory_order_release, std::memory_order_relaxed));
-    punch_candidate_count_.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  void push_punch(uint64_t seg, uint64_t epoch) const noexcept {
+    push_node(seg, epoch);
+    punch_candidate_count_.fetch_add(1, std::memory_order_release);
   }
 
   void queue_punch_candidate_with_epoch(uint64_t seg, uint64_t epoch) const noexcept {

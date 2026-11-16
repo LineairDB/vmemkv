@@ -9,6 +9,7 @@
 #pragma once
 
 #include <linux/magic.h>
+#include <sys/mman.h>
 #include <sys/vfs.h>
 
 #include <algorithm>
@@ -53,6 +54,13 @@ struct CompactionState {
   std::atomic<uint64_t> probe_validate_ns{0};
   std::atomic<uint64_t> probe_movedata_ns{0};
   std::atomic<uint64_t> probe_publish_ns{0};
+  std::atomic<uint64_t> probe_cycle_ns{0};
+  std::atomic<uint64_t> probe_punch_ns{0};
+  std::atomic<uint64_t> probe_collect_ns{0};
+  std::atomic<uint64_t> probe_prefetch_ns{0};
+  std::atomic<uint64_t> probe_dirty_pass_ns{0};
+  std::atomic<uint64_t> probe_garbage_pass_ns{0};
+  std::atomic<uint64_t> probe_cycles_ran{0};
 };
 
 namespace compaction_detail {
@@ -109,32 +117,37 @@ auto punch_evacuated_segments(CompactionState &state,
   // through the zero-crossing path.
   std::vector<typename T2Ownership<ConfigT>::PunchCandidate> deferred;
   uint64_t punched = 0;
-  for (const auto &candidate : candidates) {
+  for (size_t idx = 0; idx < candidates.size(); ++idx) {
+    const auto &candidate = candidates[idx];
     const uint64_t seg = candidate.segment;
     if (candidate.evacuated_epoch + 1 >= covered_through || (seg + 1) * ConfigT::kSegmentBytes > base) {
       deferred.push_back(candidate);
       continue;
     }
     if (own.seg_live(seg) != 0) {
+      own.retire_punch_candidates(1);
       continue;
     }
     switch (tier2.punch_if_occupied(seg * ConfigT::kSegmentBytes, ConfigT::kSegmentBytes)) {
       case vmemkv::T2FlatFile::PunchOutcome::Punched:
         ++punched;
+        own.retire_punch_candidates(1);
         if (segment_probe_enabled()) {
           state.probe_punched_segments.fetch_add(1, std::memory_order_relaxed);
           state.probe_punched_bytes.fetch_add(ConfigT::kSegmentBytes, std::memory_order_relaxed);
         }
         break;
       case vmemkv::T2FlatFile::PunchOutcome::AlreadyHollow:
+        own.retire_punch_candidates(1);
         break;
       case vmemkv::T2FlatFile::PunchOutcome::Failed:
         state.punch_supported.store(false, std::memory_order_relaxed);
-        own.requeue_punch_candidates(deferred);
+        own.retire_punch_candidates(candidates.size() - idx);
+        own.requeue_deferred_punch_candidates(deferred);
         return punched;
     }
   }
-  own.requeue_punch_candidates(deferred);
+  own.requeue_deferred_punch_candidates(deferred);
   return punched;
 }
 
@@ -286,6 +299,115 @@ auto payloads_overlap_garbage_segment(std::span<const uint64_t> payloads,
       payloads, [&](uint64_t payload) { return own.payload_overlaps_garbage_segment(payload, base, used); });
 }
 
+// Batches, page-aligns, sorts, and merges T2 byte ranges for a chunk of payload handles,
+// then issues MADV_WILLNEED so cold NVMe pages fault in concurrently rather than synchronously
+// inside relocate_one().
+inline void prefetch_payload_batch(std::span<const uint64_t> batch,
+                                   const vmemkv::T2Memory *mem,
+                                   uint64_t upper_bound) noexcept {
+  if (batch.empty() || mem == nullptr || mem->reads.random_mmap == nullptr) {
+    return;
+  }
+  const uint64_t limit = std::min(upper_bound, mem->capacity);
+  const uint64_t page_size = t2_detail::os_page_size();
+  const uint64_t page_mask = page_size - 1;
+  struct PageRange {
+    uint64_t start;
+    uint64_t end;
+  };
+  std::vector<PageRange> ranges;
+  ranges.reserve(batch.size());
+  for (uint64_t payload : batch) {
+    const uint64_t off = payload & t2_detail::kPayloadOffsetMask;
+    if (off >= limit) {
+      continue;
+    }
+    const uint64_t hint = t2_detail::payload_hint_bytes(payload, t2_detail::kBaseSizeHintMargin);
+    const uint64_t raw_end = off + std::min<uint64_t>(hint, limit - off);
+    const uint64_t pg_start = off & ~page_mask;
+    const uint64_t pg_end = std::min<uint64_t>((raw_end + page_mask) & ~page_mask, mem->capacity);
+    if (pg_end > pg_start) {
+      ranges.push_back({pg_start, pg_end});
+    }
+  }
+  if (ranges.empty()) {
+    return;
+  }
+  std::sort(ranges.begin(), ranges.end(), [](const PageRange &lhs, const PageRange &rhs) {
+    return lhs.start < rhs.start || (lhs.start == rhs.start && lhs.end < rhs.end);
+  });
+  uint64_t cur_start = ranges[0].start;
+  uint64_t cur_end = ranges[0].end;
+  for (size_t i = 1; i < ranges.size(); ++i) {
+    if (ranges[i].start <= cur_end) {
+      cur_end = std::max(cur_end, ranges[i].end);
+      continue;
+    }
+    (void)::madvise(mem->reads.random_mmap + cur_start, static_cast<size_t>(cur_end - cur_start), MADV_WILLNEED);
+    cur_start = ranges[i].start;
+    cur_end = ranges[i].end;
+  }
+  (void)::madvise(mem->reads.random_mmap + cur_start, static_cast<size_t>(cur_end - cur_start), MADV_WILLNEED);
+}
+
+inline constexpr size_t kPrefetchBatchSize = 256;
+
+inline void prefetch_target_chunk(CompactionState &state,
+                                  std::span<const uint64_t> targets,
+                                  size_t offset,
+                                  const vmemkv::T2Memory *mem,
+                                  uint64_t upper_bound,
+                                  bool measure) noexcept {
+  if (offset >= targets.size()) {
+    return;
+  }
+  const auto prefetch_start = measure ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+  const size_t len = std::min(kPrefetchBatchSize, targets.size() - offset);
+  prefetch_payload_batch(targets.subspan(offset, len), mem, upper_bound);
+  if (measure) {
+    state.probe_prefetch_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                                std::chrono::steady_clock::now() - prefetch_start)
+                                                                .count()),
+                                      std::memory_order_relaxed);
+  }
+}
+
+template <typename ConfigT, typename T1, typename LockStripe>
+void relocate_targets_pipelined(CompactionState &state,
+                                std::span<const uint64_t> targets,
+                                T1 &tier1,
+                                T2FlatFile &tier2,
+                                T2Ownership<ConfigT> &own,
+                                LockStripe &&lock_stripe,
+                                const vmemkv::T2Memory *mem,
+                                uint64_t upper_bound,
+                                CompactionProgress &progress,
+                                bool measure) {
+  prefetch_target_chunk(state, targets, 0, mem, upper_bound, measure);
+  for (size_t batch_start = 0; batch_start < targets.size(); batch_start += kPrefetchBatchSize) {
+    prefetch_target_chunk(state, targets, batch_start + kPrefetchBatchSize, mem, upper_bound, measure);
+    const size_t batch_end = std::min(batch_start + kPrefetchBatchSize, targets.size());
+    for (size_t i = batch_start; i < batch_end; ++i) {
+      const auto relocation_start =
+          measure ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+      const uint64_t off = targets[i] & t2_detail::kPayloadOffsetMask;
+      const uint64_t moved = relocate_one<ConfigT>(tier1, tier2, own, lock_stripe, off, mem, &state);
+      if (moved != 0) {
+        progress.moved_bytes += moved;
+        progress.did_relocate = true;
+      }
+      if (measure) {
+        (moved == 0 ? state.probe_stale : state.probe_relocated).fetch_add(1, std::memory_order_relaxed);
+        state.probe_moved_bytes.fetch_add(moved, std::memory_order_relaxed);
+        state.probe_relocate_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                                    std::chrono::steady_clock::now() - relocation_start)
+                                                                    .count()),
+                                          std::memory_order_relaxed);
+      }
+    }
+  }
+}
+
 template <typename ConfigT, typename T1, typename LockStripe, typename EntrySnapshot>
 void repack_dirty_shard(CompactionState &state,
                         std::span<const EntrySnapshot> entries,
@@ -302,7 +424,15 @@ void repack_dirty_shard(CompactionState &state,
     return;
   }
 
+  const bool measure = segment_probe_enabled();
+  const auto collect_start = measure ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
   const std::vector<uint64_t> payloads = collect_shard_payloads(entries, mem);
+  if (measure) {
+    state.probe_collect_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                               std::chrono::steady_clock::now() - collect_start)
+                                                               .count()),
+                                     std::memory_order_relaxed);
+  }
   const size_t count = payloads.size();
   if (count == 0) {
     return;
@@ -319,30 +449,24 @@ void repack_dirty_shard(CompactionState &state,
     return;
   }
 
-  const bool measure = segment_probe_enabled();
   if (measure) {
     state.probe_segment_visits.fetch_add(1, std::memory_order_relaxed);
     state.probe_sort_candidates.fetch_add(count, std::memory_order_relaxed);
   }
-  for (size_t i = 0; i < count; ++i) {
-    if (!repack_entire_shard && !own.payload_overlaps_garbage_segment(payloads[i], base, used)) {
-      continue;
+
+  std::vector<uint64_t> filtered_targets;
+  std::span<const uint64_t> targets = payloads;
+  if (!repack_entire_shard) {
+    filtered_targets.reserve(count);
+    for (uint64_t payload : payloads) {
+      if (own.payload_overlaps_garbage_segment(payload, base, used)) {
+        filtered_targets.push_back(payload);
+      }
     }
-    const auto relocation_start = measure ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    const uint64_t off = payloads[i] & t2_detail::kPayloadOffsetMask;
-    const uint64_t moved = relocate_one<ConfigT>(tier1, tier2, own, lock_stripe, off, mem, &state);
-    if (moved != 0) {
-      progress.moved_bytes += moved;
-      progress.did_relocate = true;
-    }
-    if (measure) {
-      (moved == 0 ? state.probe_stale : state.probe_relocated).fetch_add(1, std::memory_order_relaxed);
-      state.probe_moved_bytes.fetch_add(moved, std::memory_order_relaxed);
-      state.probe_relocate_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                                  std::chrono::steady_clock::now() - relocation_start)
-                                                                  .count()),
-                                        std::memory_order_relaxed);
-    }
+    targets = filtered_targets;
+  }
+  if (!targets.empty()) {
+    relocate_targets_pipelined<ConfigT>(state, targets, tier1, tier2, own, lock_stripe, mem, used, progress, measure);
   }
 }
 
@@ -360,7 +484,10 @@ auto compact_cycle(CompactionState &state,
     return false;
   }
 
+  const bool measure = segment_probe_enabled();
+  const auto cycle_start = measure ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
   uint64_t punched = punch_evacuated_segments<ConfigT>(state, own, tier2, t2_path);
+  const auto punch_end = measure ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
   const vmemkv::T2Memory *mem = tier2.get_memory();
   CompactionProgress progress;
@@ -373,6 +500,7 @@ auto compact_cycle(CompactionState &state,
       return progress.moved_bytes < ConfigT::kCompactionMaxMoveBytesPerCycle;
     });
   }
+  const auto dirty_end = measure ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
   if (progress.moved_bytes < ConfigT::kCompactionMaxMoveBytesPerCycle) {
     const uint64_t base = mem->base_boundary.load(std::memory_order_acquire);
@@ -395,6 +523,17 @@ auto compact_cycle(CompactionState &state,
         own.clear_garbage_segments(base, used);
       }
     }
+  }
+  if (measure) {
+    const auto cycle_end = std::chrono::steady_clock::now();
+    auto to_ns = [](auto begin, auto end) -> uint64_t {
+      return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count());
+    };
+    state.probe_cycles_ran.fetch_add(1, std::memory_order_relaxed);
+    state.probe_punch_ns.fetch_add(to_ns(cycle_start, punch_end), std::memory_order_relaxed);
+    state.probe_dirty_pass_ns.fetch_add(to_ns(punch_end, dirty_end), std::memory_order_relaxed);
+    state.probe_garbage_pass_ns.fetch_add(to_ns(dirty_end, cycle_end), std::memory_order_relaxed);
+    state.probe_cycle_ns.fetch_add(to_ns(cycle_start, cycle_end), std::memory_order_relaxed);
   }
 
   if (progress.did_relocate || punched > 0) {

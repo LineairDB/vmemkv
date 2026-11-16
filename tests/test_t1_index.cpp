@@ -310,10 +310,13 @@ TEST_CASE("T1Index: concurrent updates to already-sorted keys survive racing reo
   writers.reserve(writer_thread_count);
   for (int writer_id = 0; writer_id < writer_thread_count; ++writer_id) {
     writers.emplace_back([&, writer_id]() {
-      for (int i = 0; i < iterations_per_writer; ++i) {
+      for (int i = 0; i < iterations_per_writer || reorganize_count.load(std::memory_order_relaxed) == 0; ++i) {
         const std::string key = "k" + std::to_string(i % key_count);
-        const auto value = static_cast<uint64_t>((writer_id << 20) | i);
+        const auto value = static_cast<uint64_t>((writer_id << 20) | (i % iterations_per_writer));
         CHECK(idx->put(to_span(key), value) == TestIndex::PutResult::Applied);
+        if (i >= iterations_per_writer && (i % 64) == 0) {
+          std::this_thread::yield();
+        }
       }
     });
   }

@@ -755,7 +755,12 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "64KB shuffled bulk load bounds T2 write a
   const uint64_t used_after_updates = store->impl().t2().bytes_used();
   CHECK((used_after_updates - used_before_updates) <= (used_after_load * 3) / 2);
 
+  // This checkpoint can advance base_boundary across dirty segments updated in Phase 2,
+  // exposing one final frozen garbage evacuation before the two-checkpoint epoch gate runs.
   store->checkpoint();
+  wait_for_compaction(*store);
+  store->checkpoint();
+  wait_for_compaction(*store);
   store->checkpoint();
   wait_for([&] { return store->impl().punch_backlog_segments() == 0; });
   CHECK(file_blocks(t2_data_path(path)) * 512 <= used_after_load * 2);

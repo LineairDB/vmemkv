@@ -348,8 +348,11 @@ auto Wal::drain_pending() -> uint64_t {
 }
 
 auto Wal::release_leadership(uint64_t observed_target) -> bool {
-  flushing_.store(false, std::memory_order_release);
+  flushing_.store(false, std::memory_order_seq_cst);
   flushing_.notify_all();
+  if (rotate_waiters_.load(std::memory_order_seq_cst) > 0) {
+    return false;
+  }
   if (next_lsn_.load(std::memory_order_acquire) == observed_target) {
     return false;
   }
@@ -408,31 +411,43 @@ auto Wal::reserve_record(WalRecordType type,
   return rec;
 }
 
-auto Wal::await_durable(PendingRecord *rec) -> uint64_t {
-  const uint64_t lsn = rec->lsn;
-  bool is_leader = !flushing_.exchange(true, std::memory_order_acq_rel);
+auto Wal::try_claim_flush_leader() noexcept -> bool {
+  return rotate_waiters_.load(std::memory_order_seq_cst) == 0 && !flushing_.exchange(true, std::memory_order_seq_cst);
+}
 
-  if (!is_leader) {
-    if (highest_settled_lsn_.load(std::memory_order_acquire) < lsn) {
-      // Bounded wait_for(), not a spin (spins steal cycles from concurrent work) and not an
-      // unbounded wait: a leader handoff in the release-check gap can strand this follower on a
-      // notify that never names it. On timeout with the LSN still unsettled and no active
-      // leader, self-elect instead of waiting forever.
-      constexpr auto kFollowerWaitTimeout = std::chrono::milliseconds(5);
-      std::unique_lock<std::mutex> lock(settled_mutex_);
-      while (highest_settled_lsn_.load(std::memory_order_acquire) < lsn) {
-        const bool timed_out = settled_cv_.wait_for(lock, kFollowerWaitTimeout) == std::cv_status::timeout;
-        if (timed_out && highest_settled_lsn_.load(std::memory_order_acquire) < lsn) {
-          lock.unlock();
-          if (!flushing_.exchange(true, std::memory_order_acq_rel)) {
-            is_leader = true;
-            break;
-          }
-          lock.lock();
-        }
+auto Wal::await_settlement_or_claim_leader(uint64_t lsn) -> bool {
+  if (highest_settled_lsn_.load(std::memory_order_acquire) >= lsn) {
+    return false;
+  }
+  // Bounded wait_for(), not a spin (spins steal cycles from concurrent work) and not an
+  // unbounded wait: a leader handoff in the release-check gap can strand this follower on a
+  // notify that never names it. On timeout or rotation-end notification with no active leader
+  // and no pending rotation, self-elect instead of waiting forever.
+  constexpr auto kFollowerWaitTimeout = std::chrono::milliseconds(5);
+  std::unique_lock<std::mutex> lock(settled_mutex_);
+  while (highest_settled_lsn_.load(std::memory_order_acquire) < lsn) {
+    const bool leader_or_rotate_active =
+        rotate_waiters_.load(std::memory_order_seq_cst) > 0 || flushing_.load(std::memory_order_seq_cst);
+    const bool timed_out =
+        leader_or_rotate_active && (settled_cv_.wait_for(lock, kFollowerWaitTimeout) == std::cv_status::timeout);
+    if (highest_settled_lsn_.load(std::memory_order_acquire) >= lsn) {
+      return false;
+    }
+    if (rotate_waiters_.load(std::memory_order_seq_cst) == 0 &&
+        (timed_out || !flushing_.load(std::memory_order_seq_cst))) {
+      lock.unlock();
+      if (try_claim_flush_leader()) {
+        return true;
       }
+      lock.lock();
     }
   }
+  return false;
+}
+
+auto Wal::await_durable(PendingRecord *rec) -> uint64_t {
+  const uint64_t lsn = rec->lsn;
+  const bool is_leader = try_claim_flush_leader() || await_settlement_or_claim_leader(lsn);
 
   if (!is_leader) {
     const std::exception_ptr err = rec->error;
@@ -516,8 +531,27 @@ void Wal::rotate_segment() {
   //
   // Timed: under sustained writers this wait dominates rotate_segment()'s (and therefore the
   // checkpoint's) wall-clock cost; open/close/unlink are consistently sub-millisecond.
+  struct RotateWaiterGuard {
+    std::atomic<uint64_t> &waiters;
+    bool active = true;
+    explicit RotateWaiterGuard(std::atomic<uint64_t> &waiters_atomic) noexcept : waiters(waiters_atomic) {}
+    RotateWaiterGuard(const RotateWaiterGuard &) = delete;
+    auto operator=(const RotateWaiterGuard &) -> RotateWaiterGuard & = delete;
+    RotateWaiterGuard(RotateWaiterGuard &&) = delete;
+    auto operator=(RotateWaiterGuard &&) -> RotateWaiterGuard & = delete;
+    void release() noexcept {
+      if (active) {
+        waiters.fetch_sub(1, std::memory_order_seq_cst);
+        active = false;
+      }
+    }
+    ~RotateWaiterGuard() { release(); }
+  };
+
   const auto leader_wait_start = std::chrono::steady_clock::now();
-  while (flushing_.exchange(true, std::memory_order_acq_rel)) {
+  rotate_waiters_.fetch_add(1, std::memory_order_seq_cst);
+  RotateWaiterGuard waiter_guard{rotate_waiters_};
+  while (flushing_.exchange(true, std::memory_order_seq_cst)) {
     flushing_.wait(true, std::memory_order_acquire);
   }
   last_rotate_leader_wait_us_.store(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
@@ -533,14 +567,18 @@ void Wal::rotate_segment() {
     new_fd = open_create_0600(new_path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_APPEND, "open new wal segment");
   } catch (...) {
     const auto err = std::current_exception();
+    waiter_guard.release();
     fail_all_pending_and_release_leadership(err);
     std::rethrow_exception(err);
   }
 
   fd_.store(new_fd, std::memory_order_release);
   active_generation_ = new_generation;
-  flushing_.store(false, std::memory_order_release);
+  waiter_guard.release();
+  flushing_.store(false, std::memory_order_seq_cst);
   flushing_.notify_all();
+  { std::lock_guard<std::mutex> lock(settled_mutex_); }
+  settled_cv_.notify_all();
 
   // fd_close_mu_ pairs with rotate_segment()'s lock around close(old_fd): the fd snapshotted
   // here can still be the outgoing one even though fd_ already points at the new fd.
