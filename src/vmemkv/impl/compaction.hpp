@@ -8,6 +8,7 @@
 // two-checkpoint coverage.
 #pragma once
 
+#include <fcntl.h>
 #include <linux/magic.h>
 #include <sys/mman.h>
 #include <sys/vfs.h>
@@ -490,6 +491,7 @@ auto compact_cycle(CompactionState &state,
   const auto punch_end = measure ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
   const vmemkv::T2Memory *mem = tier2.get_memory();
+  const uint64_t sync_begin = mem != nullptr ? mem->bytes_used.load(std::memory_order_acquire) : 0;
   CompactionProgress progress;
 
   using EntrySnapshot = typename T1::EntrySnapshot;
@@ -522,6 +524,18 @@ auto compact_cycle(CompactionState &state,
       if (completed_all_shards) {
         own.clear_garbage_segments(base, used);
       }
+    }
+  }
+  // Flush this cycle's relocated T2 range to disk without waiting for background writeback
+  // timers, keeping dirty page-cache buildup bounded and naturally pacing compaction to
+  // storage write bandwidth. Crash durability stays governed by the WAL and checkpoint msync().
+  if (progress.did_relocate && mem != nullptr && mem->reads.pread_fd >= 0) {
+    const uint64_t sync_end = mem->bytes_used.load(std::memory_order_acquire);
+    if (sync_end > sync_begin) {
+      (void)::sync_file_range(mem->reads.pread_fd,
+                              static_cast<off_t>(sync_begin),
+                              static_cast<off_t>(sync_end - sync_begin),
+                              SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER);
     }
   }
   if (measure) {
