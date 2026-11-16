@@ -108,6 +108,9 @@ class ShardedT1CheckpointWriter {
   // fsyncs, and renames atomically onto the final path.
   void finish(std::span<const T1ChkKeyPrefix> boundaries);
 
+  [[nodiscard]] auto bytes_written() const noexcept -> uint64_t { return bytes_written_; }
+  [[nodiscard]] auto shard_count() const noexcept -> uint64_t { return shard_count_; }
+
  private:
   void write_bytes_internal(const void *data, size_t size);
 
@@ -116,6 +119,7 @@ class ShardedT1CheckpointWriter {
   FdGuard file_descriptor_;
   uint64_t shard_count_ = 0;
   uint64_t total_entry_count_ = 0;
+  uint64_t bytes_written_ = 0;
   FoldingChecksum checksum_;  // Running FNV-1a64 state, folded incrementally as bytes are written.
   bool finished_ = false;
 };
@@ -153,9 +157,23 @@ class ShardedT1CheckpointFile {
 // manifest itself commits (temp write, fsync, atomic rename).
 
 inline constexpr uint32_t kManifestMagic = 0x314B4D56;  // ASCII "VMK1"
-// A non-v4 manifest reads as "no checkpoint exists yet" (same as corrupt/missing); no on-disk
+// A non-v5 manifest reads as "no checkpoint exists yet" (same as corrupt/missing); no on-disk
 // migration path exists or is needed.
-inline constexpr uint8_t kManifestFormatVersion = 4;
+inline constexpr uint8_t kManifestFormatVersion = 5;
+
+inline constexpr size_t kT1ChunkMetaReservedBytes = 7;
+// Describes one active VLK2 key-range chunk file inside `<t2_path>.t1chk/`.
+struct T1ChunkMeta {
+  uint64_t chunk_id = 0;
+  uint64_t approx_bytes = 0;
+  T1ChkKeyPrefix upper_bound{};
+  uint8_t has_upper_bound = 0;
+  // NOLINTNEXTLINE(modernize-avoid-c-arrays)
+  uint8_t reserved[kT1ChunkMetaReservedBytes] = {};
+};
+inline constexpr size_t kT1ChunkMetaBytes = 40;
+static_assert(sizeof(T1ChunkMeta) == kT1ChunkMetaBytes);
+static_assert(std::is_standard_layout_v<T1ChunkMeta>);
 
 struct ManifestHeader {
   uint32_t magic = kManifestMagic;
@@ -166,24 +184,38 @@ struct ManifestHeader {
   uint64_t generation = 0;
   uint64_t t2_bytes_used = 0;  // Logical durable T2 bytes -- not recoverable from file size
                                // (capacity-truncated files are larger than their live data).
-  uint64_t checksum = 0;       // FNV-1a64 over the header with checksum zeroed.
+  uint64_t next_t1_chunk_id = 1;
+  uint64_t t1_chunk_count = 0;
+  uint64_t checksum = 0;  // FNV-1a64 over header (checksum zeroed) followed by t1_chunk_count T1ChunkMeta records.
 };
-inline constexpr size_t kManifestHeaderBytes = 32;
+inline constexpr size_t kManifestHeaderBytes = 48;
 static_assert(sizeof(ManifestHeader) == kManifestHeaderBytes);
 static_assert(std::is_standard_layout_v<ManifestHeader>);
 
 struct ManifestData {
   uint64_t generation = 0;
   uint64_t t2_bytes_used = 0;
+  uint64_t next_t1_chunk_id = 1;
+  std::vector<T1ChunkMeta> t1_chunks;
 };
 
 // Temp-write, fsync, atomic rename. Call only after `generation`'s T1 and T2 files are fully
 // written and fsynced.
 // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-void write_manifest(const std::filesystem::path &manifest_path, uint64_t generation, uint64_t t2_bytes_used);
+void write_manifest(const std::filesystem::path &manifest_path,
+                    uint64_t generation,
+                    uint64_t t2_bytes_used,
+                    std::span<const T1ChunkMeta> t1_chunks = {},
+                    uint64_t next_t1_chunk_id = 1);
 
-// Returns generation/t2_bytes_used, or nullopt when missing or invalid (bad magic, version,
+// Returns manifest state, or nullopt when missing or invalid (bad magic, version, layout,
 // checksum) -- callers treat that as "no checkpoint exists yet".
 auto read_manifest(const std::filesystem::path &manifest_path) -> std::optional<ManifestData>;
+
+// Persists newly created or renamed directory entries inside `dir_path`.
+void fsync_directory(const std::filesystem::path &dir_path);
+
+// Removes obsolete chunk files or orphaned temps inside `t1_chk_dir` not listed in `active_chunks`.
+void cleanup_stale_t1_chunks(const std::filesystem::path &t1_chk_dir, std::span<const T1ChunkMeta> active_chunks);
 
 }  // namespace vmemkv

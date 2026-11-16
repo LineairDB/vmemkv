@@ -258,8 +258,37 @@ class ShardedT1Index {
   // hence reorganize_until_captured() retries until the callback fires.
   template <typename OffsetMapper, typename PerShardWriter>
   auto checkpoint_all_shards(OffsetMapper offset_mapper, PerShardWriter per_shard_writer) -> std::vector<Key> {
+    std::vector<Key> out_boundaries;
+    with_checkpoint_shards(
+        [&](auto &context) {
+          const auto bounds = context.boundaries();
+          out_boundaries.assign(bounds.begin(), bounds.end());
+          std::vector<EntrySnapshot> dumped;
+          for (size_t idx = 0; idx < context.shard_count(); ++idx) {
+            t1_debug::g_checkpoint_current_shard.store(idx + 1, std::memory_order_release);
+            context.extract_shard(idx, dumped, offset_mapper, per_shard_writer);
+          }
+          t1_debug::g_checkpoint_current_shard.store(0, std::memory_order_release);
+        },
+        /*advance_epoch=*/false);
+    return out_boundaries;
+  }
+
+  struct CheckpointContext;
+
+  // Captures a split-paused snapshot of live shards. When `advance_epoch` is true, advances
+  // checkpoint_write_epoch_ and drains in-flight routing-guarded writes before invoking `func`.
+  template <typename Func>
+  void with_checkpoint_shards(Func &&func, bool advance_epoch = true) {
     SplitPause pause(splits_paused_);
     wait_until_no_split();
+
+    uint64_t active_epoch = checkpoint_write_epoch_.load(std::memory_order_acquire);
+    if (advance_epoch) {
+      active_epoch = checkpoint_write_epoch_.fetch_add(1, std::memory_order_acq_rel);
+      const uint64_t bumped_routing = routing_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
+      routing_epochs_.wait_until_epoch(bumped_routing);
+    }
 
     std::vector<ShardSlot *> snapshot;
     std::vector<Key> boundaries;
@@ -280,53 +309,9 @@ class ShardedT1Index {
       }
     } ref_release{&snapshot};
 
-    const size_t total_shards = snapshot.size();
-    t1_debug::g_checkpoint_total_shards.store(total_shards, std::memory_order_release);
-    std::vector<EntrySnapshot> dumped;
-    size_t shard_idx = 0;
-    for (ShardSlot *slot : snapshot) {
-      ++shard_idx;
-      t1_debug::g_checkpoint_current_shard.store(shard_idx, std::memory_order_release);
-      const auto shard_start = std::chrono::steady_clock::now();
-      // Merge-free shortcut: an empty active append means the merge output is the sorted
-      // region as-is (same order, same tombstone-skipping) -- but only when no merge is
-      // in flight (an in-flight reorganize() has frozen the previous active into immutable,
-      // which a sorted-only dump would silently drop). Concurrent writes stay consistent for
-      // the same reason a merge snapshot does: they are WAL-covered past this cycle's
-      // checkpoint_lsn and converge via replay. Tombstone pressure is not reset here --
-      // only a real merge carries tombstones away.
-      if (slot->index->append_size() == 0 && !slot->index->has_immutable()) {
-        slot->index->dump_sorted_region(dumped);
-        offset_mapper(std::span<EntrySnapshot>(dumped));
-        slot->approx_t2_bytes.store(sharded_detail::sum_entries_t2_bytes(std::span<const EntrySnapshot>(dumped)),
-                                    std::memory_order_relaxed);
-        per_shard_writer(dumped);
-      } else {
-        reorganize_until_captured(
-            *slot->index,
-            offset_mapper,
-            [&](std::span<const EntrySnapshot> merged) {
-              slot->approx_t2_bytes.store(sharded_detail::sum_entries_t2_bytes(merged), std::memory_order_relaxed);
-              per_shard_writer(merged);
-            },
-            /*parallel_sort=*/true);
-        slot->tombstones_since_maintenance.store(0, std::memory_order_relaxed);
-      }
-      const auto shard_elapsed = std::chrono::steady_clock::now() - shard_start;
-      if (shard_elapsed > std::chrono::seconds(1)) {
-        std::cerr << "[checkpoint_all_shards] Shard " << shard_idx << "/" << total_shards << " took "
-                  << std::chrono::duration_cast<std::chrono::milliseconds>(shard_elapsed).count() << "ms\n";
-      }
-      // Same re-drive as for_each_dirty_shard: checkpoint merges drain appends without
-      // splitting, so a big shard must re-enter maintenance here. Approximate post-merge
-      // size is enough as a gate; maintenance re-merges and confirms the exact size.
-      if (should_split_shard(slot->index->approx_entry_count(),
-                             slot->approx_t2_bytes.load(std::memory_order_relaxed))) {
-        queue_.push_if_live(slot);
-      }
-    }
-    t1_debug::g_checkpoint_current_shard.store(0, std::memory_order_release);
-    return boundaries;
+    t1_debug::g_checkpoint_total_shards.store(snapshot.size(), std::memory_order_release);
+    CheckpointContext context{*this, snapshot, boundaries, active_epoch};
+    func(context);
   }
 
   // Recovery-only: replaces this fresh, still-unshared instance's single shard with a
@@ -524,9 +509,87 @@ class ShardedT1Index {
     // True while this shard is queued for T2 compaction.
     std::atomic<bool> t2_dirty{false};
     std::atomic<bool> split_paused{false};
+    // Checkpoint epoch tracking: foreground puts stamp checkpoint_write_epoch_; checkpoint
+    // advances persisted_epoch after durable commit when no post-target entries were skipped.
+    std::atomic<uint64_t> dirty_epoch{0};
+    uint64_t persisted_epoch{0};
     // Hazard refs for unguarded worker/checkpoint touches; continue_split() waits for zero.
     std::atomic<int> outside_refs{0};
   };
+
+ public:
+  struct CheckpointContext {
+    ShardedT1Index &owner;
+    std::span<ShardSlot *const> shards;
+    std::span<const Key> dir_boundaries;
+    uint64_t snapshot_epoch;
+
+    [[nodiscard]] auto shard_count() const noexcept -> size_t { return shards.size(); }
+    [[nodiscard]] auto boundaries() const noexcept -> std::span<const Key> { return dir_boundaries; }
+    [[nodiscard]] auto shard_is_dirty(size_t index) const noexcept -> bool {
+      return shards[index]->dirty_epoch.load(std::memory_order_acquire) > shards[index]->persisted_epoch;
+    }
+    template <typename OffsetMapper, typename OnEntries>
+    void extract_shard(size_t index,
+                       std::vector<EntrySnapshot> &dumped,
+                       OffsetMapper &&offset_mapper,
+                       OnEntries &&on_entries) const {
+      owner.extract_shard_for_checkpoint(shards[index],
+                                         index + 1,
+                                         shards.size(),
+                                         dumped,
+                                         std::forward<OffsetMapper>(offset_mapper),
+                                         std::forward<OnEntries>(on_entries));
+    }
+    void mark_persisted(size_t index) const noexcept { shards[index]->persisted_epoch = snapshot_epoch; }
+  };
+
+ private:
+  template <typename OffsetMapper, typename PerShardWriter>
+  // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+  void extract_shard_for_checkpoint(ShardSlot *slot,
+                                    size_t shard_idx,
+                                    size_t total_shards,
+                                    std::vector<EntrySnapshot> &dumped,
+                                    OffsetMapper &&offset_mapper,
+                                    PerShardWriter &&per_shard_writer) {
+    const auto shard_start = std::chrono::steady_clock::now();
+    // Merge-free shortcut: an empty active append means the merge output is the sorted
+    // region as-is (same order, same tombstone-skipping) -- but only when no merge is
+    // in flight (an in-flight reorganize() has frozen the previous active into immutable,
+    // which a sorted-only dump would silently drop). Concurrent writes stay consistent for
+    // the same reason a merge snapshot does: they are WAL-covered past this cycle's
+    // checkpoint_lsn and converge via replay. Tombstone pressure is not reset here --
+    // only a real merge carries tombstones away.
+    if (slot->index->append_size() == 0 && !slot->index->has_immutable()) {
+      slot->index->dump_sorted_region(dumped);
+      offset_mapper(std::span<EntrySnapshot>(dumped));
+      slot->approx_t2_bytes.store(sharded_detail::sum_entries_t2_bytes(std::span<const EntrySnapshot>(dumped)),
+                                  std::memory_order_relaxed);
+      per_shard_writer(dumped);
+    } else {
+      reorganize_until_captured(
+          *slot->index,
+          offset_mapper,
+          [&](std::span<const EntrySnapshot> merged) {
+            slot->approx_t2_bytes.store(sharded_detail::sum_entries_t2_bytes(merged), std::memory_order_relaxed);
+            per_shard_writer(merged);
+          },
+          /*parallel_sort=*/true);
+      slot->tombstones_since_maintenance.store(0, std::memory_order_relaxed);
+    }
+    const auto shard_elapsed = std::chrono::steady_clock::now() - shard_start;
+    if (shard_elapsed > std::chrono::seconds(1)) {
+      std::cerr << "[checkpoint_all_shards] Shard " << shard_idx << "/" << total_shards << " took "
+                << std::chrono::duration_cast<std::chrono::milliseconds>(shard_elapsed).count() << "ms\n";
+    }
+    // Same re-drive as for_each_dirty_shard: checkpoint merges drain appends without
+    // splitting, so a big shard must re-enter maintenance here. Approximate post-merge
+    // size is enough as a gate; maintenance re-merges and confirms the exact size.
+    if (should_split_shard(slot->index->approx_entry_count(), slot->approx_t2_bytes.load(std::memory_order_relaxed))) {
+      queue_.push_if_live(slot);
+    }
+  }
 
   // Outcome of one dirty-shard visit: keep scanning shards or stop at this one.
   enum class DirtyShardVisit : std::uint8_t { kContinue, kStop };
@@ -883,6 +946,9 @@ class ShardedT1Index {
     auto *low_slot = new ShardSlot(std::move(low_shard));
     auto *high_slot = new ShardSlot(std::move(high_shard));
     const bool dirty = was_dirty || target->t2_dirty.load(std::memory_order_relaxed);
+    const uint64_t split_dirty_epoch = checkpoint_write_epoch_.load(std::memory_order_acquire);
+    low_slot->dirty_epoch.store(split_dirty_epoch, std::memory_order_relaxed);
+    high_slot->dirty_epoch.store(split_dirty_epoch, std::memory_order_relaxed);
     low_slot->approx_t2_bytes.store(low_t2_bytes, std::memory_order_relaxed);
     high_slot->approx_t2_bytes.store(high_t2_bytes, std::memory_order_relaxed);
     low_slot->outside_refs.store(1, std::memory_order_relaxed);
@@ -973,7 +1039,15 @@ class ShardedT1Index {
     return std::max<size_t>(1, (hardware_threads == 0 ? 4 : hardware_threads) / 4);
   }
 
+  void mark_checkpoint_dirty(ShardSlot *slot) noexcept {
+    const uint64_t cur = checkpoint_write_epoch_.load(std::memory_order_acquire);
+    if (slot->dirty_epoch.load(std::memory_order_relaxed) != cur) {
+      slot->dirty_epoch.store(cur, std::memory_order_release);
+    }
+  }
+
   void note_put_applied(ShardSlot *slot, Payload value, bool is_inline, bool mark_t2_dirty) {
+    mark_checkpoint_dirty(slot);
     if (mark_t2_dirty && value != STORE_NOT_FOUND && !is_inline) {
       dirty_queue_.push_if_live(slot);
       const uint64_t rec_bytes = sharded_detail::payload_t2_bytes(value, is_inline);
@@ -1148,6 +1222,7 @@ class ShardedT1Index {
   // at the Closing CAS, which checks this); in-flight splits are unaffected.
   std::atomic<int> splits_paused_{0};
   std::atomic<size_t> active_maintenance_{0};
+  std::atomic<uint64_t> checkpoint_write_epoch_{1};
 };
 
 template <typename Config>

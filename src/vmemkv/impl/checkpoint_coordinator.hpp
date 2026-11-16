@@ -7,17 +7,20 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <span>
 #include <stdexcept>
 #include <system_error>
 #include <thread>
 #include <vector>
 #include <vmemkv/checkpoint/checkpoint.hpp>
+#include <vmemkv/checkpoint/paths.hpp>
 #include <vmemkv/config.hpp>
 #include <vmemkv/core/background_poll.hpp>
 #include <vmemkv/core/env.hpp>
@@ -46,6 +49,9 @@ struct ReorgStats {
 
 struct ReorgState {
   std::atomic<bool> running{false};
+  std::vector<T1ChunkMeta> t1_chunks;
+  uint64_t next_t1_chunk_id{1};
+  uint64_t t1_chunk_split_bytes{0};
   ReorgStats stats;
 };
 
@@ -167,50 +173,224 @@ inline void msync_target_range(const T2Memory *mem, uint64_t old_base_boundary, 
 // every post-target T1 change comes from a WAL-logged foreground op (relocations
 // only rewrite the same version elsewhere), and logical replay rebuilds them at
 // new offsets. Tombstones and T1-inline values carry no T2 offset and persist as-is.
-template <typename ConfigT>
-auto publish_t1_checkpoint(ShardedT1Index<ConfigT> &tier1,
-                           const std::filesystem::path &t2_path,
+// Streams entries (< target) for one shard via add_shard(). Returns true if any non-inline
+// T2 offset >= target was filtered out.
+template <typename EntrySnapshot>
+auto stream_filtered_shard(std::span<const EntrySnapshot> entries,
                            uint64_t target,
-                           std::chrono::nanoseconds &t1_write_phase) -> std::chrono::nanoseconds {
-  using EntrySnapshot = typename ShardedT1Index<ConfigT>::EntrySnapshot;
-  auto offset_mapper_fn = [](std::span<EntrySnapshot> /*merged*/) {};
-  vmemkv::ShardedT1CheckpointWriter t1_chk_writer(vmemkv::derive_t1_chk_path(t2_path));
-  auto chk_writer_fn = [&](std::span<const EntrySnapshot> merged) {
-    const auto write_start = std::chrono::steady_clock::now();
-    size_t filtered_count = 0;
-    for (const auto &entry : merged) {
-      if (entry.payload_bits != vmemkv::STORE_NOT_FOUND && !t1_detail::is_inline(entry.hash) &&
-          (entry.payload_bits & t2_detail::kPayloadOffsetMask) >= target) {
-        continue;
-      }
-      ++filtered_count;
-    }
-    t1_chk_writer.begin_shard(filtered_count);
-
-    constexpr size_t kChunkSize = 2048;
-    std::array<vmemkv::T1ChkEntry, kChunkSize> chunk{};
-    size_t chunk_len = 0;
-    for (const auto &entry : merged) {
-      if (entry.payload_bits != vmemkv::STORE_NOT_FOUND && !t1_detail::is_inline(entry.hash) &&
-          (entry.payload_bits & t2_detail::kPayloadOffsetMask) >= target) {
-        continue;
-      }
-      chunk[chunk_len++] = vmemkv::T1ChkEntry{entry.key, entry.hash, entry.payload_bits};
-      if (chunk_len == kChunkSize) {
-        t1_chk_writer.write_shard_chunk(chunk.data(), chunk_len);
-        chunk_len = 0;
-      }
-    }
-    if (chunk_len > 0) {
-      t1_chk_writer.write_shard_chunk(chunk.data(), chunk_len);
-    }
-    t1_write_phase += std::chrono::steady_clock::now() - write_start;
+                           vmemkv::ShardedT1CheckpointWriter &writer) -> bool {
+  auto is_post_target = [target](const EntrySnapshot &entry) noexcept {
+    return entry.payload_bits != vmemkv::STORE_NOT_FOUND && !t1_detail::is_inline(entry.hash) &&
+           (entry.payload_bits & t2_detail::kPayloadOffsetMask) >= target;
   };
+  if (std::ranges::none_of(entries, is_post_target)) {
+    writer.add_shard(entries);
+    return false;
+  }
+  std::vector<EntrySnapshot> filtered;
+  filtered.reserve(entries.size());
+  for (const auto &entry : entries) {
+    if (!is_post_target(entry)) {
+      filtered.push_back(entry);
+    }
+  }
+  writer.add_shard(std::span<const EntrySnapshot>(filtered));
+  return true;
+}
+
+struct ShardChunkGroup {
+  size_t shard_begin = 0;
+  size_t shard_end = 0;
+  const vmemkv::T1ChunkMeta *prev_chunk = nullptr;
+  bool dirty = false;
+};
+
+template <typename CheckpointContext>
+auto map_prev_chunks_to_shards(std::span<const vmemkv::T1ChunkMeta> prev_chunks,
+                               const CheckpointContext &context) -> std::vector<ShardChunkGroup> {
+  const size_t total = context.shard_count();
+  const auto bounds = context.boundaries();
+  if (prev_chunks.empty()) {
+    return {{0, total, nullptr, true}};
+  }
+
+  std::vector<ShardChunkGroup> groups;
+  groups.reserve(prev_chunks.size());
+  size_t cursor = 0;
+  for (const auto &prev : prev_chunks) {
+    const size_t begin = cursor;
+    if (prev.has_upper_bound == 0) {
+      cursor = total;
+    } else {
+      while (cursor + 1 < total && !(prev.upper_bound < bounds[cursor])) {
+        ++cursor;
+      }
+      if (cursor == begin || cursor >= total || !(bounds[cursor - 1] == prev.upper_bound)) {
+        return {{0, total, nullptr, true}};
+      }
+    }
+    bool dirty = false;
+    for (size_t shard_idx = begin; shard_idx < cursor; ++shard_idx) {
+      if (context.shard_is_dirty(shard_idx)) {
+        dirty = true;
+        break;
+      }
+    }
+    groups.push_back({begin, cursor, &prev, dirty});
+  }
+  return cursor == total ? groups : std::vector<ShardChunkGroup>{{0, total, nullptr, true}};
+}
+
+inline auto should_coalesce_with_next(uint64_t cur_bytes,
+                                      bool from_open_writer,
+                                      const ShardChunkGroup &next,
+                                      uint64_t split_bytes) noexcept -> bool {
+  const uint64_t merge_bytes = split_bytes / 2;
+  const uint64_t tiny_bytes = std::max<uint64_t>(1, split_bytes / 8);
+  if (next.prev_chunk == nullptr || next.dirty) {
+    return cur_bytes < (from_open_writer ? merge_bytes : tiny_bytes);
+  }
+  const uint64_t combined = cur_bytes + next.prev_chunk->approx_bytes;
+  return combined <= merge_bytes || (cur_bytes < tiny_bytes && combined <= split_bytes);
+}
+
+struct T1ChunkEmitter {
+  const std::filesystem::path &t1_dir;
+  uint64_t target;
+  uint64_t split_bytes;
+  uint64_t next_chunk_id;
+  std::chrono::nanoseconds &t1_write_phase;
+  std::unique_ptr<vmemkv::ShardedT1CheckpointWriter> writer;
+  uint64_t active_chunk_id = 0;
+  std::vector<vmemkv::T1ChkKeyPrefix> internal_boundaries;
+  std::vector<vmemkv::T1ChunkMeta> staged_chunks;
+  std::vector<uint64_t> written_chunk_ids;
+  std::vector<size_t> persisted_shards;
+
+  void open_if_needed() {
+    if (writer != nullptr) {
+      return;
+    }
+    active_chunk_id = next_chunk_id++;
+    written_chunk_ids.push_back(active_chunk_id);
+    writer = std::make_unique<vmemkv::ShardedT1CheckpointWriter>(vmemkv::derive_t1_chunk_path(t1_dir, active_chunk_id));
+    internal_boundaries.clear();
+  }
+
+  void close_chunk(bool has_upper, const vmemkv::T1ChkKeyPrefix &upper) {
+    const auto write_start = std::chrono::steady_clock::now();
+    writer->finish(internal_boundaries);
+    const uint64_t bytes = writer->bytes_written();
+    t1_write_phase += std::chrono::steady_clock::now() - write_start;
+    staged_chunks.push_back(
+        {active_chunk_id, bytes, has_upper ? upper : vmemkv::T1ChkKeyPrefix{}, static_cast<uint8_t>(has_upper), {}});
+    writer.reset();
+    internal_boundaries.clear();
+    active_chunk_id = 0;
+  }
+};
+
+template <typename EntrySnapshot, typename CheckpointContext>
+void emit_shard_group(const ShardChunkGroup &group,
+                      const ShardChunkGroup *next_group,
+                      CheckpointContext &context,
+                      std::vector<EntrySnapshot> &dumped,
+                      T1ChunkEmitter &emit) {
+  auto no_op_mapper = [](std::span<EntrySnapshot> /*merged*/) {};
+  for (size_t shard_idx = group.shard_begin; shard_idx < group.shard_end; ++shard_idx) {
+    emit.open_if_needed();
+    if (emit.writer->shard_count() > 0) {
+      emit.internal_boundaries.push_back(context.boundaries()[shard_idx - 1]);
+    }
+    bool skipped_post_target = false;
+    context.extract_shard(shard_idx, dumped, no_op_mapper, [&](std::span<const EntrySnapshot> entries) {
+      const auto write_start = std::chrono::steady_clock::now();
+      skipped_post_target = stream_filtered_shard(entries, emit.target, *emit.writer);
+      emit.t1_write_phase += std::chrono::steady_clock::now() - write_start;
+    });
+    if (!skipped_post_target) {
+      emit.persisted_shards.push_back(shard_idx);
+    }
+    if (shard_idx + 1 < context.shard_count() && emit.writer->bytes_written() >= emit.split_bytes) {
+      emit.close_chunk(true, context.boundaries()[shard_idx]);
+    }
+  }
+  if (emit.writer == nullptr) {
+    return;
+  }
+  if (next_group != nullptr &&
+      should_coalesce_with_next(emit.writer->bytes_written(), true, *next_group, emit.split_bytes)) {
+    return;
+  }
+  const bool has_upper = (group.shard_end < context.shard_count());
+  emit.close_chunk(has_upper, has_upper ? context.boundaries()[group.shard_end - 1] : vmemkv::T1ChkKeyPrefix{});
+}
+
+// Publishes only dirty/coalesced T1 chunks to `<t2_path>.t1chk/` and commits the atomic
+// manifest; rolls back newly written chunk files on error without mutating committed state.
+template <typename ConfigT>
+auto publish_t1_checkpoint_and_manifest(ReorgState &state,
+                                        ShardedT1Index<ConfigT> &tier1,
+                                        const std::filesystem::path &t2_path,
+                                        uint64_t checkpoint_lsn,
+                                        uint64_t target,
+                                        std::chrono::nanoseconds &t1_write_phase) -> std::chrono::nanoseconds {
+  using EntrySnapshot = typename ShardedT1Index<ConfigT>::EntrySnapshot;
+  const uint64_t split_bytes =
+      state.t1_chunk_split_bytes > 0 ? state.t1_chunk_split_bytes : ConfigT::kT1ChunkSplitBytes;
+  const std::filesystem::path t1_dir = vmemkv::derive_t1_chk_path(t2_path);
+  std::filesystem::create_directories(t1_dir);
+
   const auto start = std::chrono::steady_clock::now();
-  const auto t1_boundaries = tier1.checkpoint_all_shards(offset_mapper_fn, chk_writer_fn);
-  const auto elapsed = std::chrono::steady_clock::now() - start;
-  t1_chk_writer.finish(t1_boundaries);
-  return elapsed;
+  std::chrono::nanoseconds t1_elapsed{0};
+
+  tier1.with_checkpoint_shards([&](auto &context) {
+    T1ChunkEmitter emit{t1_dir, target, split_bytes, state.next_t1_chunk_id, t1_write_phase, {}, 0, {}, {}, {}, {}};
+    try {
+      const auto groups = map_prev_chunks_to_shards(state.t1_chunks, context);
+      emit.staged_chunks.reserve(groups.size());
+      std::vector<EntrySnapshot> dumped;
+
+      for (size_t g_idx = 0; g_idx < groups.size(); ++g_idx) {
+        const ShardChunkGroup &group = groups[g_idx];
+        const ShardChunkGroup *next_group = (g_idx + 1 < groups.size()) ? &groups[g_idx + 1] : nullptr;
+        const bool coalesce_clean =
+            group.prev_chunk != nullptr && next_group != nullptr &&
+            should_coalesce_with_next(group.prev_chunk->approx_bytes, false, *next_group, split_bytes);
+        if (emit.writer == nullptr && !group.dirty && !coalesce_clean) {
+          emit.staged_chunks.push_back(*group.prev_chunk);
+          continue;
+        }
+        emit_shard_group<EntrySnapshot>(group, next_group, context, dumped, emit);
+      }
+
+      if (!emit.written_chunk_ids.empty()) {
+        const auto sync_start = std::chrono::steady_clock::now();
+        vmemkv::fsync_directory(t1_dir);
+        t1_write_phase += std::chrono::steady_clock::now() - sync_start;
+      }
+      t1_elapsed = std::chrono::steady_clock::now() - start;
+
+      g_checkpoint_debug_phase.store("checkpoint: write_manifest", std::memory_order_release);
+      vmemkv::write_manifest(
+          vmemkv::derive_manifest_path(t2_path), checkpoint_lsn, target, emit.staged_chunks, emit.next_chunk_id);
+
+      state.t1_chunks = std::move(emit.staged_chunks);
+      state.next_t1_chunk_id = emit.next_chunk_id;
+      for (const size_t shard_idx : emit.persisted_shards) {
+        context.mark_persisted(shard_idx);
+      }
+      if (!emit.written_chunk_ids.empty()) {
+        vmemkv::cleanup_stale_t1_chunks(t1_dir, state.t1_chunks);
+      }
+    } catch (...) {
+      for (const uint64_t new_id : emit.written_chunk_ids) {
+        remove_quiet(vmemkv::derive_t1_chunk_path(t1_dir, new_id));
+      }
+      throw;
+    }
+  });
+  return t1_elapsed;
 }
 
 inline auto to_us(std::chrono::nanoseconds duration) -> uint64_t {
@@ -316,9 +496,8 @@ void checkpoint_internal(ReorgState &state,
     // post-target appends are WAL-covered only and must not be adopted as
     // durable on restart (see publish_t1_checkpoint's filter).
     g_checkpoint_debug_phase.store("checkpoint: publish_t1_checkpoint", std::memory_order_release);
-    t1_phase = publish_t1_checkpoint(tier1, t2_path, checkpoint_target.target, t1_write_phase);
-    g_checkpoint_debug_phase.store("checkpoint: write_manifest", std::memory_order_release);
-    vmemkv::write_manifest(vmemkv::derive_manifest_path(t2_path), checkpoint_lsn, checkpoint_target.target);
+    t1_phase = publish_t1_checkpoint_and_manifest(
+        state, tier1, t2_path, checkpoint_lsn, checkpoint_target.target, t1_write_phase);
   } catch (...) {
     // Nothing durable happened yet (base_boundary hasn't advanced) -- un-claim so in-place
     // updates aren't blocked forever for an unpublished cycle.

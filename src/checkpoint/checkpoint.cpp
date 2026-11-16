@@ -3,8 +3,10 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <system_error>
+#include <unordered_set>
 #include <vmemkv/checkpoint/checkpoint.hpp>
 #include <vmemkv/core/io.hpp>
 #include <vmemkv/core/mmap.hpp>
@@ -149,6 +151,7 @@ ShardedT1CheckpointWriter::~ShardedT1CheckpointWriter() {
 void ShardedT1CheckpointWriter::write_bytes_internal(const void *data, size_t size) {
   write_all_exact(file_descriptor_.fd, data, size, "write sharded t1 checkpoint");
   checksum_.add(data, size);
+  bytes_written_ += size;
 }
 
 void ShardedT1CheckpointWriter::begin_shard(uint64_t entry_count) {
@@ -186,6 +189,7 @@ void ShardedT1CheckpointWriter::finish(std::span<const T1ChkKeyPrefix> boundarie
   // throw doesn't double-close in the destructor.
   const int trailer_fd = file_descriptor_.release();
   write_fsync_close(trailer_fd, &header, sizeof(header), "write sharded t1 checkpoint trailer");
+  bytes_written_ += sizeof(header);
   finished_ = true;
 
   rename_temp_to_final(temp_path_, final_path_, "rename sharded t1 checkpoint file");
@@ -252,15 +256,57 @@ auto ShardedT1CheckpointFile::boundaries() const noexcept -> std::span<const T1C
   return {boundaries_, boundary_count_};
 }
 
-// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-void write_manifest(const std::filesystem::path &manifest_path, uint64_t generation, uint64_t t2_bytes_used) {
+namespace {
+
+auto validate_manifest_chunks(std::span<const T1ChunkMeta> chunks, uint64_t next_chunk_id) -> bool {
+  for (size_t i = 0; i < chunks.size(); ++i) {
+    if (chunks[i].chunk_id == 0 || chunks[i].chunk_id >= next_chunk_id) {
+      return false;
+    }
+    const bool expect_bound = (i + 1 < chunks.size());
+    if ((chunks[i].has_upper_bound != 0) != expect_bound) {
+      return false;
+    }
+    if (i > 0 && !(chunks[i - 1].upper_bound < chunks[i].upper_bound) && expect_bound) {
+      return false;
+    }
+  }
+  return true;
+}
+
+auto compute_manifest_checksum(ManifestHeader header, std::span<const T1ChunkMeta> chunks) noexcept -> uint64_t {
+  header.checksum = 0;
+  FoldingChecksum checksum;
+  checksum.add_header(header);
+  if (!chunks.empty()) {
+    checksum.add(chunks.data(), chunks.size_bytes());
+  }
+  return checksum.value();
+}
+
+}  // namespace
+
+void write_manifest(const std::filesystem::path &manifest_path,
+                    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+                    uint64_t generation,
+                    uint64_t t2_bytes_used,
+                    std::span<const T1ChunkMeta> t1_chunks,
+                    uint64_t next_t1_chunk_id) {
   ManifestHeader header;
   header.generation = generation;
   header.t2_bytes_used = t2_bytes_used;
-  header.checksum = checksum_header(header);
+  header.next_t1_chunk_id = next_t1_chunk_id;
+  header.t1_chunk_count = t1_chunks.size();
+  header.checksum = compute_manifest_checksum(header, t1_chunks);
+
+  std::vector<std::byte> payload(sizeof(header) + t1_chunks.size_bytes());
+  std::memcpy(payload.data(), &header, sizeof(header));
+  if (!t1_chunks.empty()) {
+    std::memcpy(payload.data() + sizeof(header), t1_chunks.data(), t1_chunks.size_bytes());
+  }
 
   write_via_temp_then_rename(manifest_path, [&](int file_descriptor) {
-    write_fsync_close(file_descriptor, &header, sizeof(header), "write manifest");
+    write_fsync_close(file_descriptor, payload.data(), payload.size(), "write manifest");
   });
 }
 
@@ -271,21 +317,68 @@ auto read_manifest(const std::filesystem::path &manifest_path) -> std::optional<
   }
   const FdGuard fd_guard{file_descriptor};
 
-  ManifestHeader header;
-  const ssize_t bytes_read = ::read(fd_guard.fd, &header, sizeof(header));
-  if (bytes_read != static_cast<ssize_t>(sizeof(header))) {
+  const auto file_size = fstat_size(fd_guard.fd, "fstat manifest");
+  if (file_size < sizeof(ManifestHeader)) {
     return std::nullopt;  // Torn/truncated manifest: treat as absent, fall back safely.
   }
 
-  if (header.magic != kManifestMagic || header.format_version != kManifestFormatVersion) {
+  ManifestHeader header;
+  if (::pread(fd_guard.fd, &header, sizeof(header), 0) != static_cast<ssize_t>(sizeof(header))) {
+    return std::nullopt;
+  }
+  if (header.magic != kManifestMagic || header.format_version != kManifestFormatVersion ||
+      header.next_t1_chunk_id == 0) {
+    return std::nullopt;
+  }
+  if (header.t1_chunk_count > (std::numeric_limits<size_t>::max() - sizeof(header)) / sizeof(T1ChunkMeta)) {
+    return std::nullopt;
+  }
+  const size_t chunks_bytes = static_cast<size_t>(header.t1_chunk_count) * sizeof(T1ChunkMeta);
+  if (file_size != sizeof(header) + chunks_bytes) {
     return std::nullopt;
   }
 
-  if (checksum_header(header) != header.checksum) {
+  ManifestData data;
+  data.generation = header.generation;
+  data.t2_bytes_used = header.t2_bytes_used;
+  data.next_t1_chunk_id = header.next_t1_chunk_id;
+  data.t1_chunks.resize(header.t1_chunk_count);
+  if (chunks_bytes > 0 &&
+      ::pread(fd_guard.fd, data.t1_chunks.data(), chunks_bytes, sizeof(header)) != static_cast<ssize_t>(chunks_bytes)) {
     return std::nullopt;
   }
+  if (!validate_manifest_chunks(data.t1_chunks, data.next_t1_chunk_id) ||
+      compute_manifest_checksum(header, data.t1_chunks) != header.checksum) {
+    return std::nullopt;
+  }
+  return data;
+}
 
-  return ManifestData{header.generation, header.t2_bytes_used};
+void fsync_directory(const std::filesystem::path &dir_path) {
+  const FdGuard dir_fd{open_file(dir_path.c_str(), O_RDONLY | O_DIRECTORY, "open t1 checkpoint directory")};
+  if (::fsync(dir_fd.fd) != 0) {
+    throw std::system_error(errno, std::generic_category(), "fsync t1 checkpoint directory");
+  }
+}
+
+void cleanup_stale_t1_chunks(const std::filesystem::path &t1_chk_dir, std::span<const T1ChunkMeta> active_chunks) {
+  std::error_code dir_error;
+  if (!std::filesystem::exists(t1_chk_dir, dir_error)) {
+    return;
+  }
+  std::unordered_set<std::string> keep;
+  keep.reserve(active_chunks.size());
+  for (const auto &meta : active_chunks) {
+    keep.insert(derive_t1_chunk_filename(meta.chunk_id));
+  }
+  for (const auto &entry : std::filesystem::directory_iterator(t1_chk_dir, dir_error)) {
+    if (dir_error) {
+      break;
+    }
+    if (!keep.contains(entry.path().filename().string())) {
+      remove_quiet(entry.path());
+    }
+  }
 }
 
 }  // namespace vmemkv

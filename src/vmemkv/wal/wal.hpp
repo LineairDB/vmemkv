@@ -250,7 +250,8 @@ inline void remove_store_files(const std::filesystem::path &t2_path) {
   remove_quiet(t2_path);
   remove_wal_segments(derive_wal_path(t2_path));
   remove_quiet(derive_manifest_path(t2_path));
-  remove_quiet(derive_t1_chk_path(t2_path));
+  std::error_code ignored_ec;
+  std::filesystem::remove_all(derive_t1_chk_path(t2_path), ignored_ec);
   remove_quiet(derive_t2_chk_path(t2_path));
 }
 

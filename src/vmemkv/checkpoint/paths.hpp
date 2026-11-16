@@ -12,13 +12,18 @@ inline auto derive_manifest_path(const std::filesystem::path &t2_path) -> std::f
   return {t2_path.string() + ".manifest"};
 }
 
-// T1 checkpoint / T2 checkpoint file paths. Each is a single path reused across
-// every checkpoint this store ever commits: the T1 file is fully rewritten each
-// cycle via temp+rename, and the T2 file is the store's one persistent data file,
-// appended to in place. Neither is trusted by a reader until the manifest names the
-// generation that last wrote them.
+// T1 checkpoint directory and T2 checkpoint file paths. T1 stores key-range chunk files
+// inside `<t2_path>.t1chk/` named via derive_t1_chunk_path(), and T2 appends to a single
+// persistent data file in place. Neither is trusted by a reader until the manifest names
+// the committed generation and active T1 chunks.
 inline auto derive_t1_chk_path(const std::filesystem::path &t2_path) -> std::filesystem::path {
   return {t2_path.string() + ".t1chk"};
+}
+inline auto derive_t1_chunk_filename(uint64_t chunk_id) -> std::string {
+  return "chunk_" + std::to_string(chunk_id) + ".chk";
+}
+inline auto derive_t1_chunk_path(const std::filesystem::path &t1_chk_dir, uint64_t chunk_id) -> std::filesystem::path {
+  return t1_chk_dir / derive_t1_chunk_filename(chunk_id);
 }
 inline auto derive_t2_chk_path(const std::filesystem::path &t2_path) -> std::filesystem::path {
   return {t2_path.string() + ".t2chk"};

@@ -339,7 +339,7 @@ TEST_CASE("checkpoint: a valid manifest pointing at a missing T1 checkpoint file
   REQUIRE(manifest.has_value());
   // T1 file lost with the WAL already rotated to the tail: full replay would silently lose the
   // pre-checkpoint key, so construction must fail loudly instead (see load_checkpoint_if_present).
-  std::filesystem::remove(vmemkv::derive_t1_chk_path(path));
+  std::filesystem::remove_all(vmemkv::derive_t1_chk_path(path));
 
   CHECK_THROWS(std::make_unique<vmemkv::variants::VMemKV_Default>(path, kStoreCapacityBytes));
 }
@@ -517,5 +517,111 @@ TEST_CASE("checkpoint: sharded T1 survives checkpoint and restart with multiple 
       REQUIRE(val.has_value());
       CHECK(vmemkv_test::span_to_string(vmemkv_test::as_span(*val)) == vmemkv_test::indexed_value(i));
     }
+  }
+}
+
+TEST_CASE("Manifest: round-trips chunk metadata and rejects corrupt trailing metadata") {
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_chk_test", vmemkv::remove_quiet);
+  const std::vector<vmemkv::T1ChunkMeta> chunks = {
+      {10, 4096, make_chk_prefix("k500"), 1, {}},
+      {12, 2048, {}, 0, {}},
+  };
+  vmemkv::write_manifest(path, 99, 8192, chunks, 13);
+
+  const auto loaded = vmemkv::read_manifest(path);
+  REQUIRE(loaded.has_value());
+  CHECK(loaded->generation == 99);
+  CHECK(loaded->t2_bytes_used == 8192);
+  CHECK(loaded->next_t1_chunk_id == 13);
+  REQUIRE(loaded->t1_chunks.size() == 2);
+  CHECK(loaded->t1_chunks[0].chunk_id == 10);
+  CHECK(loaded->t1_chunks[0].approx_bytes == 4096);
+  CHECK(loaded->t1_chunks[0].upper_bound == make_chk_prefix("k500"));
+  CHECK(loaded->t1_chunks[1].chunk_id == 12);
+  CHECK(loaded->t1_chunks[1].has_upper_bound == 0);
+
+  vmemkv_test::flip_byte_at(path.get(), static_cast<std::streamoff>(sizeof(vmemkv::ManifestHeader)));
+  CHECK_FALSE(vmemkv::read_manifest(path).has_value());
+}
+
+TEST_CASE("checkpoint: chunked T1 splits, preserves clean chunks, merges after deletes, and recovers") {
+  const auto path = vmemkv_test::ScopedTempPath("vmemkv_crash", vmemkv::remove_store_files);
+  constexpr int kKeyCount = 2000;
+  constexpr auto kKeyFor = [](int i) {
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "k%06d", i);
+    return std::string(buf);
+  };
+
+  size_t shard_count_final = 0;
+  std::vector<vmemkv::T1ChunkMeta> chunks_after_merge;
+  {
+    auto store = std::make_unique<VMemKV_TinyShard>(path, kStoreCapacityBytes);
+    store->impl().set_t1_chunk_split_bytes_for_test(4096);
+    for (int i = 0; i < kKeyCount; ++i) {
+      REQUIRE(store->insert(kKeyFor(i), vmemkv_test::indexed_value(i)));
+    }
+    for (int attempt = 0; attempt < 200 && store->impl().t1().shard_count() < 8; ++attempt) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    store->impl().t1().drain_maintenance();
+    REQUIRE(store->impl().t1().shard_count() >= 4);
+    store->checkpoint();
+
+    const auto chunks_initial = store->impl().t1_checkpoint_chunks();
+    REQUIRE(chunks_initial.size() >= 4);
+
+    // Mutate only the highest key range so the leading chunks stay clean and retain their IDs.
+    REQUIRE(store->insert("zzzz_tail", vmemkv_test::indexed_value(999999)));
+    store->checkpoint();
+
+    const auto chunks_after_tail = store->impl().t1_checkpoint_chunks();
+    REQUIRE(chunks_after_tail.size() >= chunks_initial.size());
+    CHECK(chunks_after_tail[0].chunk_id == chunks_initial[0].chunk_id);
+    CHECK(chunks_after_tail.back().chunk_id != chunks_initial.back().chunk_id);
+
+    size_t files_in_dir = 0;
+    for (const auto &entry : std::filesystem::directory_iterator(vmemkv::derive_t1_chk_path(path))) {
+      (void)entry;
+      ++files_in_dir;
+    }
+    CHECK(files_in_dir == chunks_after_tail.size());
+
+    // Delete 95% of keys and merge small chunks back down.
+    for (int i = 0; i < kKeyCount; ++i) {
+      if (i % 20 != 0) {
+        REQUIRE(store->remove(kKeyFor(i)));
+      }
+    }
+    store->impl().t1().drain_maintenance();
+    store->checkpoint();
+
+    shard_count_final = store->impl().t1().shard_count();
+    chunks_after_merge = store->impl().t1_checkpoint_chunks();
+    CHECK(chunks_after_merge.size() < chunks_after_tail.size());
+  }
+
+  // Create an orphaned stale chunk file to verify recovery sweeps unreferenced files.
+  const auto orphan_path = vmemkv::derive_t1_chunk_path(vmemkv::derive_t1_chk_path(path), 999999);
+  { std::ofstream out(orphan_path, std::ios::binary); }
+  REQUIRE(std::filesystem::exists(orphan_path));
+
+  {
+    auto store = std::make_unique<VMemKV_TinyShard>(path, kStoreCapacityBytes);
+    CHECK_FALSE(std::filesystem::exists(orphan_path));
+    CHECK(store->impl().t1().shard_count() == shard_count_final);
+    CHECK(store->impl().t1_checkpoint_chunks().size() == chunks_after_merge.size());
+    for (int i = 0; i < kKeyCount; ++i) {
+      const auto val = vmemkv_test::get_optional_bytes(store, kKeyFor(i));
+      if (i % 20 == 0) {
+        REQUIRE(val.has_value());
+        CHECK(vmemkv_test::span_to_string(vmemkv_test::as_span(*val)) == vmemkv_test::indexed_value(i));
+      } else {
+        CHECK_FALSE(val.has_value());
+      }
+    }
+    const auto tail = vmemkv_test::get_optional_bytes(store, "zzzz_tail");
+    REQUIRE(tail.has_value());
+    CHECK(vmemkv_test::span_to_string(vmemkv_test::as_span(*tail)) == vmemkv_test::indexed_value(999999));
   }
 }

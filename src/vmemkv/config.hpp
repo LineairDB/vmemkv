@@ -43,6 +43,9 @@ struct T1Config {
   // See docs/specification/t1_sharding_design.md for the relation.
   static constexpr size_t kShardTargetSizeEntries = size_t{1} << 20;
   static constexpr size_t kShardSplitThresholdPercent = 200;
+
+  // Target max bytes per T1 checkpoint chunk file (merge threshold = split / 2).
+  static constexpr uint64_t kT1ChunkSplitBytes = 32ULL << 20;
 };
 
 struct T2Config {

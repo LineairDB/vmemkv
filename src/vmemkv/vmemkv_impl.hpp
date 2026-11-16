@@ -215,6 +215,8 @@ class VMemKVImpl {
   auto t2() noexcept -> vmemkv::T2FlatFile & { return t2_; }
   auto t2() const noexcept -> const vmemkv::T2FlatFile & { return t2_; }
   auto compaction_probe_state() const noexcept -> const vmemkv::CompactionState & { return compact_; }
+  void set_t1_chunk_split_bytes_for_test(uint64_t split_bytes) noexcept { reorg_.t1_chunk_split_bytes = split_bytes; }
+  auto t1_checkpoint_chunks() const -> std::vector<vmemkv::T1ChunkMeta> { return reorg_.t1_chunks; }
   auto pending_segment_count() const -> size_t {
     const T2Memory *mem = t2_.get_memory();
     const uint64_t base = mem != nullptr ? mem->base_boundary.load(std::memory_order_acquire) : 0;
@@ -515,33 +517,49 @@ class VMemKVImpl {
       return;
     }
 
-    vmemkv::ShardedT1CheckpointFile t1_chk(vmemkv::derive_t1_chk_path(t2_path));
+    const std::filesystem::path t1_chk_dir = vmemkv::derive_t1_chk_path(t2_path);
+    if (manifest->t1_chunks.empty() || !std::filesystem::is_directory(t1_chk_dir)) {
+      throw std::runtime_error("sharded t1 checkpoint directory missing or empty for valid manifest");
+    }
+    vmemkv::cleanup_stale_t1_chunks(t1_chk_dir, manifest->t1_chunks);
 
     // O(N) memcpy-shaped conversion (on-disk order -> EntrySnapshot order), no hashing or
     // per-key insertion -- what makes fast boot fast (docs/specification/low_level_design.md 5.4), done once per
     // shard. Runs before t1_.start_workers() (see the constructor's own comment), so this is the
     // single-threaded window load_from_checkpoint()'s own contract requires.
     using EntrySnapshot = typename T1IndexT::EntrySnapshot;
+    using Key = typename T1IndexT::Key;
     std::vector<std::vector<EntrySnapshot>> per_shard_entries;
+    std::vector<Key> boundaries;
     std::vector<bool> shard_local;
-    per_shard_entries.reserve(t1_chk.shard_count());
-    shard_local.reserve(t1_chk.shard_count());
-    for (size_t shard_index = 0; shard_index < t1_chk.shard_count(); ++shard_index) {
-      std::vector<EntrySnapshot> entries;
-      const auto on_disk_entries = t1_chk.shard_entries(shard_index);
-      entries.reserve(on_disk_entries.size());
-      for (const auto &on_disk : on_disk_entries) {
-        const EntrySnapshot entry{on_disk.key_prefix, on_disk.payload_bits, on_disk.hash};
-        entries.push_back(entry);
-        if (entry.payload_bits != vmemkv::STORE_NOT_FOUND && !t1_detail::is_inline(entry.hash)) {
-          t2_own_.note_replace(vmemkv::STORE_NOT_FOUND, 0, /*new_is_offset=*/true, entry.payload_bits);
-        }
+
+    for (const auto &chunk_meta : manifest->t1_chunks) {
+      vmemkv::ShardedT1CheckpointFile chunk_file(vmemkv::derive_t1_chunk_path(t1_chk_dir, chunk_meta.chunk_id));
+      const auto chunk_bounds = chunk_file.boundaries();
+      boundaries.insert(boundaries.end(), chunk_bounds.begin(), chunk_bounds.end());
+      if (chunk_meta.has_upper_bound != 0) {
+        boundaries.push_back(chunk_meta.upper_bound);
       }
-      shard_local.push_back(compaction_detail::shard_pages_local<EntrySnapshot>(entries, t2_.get_memory()));
-      per_shard_entries.push_back(std::move(entries));
+
+      for (size_t shard_index = 0; shard_index < chunk_file.shard_count(); ++shard_index) {
+        std::vector<EntrySnapshot> entries;
+        const auto on_disk_entries = chunk_file.shard_entries(shard_index);
+        entries.reserve(on_disk_entries.size());
+        for (const auto &on_disk : on_disk_entries) {
+          const EntrySnapshot entry{on_disk.key_prefix, on_disk.payload_bits, on_disk.hash};
+          entries.push_back(entry);
+          if (entry.payload_bits != vmemkv::STORE_NOT_FOUND && !t1_detail::is_inline(entry.hash)) {
+            t2_own_.note_replace(vmemkv::STORE_NOT_FOUND, 0, /*new_is_offset=*/true, entry.payload_bits);
+          }
+        }
+        shard_local.push_back(compaction_detail::shard_pages_local<EntrySnapshot>(entries, t2_.get_memory()));
+        per_shard_entries.push_back(std::move(entries));
+      }
     }
 
-    t1_.load_from_checkpoint(t1_chk.boundaries(), per_shard_entries);
+    t1_.load_from_checkpoint(boundaries, per_shard_entries);
+    reorg_.t1_chunks = manifest->t1_chunks;
+    reorg_.next_t1_chunk_id = manifest->next_t1_chunk_id;
     for (size_t shard_index = 0; shard_index < per_shard_entries.size(); ++shard_index) {
       t1_.mark_t2_shard_state(shard_index, !shard_local[shard_index]);
     }
