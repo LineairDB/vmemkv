@@ -487,7 +487,10 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "epoch gate defers punch by one checkpoint
   // miss that checkpoint's T1 dump.
   store->checkpoint();
   wait_for_compaction(*store);
-  CHECK(file_blocks(t2_data_path(path)) == blocks_after_drain);
+  // First post-evacuation checkpoint may flush delayed-allocated ext4 pages (increasing
+  // st_blocks slightly), but must not punch yet.
+  CHECK(store->impl().punch_backlog_segments() > 0);
+  CHECK(file_blocks(t2_data_path(path)) >= blocks_after_drain);
   store->checkpoint();
   wait_for([&] { return file_blocks(t2_data_path(path)) < blocks_after_drain; });
   for (size_t i = 0; i < kKeys; i += 257) {
