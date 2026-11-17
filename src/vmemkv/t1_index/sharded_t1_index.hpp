@@ -945,7 +945,6 @@ class ShardedT1Index {
 
     auto *low_slot = new ShardSlot(std::move(low_shard));
     auto *high_slot = new ShardSlot(std::move(high_shard));
-    const bool dirty = was_dirty || target->t2_dirty.load(std::memory_order_relaxed);
     const uint64_t split_dirty_epoch = checkpoint_write_epoch_.load(std::memory_order_acquire);
     low_slot->dirty_epoch.store(split_dirty_epoch, std::memory_order_relaxed);
     high_slot->dirty_epoch.store(split_dirty_epoch, std::memory_order_relaxed);
@@ -971,6 +970,15 @@ class ShardedT1Index {
     last_split_pause_end_ns_.store(static_cast<uint64_t>(split_pause_end.time_since_epoch().count()),
                                    std::memory_order_relaxed);
 
+    // Drain routing-guarded calls still referencing `target`/`old_dir` before sampling final
+    // `t2_dirty` state, queuing children, and retiring `target`. Any writer that observed
+    // `superseded == nullptr` before Closing may still be executing `note_put_applied(target)`
+    // inside its routing guard; waiting here guarantees its dirty flag is never missed.
+    // Waiting after Split publish avoids deadlocking writers that spin outside routing guards.
+    const uint64_t bumped = routing_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
+    routing_epochs_.wait_until_epoch(bumped);
+
+    const bool dirty = was_dirty || target->t2_dirty.load(std::memory_order_acquire);
     if (dirty) {
       dirty_queue_.push_if_live(low_slot);
       dirty_queue_.push_if_live(high_slot);
@@ -984,14 +992,6 @@ class ShardedT1Index {
     }
     low_slot->outside_refs.fetch_sub(1, std::memory_order_release);
     high_slot->outside_refs.fetch_sub(1, std::memory_order_release);
-
-    // Drain routing-guarded calls still referencing `target`/`old_dir`, then free both. No
-    // bulk redistribution of leftovers: post-snapshot writes re-apply themselves via put()'s
-    // superseded forwarding (never overwriting a newer completed write, unlike a bulk copy
-    // here). Drain after the Split publish (not before the snapshot): writers spin on Closing
-    // until this function releases them, so draining first would self-deadlock.
-    const uint64_t bumped = routing_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
-    routing_epochs_.wait_until_epoch(bumped);
 
     // Drain unguarded maintenance/checkpoint users holding outside_refs before freeing.
     {

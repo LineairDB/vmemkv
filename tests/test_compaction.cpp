@@ -17,6 +17,7 @@
 #include <thread>
 #include <vector>
 #include <vmemkv/checkpoint/paths.hpp>
+#include <vmemkv/impl/compaction.hpp>
 #include <vmemkv/impl/t2_ownership.hpp>
 #include <vmemkv/t1_index/t1_codec.hpp>
 #include <vmemkv/variants.hpp>
@@ -606,23 +607,30 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "T1 shard splits preserve T2 dirty state")
   for (size_t i = 0; i < kKeys; ++i) {
     REQUIRE(store->insert(make_key(order[i]), pattern_value(kValBytes, order[i])));
   }
-  for (size_t retry = 0; retry < 500 && store->impl().t1().shard_count() == 1; ++retry) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-  }
-  REQUIRE(store->impl().t1().shard_count() > 1);
+  store->impl().t1().drain_maintenance();
+  const size_t shards_before_checkpoint = store->impl().t1().shard_count();
+  REQUIRE(shards_before_checkpoint > 1);
   store->checkpoint();
   store->impl().t1().drain_maintenance();
-  CHECK(store->get_statistics().t2_dirty_shard_count > 1);
+  CHECK(store->get_statistics().t2_dirty_shard_count == store->impl().t1().shard_count());
   enable();
   wait_for_compaction(*store);
   store->impl().t1().drain_maintenance();
   CHECK(store->get_statistics().t2_dirty_shard_count == 0);
 
-  const auto after_688 = store->impl().t1().get_with_hash(vmemkv_test::to_span(make_key(688)));
-  const auto after_689 = store->impl().t1().get_with_hash(vmemkv_test::to_span(make_key(689)));
-  REQUIRE(after_688.payload_bits != vmemkv::STORE_NOT_FOUND);
-  REQUIRE(after_689.payload_bits != vmemkv::STORE_NOT_FOUND);
-  CHECK(vmemkv::t2_detail::are_t2_payloads_page_local(after_688.payload_bits, after_689.payload_bits));
+  // Every shard must independently reach intra-shard page locality after compaction,
+  // regardless of where asynchronous split boundaries landed.
+  const vmemkv::T2Memory *mem = store->impl().t2().get_memory();
+  REQUIRE(mem != nullptr);
+  size_t visited_shards = 0;
+  store->impl().t1().for_each_shard_for_compaction(
+      [&](std::span<const TinyShardStore::Impl::T1IndexT::EntrySnapshot> entries) {
+        ++visited_shards;
+        CHECK(vmemkv::compaction_detail::shard_pages_local(entries, mem));
+        return true;
+      });
+  CHECK(visited_shards == store->impl().t1().shard_count());
+  CHECK(count_inversions(store) < store->impl().t1().shard_count());
 
   for (size_t i = 0; i < kKeys; ++i) {
     const auto got = vmemkv_test::get_optional_bytes(store, make_key(i));
