@@ -1,6 +1,6 @@
 # vmemkv
 
-vmemkv is a larger-than-memory key-value store that delegates I/O management to the OS virtual-memory subsystem (`mmap` / `fork` / `mincore`), keeping the implementation simple while delivering production-grade performance.
+vmemkv is a larger-than-memory key-value store that delegates I/O management to the OS virtual-memory subsystem (`mmap` / `madvise` / `pread`), keeping the implementation simple while delivering production-grade performance.
 
 ## Features
 
@@ -91,7 +91,7 @@ A buildable minimal program lives in [`example/`](example/).
 
 | Item         | Guarantee                                                        |
 | ------------ | ---------------------------------------------------------------- |
-| Platform     | Linux (`mmap` / `fork` / `mincore` based; macOS/Windows unsupported) |
+| Platform     | Linux (`mmap` / `madvise` / `fallocate` based; macOS/Windows unsupported) |
 | Thread safety| `VMemKVStore` methods are safe to call concurrently (see the concurrency matrix in `src/vmemkv/vmemkv_impl.hpp`) |
 | Durability   | Every successful `insert` / `update` / `remove` is WAL-durable via group commit; `checkpoint()` compacts it into a manifest |
 | Transactions | Single-operation only (multi-operation transactions out of scope by design) |

@@ -18,8 +18,8 @@ namespace vmemkv_test {
 // Config override providing a small T1 append-region capacity (2^Log2 entries).
 template <size_t Log2>
 struct TinyAppendConfig : vmemkv::Config<> {
-  static constexpr size_t kAppendCapacityLog2 = Log2;
-  static constexpr size_t kAppendCapacityEntries = size_t{1} << Log2;
+  static constexpr size_t kMemTableCapacityLog2 = Log2;
+  static constexpr size_t kMemTableCapacityEntries = size_t{1} << Log2;
 };
 
 // Adapts a per-entry function to T1Index::reorganize()'s OffsetMapper contract.

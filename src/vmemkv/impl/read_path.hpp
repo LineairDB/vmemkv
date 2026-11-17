@@ -1,8 +1,8 @@
-// read_path.hpp - T2 base-region read path for VMemKVImpl.
+// read_path.hpp - T2 immutable-region read path for VMemKVImpl.
 //
-// Once a record's offset is below `base_boundary`, its bytes are immutable forever (an
-// in-place update targeting the base region is redirected out-of-place instead), so a reader
-// doesn't need the seqlock protecting the mutable tail and can read straight out of a
+// Once a record's offset is below `read_only_offset`, its bytes are immutable forever (an
+// in-place update targeting the immutable region redirects out-of-place instead), so a reader
+// doesn't need the seqlock protecting the mutable region and can read straight out of a
 // mapping. Get and Scan want *different* readahead policies for that read though (madvise
 // is a property of the whole mapping, not of one read), so four handles over the identical
 // bytes exist (`reads.random_mmap`, `reads.sequential_mmap`, `reads.normal_mmap`, plus
@@ -13,7 +13,6 @@
 // T2FlatFile::at().
 #pragma once
 
-#include <sys/mman.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -27,7 +26,6 @@
 #include <cstring>
 #include <optional>
 #include <span>
-#include <thread>
 #include <vector>
 #include <vmemkv/core/bytes.hpp>
 #include <vmemkv/core/spin_backoff.hpp>
@@ -70,14 +68,13 @@ inline auto read_t2_record_seqlock(AtFunc &&at_func, CopyFunc &&copy_func) {
   }
 }
 
-// Which caller is asking try_read_base_record() below for a base-region record. The only
-// thing that determines the mapping/strategy choice in that function's switch.
-enum class BaseReader : uint8_t {
+// Which caller is asking try_read_immutable_record() below for an immutable-region record.
+enum class ImmutableReader : uint8_t {
   kGet,   // One record per call, effectively random access -- never wants readahead.
   kScan,  // A contiguous key range per call -- benefits from readahead.
 };
 
-// Single table for every base-region mapping choice. Picking the "wrong" mapping for a
+// Single table for every immutable-region mapping choice. Picking the "wrong" mapping for a
 // record's size is only ever a readahead-policy mismatch, never incorrect data: every
 // mapping here covers the identical underlying bytes.
 //
@@ -85,7 +82,7 @@ enum class BaseReader : uint8_t {
 // record; null means "no direct mapping: take the residency-check path instead"
 // (large, non-resident get only).
 template <typename ConfigT>
-inline auto mapping_for(const T2Memory *mem, BaseReader reader, bool is_small) noexcept -> std::byte * {
+inline auto mapping_for(const T2Memory *mem, ImmutableReader reader, bool is_small) noexcept -> std::byte * {
   if constexpr (ConfigT::UseReadPolicyRandomOnly) {
     return mem->reads.random_mmap;
   }
@@ -96,10 +93,10 @@ inline auto mapping_for(const T2Memory *mem, BaseReader reader, bool is_small) n
     return mem->reads.normal_mmap != nullptr ? mem->reads.normal_mmap : mem->reads.random_mmap;
   }
   if constexpr (ConfigT::UseReadPolicyPreadOnly) {
-    // Handled by try_read_base_record()'s pread branch below, never by mapping selection.
+    // Handled by try_read_immutable_record()'s pread branch below, never by mapping selection.
     return nullptr;
   }
-  if (reader == BaseReader::kScan) {
+  if (reader == ImmutableReader::kScan) {
     return is_small ? mem->reads.sequential_mmap : mem->reads.normal_mmap;
   }
   if (is_small) {
@@ -110,173 +107,98 @@ inline auto mapping_for(const T2Memory *mem, BaseReader reader, bool is_small) n
 
 // Defense-in-depth backstop, not a routine path: the record must end within the immutable
 // prefix. False falls through to the always-correct mmap+seqlock path.
-inline auto base_bounds_ok(uint64_t offset, uint64_t needed, uint64_t base_boundary) noexcept -> bool {
-  return offset + needed <= base_boundary;
+inline auto immutable_bounds_ok(uint64_t offset, uint64_t needed, uint64_t read_only_offset) noexcept -> bool {
+  return offset + needed <= read_only_offset;
 }
 
-// Bounds-checked view of the base-region record at `mapping + offset`: the record's bytes
+// Bounds-checked view of the immutable-region record at `mapping + offset`: the record's bytes
 // must end within the immutable prefix, otherwise std::nullopt.
-inline auto view_base_record_if_in_bounds(const std::byte *mapping,
-                                          uint64_t offset,
-                                          uint64_t base_boundary) -> std::optional<T2RecordView> {
+inline auto view_immutable_record_if_in_bounds(const std::byte *mapping,
+                                               uint64_t offset,
+                                               uint64_t read_only_offset) -> std::optional<T2RecordView> {
   const auto *header = reinterpret_cast<const ValueRecordHeader *>(mapping + offset);
   const uint64_t needed = sizeof(ValueRecordHeader) + header->key_len + header->value_len;
-  if (!base_bounds_ok(offset, needed, base_boundary)) {
+  if (!immutable_bounds_ok(offset, needed, read_only_offset)) {
     return std::nullopt;
   }
   return make_record_view(header);
 }
 
-// Blind (no mincore, no fallback) direct read through a given base-region mapping -- the
-// common tail end of every path in try_read_base_record() below.
-inline auto read_base_record_via(std::byte *mapping,
-                                 uint64_t offset,
-                                 uint64_t base_boundary) -> std::optional<T2RecordView> {
+// Blind direct read through a given immutable-region mapping -- the common tail end of mmap
+// branches in try_read_immutable_record() below.
+inline auto read_immutable_record_via(std::byte *mapping,
+                                      uint64_t offset,
+                                      uint64_t read_only_offset) -> std::optional<T2RecordView> {
   if (mapping == nullptr) {
     return std::nullopt;
   }
-  return view_base_record_if_in_bounds(mapping, offset, base_boundary);
+  return view_immutable_record_if_in_bounds(mapping, offset, read_only_offset);
 }
 
-// Warm-path half of BaseReader::kGet's large-record case: if `[offset, offset+read_len)`
-// is entirely page-cache resident (checked via mincore(), which -- unlike an actual read --
-// never blocks on a fault itself), reads a live span straight out of the mmap for free (no
-// syscall, no copy). Returns std::nullopt on any doubt (mincore() unavailable/failed, or any
-// page not resident) -- caller falls back to a bounded pread() instead of risking a
-// page-fault-driven block here. A page could in theory be evicted between this check and the
-// caller reading through the returned span, but base-region bytes are immutable, so that only
-// costs an ordinary page fault on the read -- never wrong data.
-inline auto try_read_resident_base_record(std::byte *mapping,
-                                          uint64_t offset,  // NOLINT(bugprone-easily-swappable-parameters)
-                                          uint64_t read_len,
-                                          uint64_t base_boundary) -> std::optional<T2RecordView> {
-  const auto page_size = static_cast<uintptr_t>(t2_detail::os_page_size());
-  const uintptr_t page_mask = page_size - 1;
-  std::byte *const record_base = mapping + offset;
-  const auto start = reinterpret_cast<uintptr_t>(record_base);
-  const auto aligned_start = start & ~page_mask;
-  const auto aligned_len = ((start + read_len + page_mask) & ~page_mask) - aligned_start;
+// Embedded block-count size hint for a T1 payload, plus margin covering 8-byte alignment.
+inline auto immutable_size_hint(uint64_t payload_bits) noexcept -> uint64_t {
+  return t2_detail::payload_hint_bytes(payload_bits, t2_detail::kImmutableSizeHintMargin);
+}
 
-  thread_local static std::vector<unsigned char> tl_mincore_vec;
-  tl_mincore_vec.resize(aligned_len / page_size);
-  // NOLINTNEXTLINE(performance-no-int-to-ptr)
-  if (::mincore(reinterpret_cast<void *>(aligned_start), aligned_len, tl_mincore_vec.data()) != 0) {
+// Bounded pread() + header-bounds verification into `buf`, shared by ReadPolicyPreadOnly and
+// large Gets. Short reads/errors return std::nullopt (caller falls back to seqlock).
+inline auto read_immutable_via_pread(const T2Memory *mem,
+                                     uint64_t offset,
+                                     uint64_t read_only_offset,
+                                     uint64_t size_hint,
+                                     std::vector<std::byte> *buf) -> std::optional<T2RecordView> {
+  if (mem->reads.pread_fd < 0 || buf == nullptr) {
     return std::nullopt;
   }
-  for (unsigned char page_status : tl_mincore_vec) {
-    if ((page_status & 1) == 0) {
-      return std::nullopt;  // Not resident -- let the caller's pread() fetch it instead.
-    }
-  }
-
-  return view_base_record_if_in_bounds(mapping, offset, base_boundary);
-}
-
-// Embedded block-count size hint for a T1 payload, plus margin. The hint is 16-byte-granular
-// while records are only 8-byte aligned, so it can undershoot the true aligned length by up
-// to 8 bytes; hint + margin covers every record this store can produce, whether resident
-// (mmap path) or not (pread path).
-inline auto base_size_hint(uint64_t payload_bits) noexcept -> uint64_t {
-  return t2_detail::payload_hint_bytes(payload_bits, t2_detail::kBaseSizeHintMargin);
-}
-
-// Large-record Get under the default quadfecta: check residency first (mincore(), which never
-// blocks on a fault itself) before committing to a read -- if resident, normal_mmap gives
-// a free mmap read costing nothing beyond what a plain mmap-based Get would have paid
-// anyway; if not, one bounded pread() beats the N separate page faults an mmap read of a
-// multi-page cold record would trigger.
-inline auto read_large_get_cold(const T2Memory *mem,
-                                uint64_t offset,
-                                uint64_t base_boundary,
-                                uint64_t size_hint,
-                                std::vector<std::byte> *cold_buf) -> std::optional<T2RecordView> {
-  const uint64_t read_len = std::min(size_hint, base_boundary - offset);
-  if (mem->reads.normal_mmap != nullptr) {
-    if (auto resident = try_read_resident_base_record(mem->reads.normal_mmap, offset, read_len, base_boundary);
-        resident.has_value()) {
-      return resident;
-    }
-  }
-  if (mem->reads.pread_fd < 0 || cold_buf == nullptr) {
-    return std::nullopt;
-  }
-  cold_buf->resize(read_len);
-  const ssize_t bytes_read = ::pread(mem->reads.pread_fd, cold_buf->data(), read_len, static_cast<off_t>(offset));
+  const uint64_t read_len = std::min(size_hint, read_only_offset - offset);
+  buf->resize(read_len);
+  const ssize_t bytes_read = ::pread(mem->reads.pread_fd, buf->data(), read_len, static_cast<off_t>(offset));
   if (bytes_read < static_cast<ssize_t>(sizeof(ValueRecordHeader))) {
-    return std::nullopt;  // Short read or error -- fall back to the always-correct seqlock path.
+    return std::nullopt;
   }
-  const auto *header = reinterpret_cast<const ValueRecordHeader *>(cold_buf->data());
+  const auto *header = reinterpret_cast<const ValueRecordHeader *>(buf->data());
   const uint64_t needed = sizeof(ValueRecordHeader) + header->key_len + header->value_len;
-  // Defense-in-depth, same role as read_base_record_via()'s identical check.
   if (needed > static_cast<uint64_t>(bytes_read)) {
     return std::nullopt;
   }
   return make_record_view(header);
 }
 
-// Pread-pinned base-region read (ReadPolicyPreadOnly): every record, however small or
-// resident, is fetched with one bounded pread() into a thread-local scratch buffer instead
-// of any mmap mapping. The returned spans live only inside the caller's callback, same
-// contract as the seqlock path's thread-local buffers. Short reads and errors return
-// std::nullopt so callers fall back to the always-correct seqlock path.
+// Pread-pinned immutable-region read (ReadPolicyPreadOnly) using thread-local scratch.
 inline auto read_pread_pinned(const T2Memory *mem,
                               uint64_t offset,
-                              uint64_t base_boundary,
+                              uint64_t read_only_offset,
                               uint64_t size_hint) -> std::optional<T2RecordView> {
-  if (mem->reads.pread_fd < 0) {
-    return std::nullopt;
-  }
-  const uint64_t read_len = std::min(size_hint, base_boundary - offset);
   thread_local static std::vector<std::byte> tl_pread_scratch;
-  tl_pread_scratch.resize(read_len);
-  const ssize_t bytes_read =
-      ::pread(mem->reads.pread_fd, tl_pread_scratch.data(), read_len, static_cast<off_t>(offset));
-  if (bytes_read < static_cast<ssize_t>(sizeof(ValueRecordHeader))) {
-    return std::nullopt;
-  }
-  const auto *header = reinterpret_cast<const ValueRecordHeader *>(tl_pread_scratch.data());
-  const uint64_t needed = sizeof(ValueRecordHeader) + header->key_len + header->value_len;
-  if (needed > static_cast<uint64_t>(bytes_read)) {
-    return std::nullopt;
-  }
-  return make_record_view(header);
+  return read_immutable_via_pread(mem, offset, read_only_offset, size_hint, &tl_pread_scratch);
 }
 
-// Single entry point for every T2 base-region read. Computes the shared preamble (offset,
-// base_boundary check, embedded size hint) once, then reads through mapping_for()'s choice --
-// see that function for why each reader picks the mapping it does.
-//
-// `payload_bits` (not pre-masked to an offset) is required so the T1 index's embedded
-// block-count size hint can size the read. `cold_buf`: only used by BaseReader::kGet's large,
-// non-resident case (a bounded pread() destination, resized as needed; caller must keep it
-// alive as long as the returned view is used) -- pass nullptr for BaseReader::kScan, which
-// never needs it. Returns std::nullopt whenever this fast path isn't available (offset still
-// in the mutable tail, a mapping/fd wasn't created, mincore()/pread() failed, or a
-// defense-in-depth bounds check fails) -- callers fall back to t2_.at() +
-// read_t2_record_seqlock() in that case.
+// Single entry point for every T2 immutable-region read. Returns std::nullopt when this fast
+// path isn't available (offset still in the mutable region, mapping/fd missing, pread failed,
+// or bounds check failed) -- callers fall back to T2FlatFile::at() + seqlock.
 template <typename ConfigT>
-inline auto try_read_base_record(const T2Memory *mem,
-                                 uint64_t payload_bits,
-                                 BaseReader reader,
-                                 std::vector<std::byte> *cold_buf) -> std::optional<T2RecordView> {
-  const uint64_t offset = payload_bits & t2_detail::kPayloadOffsetMask;
-  const uint64_t base_boundary = mem->base_boundary.load(std::memory_order_acquire);
-  if (offset >= base_boundary) {
+inline auto try_read_immutable_record(const T2Memory *mem,
+                                      uint64_t payload_bits,
+                                      ImmutableReader reader,
+                                      std::vector<std::byte> *cold_buf) -> std::optional<T2RecordView> {
+  const uint64_t offset = t2_detail::decode_offset(payload_bits);
+  const uint64_t read_only_offset = mem->read_only_offset.load(std::memory_order_acquire);
+  if (offset >= read_only_offset) {
     return std::nullopt;
   }
 
-  const uint64_t size_hint = base_size_hint(payload_bits);
+  const uint64_t size_hint = immutable_size_hint(payload_bits);
   const bool is_small = size_hint <= t2_detail::os_page_size();
 
   if constexpr (ConfigT::UseReadPolicyPreadOnly) {
-    return read_pread_pinned(mem, offset, base_boundary, size_hint);
+    return read_pread_pinned(mem, offset, read_only_offset, size_hint);
   }
 
   if (std::byte *mapping = mapping_for<ConfigT>(mem, reader, is_small); mapping != nullptr) {
-    return read_base_record_via(mapping, offset, base_boundary);
+    return read_immutable_record_via(mapping, offset, read_only_offset);
   }
-  if (reader == BaseReader::kGet) {
-    return read_large_get_cold(mem, offset, base_boundary, size_hint, cold_buf);
+  if (reader == ImmutableReader::kGet) {
+    return read_immutable_via_pread(mem, offset, read_only_offset, size_hint, cold_buf);
   }
   return std::nullopt;
 }

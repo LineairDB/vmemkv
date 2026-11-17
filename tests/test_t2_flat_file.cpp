@@ -87,7 +87,7 @@ TEST_CASE("T2FlatFile: append_default over capacity throws without consuming byt
   auto mem = t2.file.get_memory();
   const std::string huge_value(5 * 1024 * 1024, 'q');
   CHECK_THROWS(t2.file.append_default(mem, as_span(bytes_of("huge")), as_span(bytes_of(huge_value))));
-  CHECK(t2.file.bytes_used() == 0);
+  CHECK(t2.file.tail_offset() == 0);
 }
 
 // scan_bounds_clean(): clean bounds (no 0x00 in the first 16 bytes, length at most 16) trust

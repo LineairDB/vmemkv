@@ -79,3 +79,26 @@ inline auto range_disjoint(const StoreKey &region_min,
 }
 
 }  // namespace t1_detail
+
+namespace vmemkv::t2_detail {
+
+// T1 payload codec shared across T1 sharding, T2 ownership, compaction, and read paths:
+// `offset | (block_count << kPayloadSizeShift)`, 16-byte-granular size hint.
+inline constexpr uint64_t kPayloadSizeShift = 48;
+inline constexpr uint64_t kPayloadOffsetMask = (1ULL << kPayloadSizeShift) - 1;
+inline constexpr uint64_t kRecordBlockAlignment = 16;
+inline constexpr uint64_t kMaxBlockCount = 1ULL << 16;
+// Margin making the 16-byte-granular block hint cover the true 8-byte-aligned record length.
+inline constexpr uint64_t kImmutableSizeHintMargin = 16;
+
+inline auto decode_offset(uint64_t payload_bits) noexcept -> uint64_t { return payload_bits & kPayloadOffsetMask; }
+
+inline auto payload_hint_bytes(uint64_t payload_bits, uint64_t margin = 0) noexcept -> uint64_t {
+  return ((payload_bits >> kPayloadSizeShift) * kRecordBlockAlignment) + margin;
+}
+
+inline auto encode_offset_payload(uint64_t offset, uint64_t block_count) noexcept -> uint64_t {
+  return offset | (block_count << kPayloadSizeShift);
+}
+
+}  // namespace vmemkv::t2_detail

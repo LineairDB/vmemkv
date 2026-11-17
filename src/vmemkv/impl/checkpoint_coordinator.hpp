@@ -34,12 +34,12 @@
 
 namespace vmemkv {
 
-// T1Only: in-memory merge, zero I/O. Checkpoint: durabilizes T2's tail in place and commits
-// a manifest (docs/specification/low_level_design.md 5.2, 5.5). Re-exported as VMemKVImpl's nested ReorgMode.
-enum class ReorgMode : std::uint8_t { T1Only, Checkpoint };
+// T1Only: in-memory MemTable compaction, zero I/O. Checkpoint: durabilizes T2's mutable region
+// in place and commits a manifest (docs/specification/low_level_design.md 5.2, 5.5).
+enum class MaintenanceMode : std::uint8_t { T1Only, Checkpoint };
 
-// Cycle accounting and single-flight state for reorganize/checkpoint cycles.
-struct ReorgStats {
+// Cycle accounting and single-flight state for checkpoint/maintenance cycles.
+struct CheckpointStats {
   mutable std::atomic<uint64_t> checkpoint_count{0};
   mutable std::atomic<uint64_t> total_wait_us{0};
 #define VMEMKV_DECLARE_STAT_ATOMIC(name) mutable std::atomic<uint64_t> name##_{0};
@@ -47,12 +47,12 @@ struct ReorgStats {
 #undef VMEMKV_DECLARE_STAT_ATOMIC
 };
 
-struct ReorgState {
+struct CheckpointState {
   std::atomic<bool> running{false};
   std::vector<T1ChunkMeta> t1_chunks;
   uint64_t next_t1_chunk_id{1};
   uint64_t t1_chunk_split_bytes{0};
-  ReorgStats stats;
+  CheckpointStats stats;
 };
 
 // Phase timings for one cycle. Field names match VMEMKV_CHECKPOINT_STATS_FIELDS so
@@ -61,13 +61,13 @@ struct CheckpointTimings {
   VMEMKV_CHECKPOINT_STATS_FIELDS(VMEMKV_DECLARE_STAT_FIELD)
 };
 
-inline void publish_checkpoint_stats(ReorgStats &stats, const CheckpointTimings &timings) {
+inline void publish_checkpoint_stats(CheckpointStats &stats, const CheckpointTimings &timings) {
 #define VMEMKV_PUBLISH_ONE(name) stats.name##_.store(timings.name, std::memory_order_relaxed);
   VMEMKV_CHECKPOINT_STATS_FIELDS(VMEMKV_PUBLISH_ONE)
 #undef VMEMKV_PUBLISH_ONE
 }
 
-inline void snapshot_checkpoint_stats(const ReorgStats &stats, VMemKVStatistics &out) {
+inline void snapshot_checkpoint_stats(const CheckpointStats &stats, VMemKVStatistics &out) {
 #define VMEMKV_SNAPSHOT_ONE(name) out.name = stats.name##_.load(std::memory_order_relaxed);
   VMEMKV_CHECKPOINT_STATS_FIELDS(VMEMKV_SNAPSHOT_ONE)
 #undef VMEMKV_SNAPSHOT_ONE
@@ -97,9 +97,9 @@ inline auto checkpoint_due(const Wal &wal, const T2Ownership<ConfigT> &own) -> b
 }
 
 // Bounded poll, not atomic::wait(): no timed overload to bound a missed wakeup. Callers only
-// arrive with a cycle already in flight, so the wait is already bounded by a reorganize's own
+// arrive with a cycle already in flight, so the wait is already bounded by a cycle's own
 // duration. Serializes explicit reorganize()/checkpoint() callers only; writes never call this.
-inline void wait_until_reorg_not_running(const ReorgState &state) {
+inline void wait_until_checkpoint_not_running(const CheckpointState &state) {
   constexpr auto kIdlePollInterval = kDefaultPoll10ms;
   const auto wait_start = std::chrono::steady_clock::now();
   while (state.running.load(std::memory_order_acquire)) {
@@ -112,7 +112,7 @@ inline void wait_until_reorg_not_running(const ReorgState &state) {
 }
 
 struct CheckpointTarget {
-  uint64_t old_base_boundary = 0;
+  uint64_t old_read_only_offset = 0;
   uint64_t target = 0;
 };
 
@@ -125,7 +125,7 @@ auto capture_checkpoint_target(T2FlatFile &tier2,
                                PreStopHook pre_stop_hook,
                                std::chrono::nanoseconds &stop_phase) -> CheckpointTarget {
   CheckpointTarget out;
-  out.old_base_boundary = tier2.get_memory()->base_boundary.load(std::memory_order_acquire);
+  out.old_read_only_offset = tier2.get_memory()->read_only_offset.load(std::memory_order_acquire);
   const vmemkv::T2Memory *mem_to_drain = tier2.get_memory();
   pre_stop_hook();
   const auto stop_start = std::chrono::steady_clock::now();
@@ -133,22 +133,22 @@ auto capture_checkpoint_target(T2FlatFile &tier2,
   stop_phase = std::chrono::steady_clock::now() - stop_start;
   {
     WriterResumeGuard resume_guard{&tier2};
-    out.target = tier2.get_memory()->bytes_used.load(std::memory_order_acquire);
+    out.target = tier2.get_memory()->tail_offset.load(std::memory_order_acquire);
   }
   return out;
 }
 
-// msync()'s addr must be page-aligned; old_base_boundary is only block-aligned. Rounding
+// msync()'s addr must be page-aligned; old_read_only_offset is only block-aligned. Rounding
 // down re-syncs a small already-durable overlap -- harmless, msync() is idempotent.
 // Synchronizes in chunks (ConfigT::kMsyncChunkBytes) and yields between chunks to avoid
 // monopolizing kernel writeback and stalling concurrent foreground operations.
 template <typename ConfigT = Config<>>
-inline void msync_target_range(const T2Memory *mem, uint64_t old_base_boundary, uint64_t target) {
-  if (target <= old_base_boundary) {
+inline void msync_target_range(const T2Memory *mem, uint64_t old_read_only_offset, uint64_t target) {
+  if (target <= old_read_only_offset) {
     return;
   }
   const uint64_t page_size = t2_detail::os_page_size();
-  const uint64_t aligned_start = old_base_boundary - (old_base_boundary % page_size);
+  const uint64_t aligned_start = old_read_only_offset - (old_read_only_offset % page_size);
   const uint64_t chunk_bytes = ConfigT::kMsyncChunkBytes;
   for (uint64_t cur = aligned_start; cur < target;) {
     const uint64_t cur_len = std::min(chunk_bytes, target - cur);
@@ -329,7 +329,7 @@ void emit_shard_group(const ShardChunkGroup &group,
 // Publishes only dirty/coalesced T1 chunks to `<t2_path>.t1chk/` and commits the atomic
 // manifest; rolls back newly written chunk files on error without mutating committed state.
 template <typename ConfigT>
-auto publish_t1_checkpoint_and_manifest(ReorgState &state,
+auto publish_t1_checkpoint_and_manifest(CheckpointState &state,
                                         ShardedT1Index<ConfigT> &tier1,
                                         const std::filesystem::path &t2_path,
                                         uint64_t checkpoint_lsn,
@@ -406,13 +406,15 @@ struct CheckpointPhases {
   std::chrono::nanoseconds t1_write{};
   std::chrono::nanoseconds rotate{};
   std::chrono::nanoseconds total{};
-  uint64_t old_base_boundary = 0;
+  uint64_t old_read_only_offset = 0;
   uint64_t target = 0;
 };
 
 // Published after checkpoint_count, so a poller waking on it always sees this cycle's own
 // numbers, never a torn mix with the next cycle's.
-inline void publish_cycle_stats(ReorgStats &stats, uint64_t rotate_leader_wait_us, const CheckpointPhases &phases) {
+inline void publish_cycle_stats(CheckpointStats &stats,
+                                uint64_t rotate_leader_wait_us,
+                                const CheckpointPhases &phases) {
   stats.checkpoint_count.fetch_add(1, std::memory_order_relaxed);
   CheckpointTimings timings;
   timings.last_checkpoint_duration_us = to_us(phases.total);
@@ -425,14 +427,14 @@ inline void publish_cycle_stats(ReorgStats &stats, uint64_t rotate_leader_wait_u
   timings.last_checkpoint_barrier_drain_duration_us = to_us(phases.barrier);
   timings.last_checkpoint_wal_rotate_duration_us = to_us(phases.rotate);
   timings.last_checkpoint_wal_rotate_leader_wait_us = rotate_leader_wait_us;
-  timings.last_checkpoint_bytes_synced = phases.target - phases.old_base_boundary;
+  timings.last_checkpoint_bytes_synced = phases.target - phases.old_read_only_offset;
   timings.last_checkpoint_corpus_bytes = phases.target;
   publish_checkpoint_stats(stats, timings);
 }
 
 // Claims the target range before msync() reads it, then drains in-flight in-place writes
-// against the old watermark. Without the claim, a racing update could be msync()'d mid-write
-// (torn on disk) or land after base_boundary publishes past it.
+// against the old fuzzy watermark. Without the claim, a racing update could be msync()'d mid-write
+// (torn on disk) or land after read_only_offset publishes past it.
 template <typename ConfigT>
 auto claim_and_drain_watermark(T2Ownership<ConfigT> &own, uint64_t target) -> std::chrono::nanoseconds {
   own.claim_watermark(target);
@@ -441,25 +443,21 @@ auto claim_and_drain_watermark(T2Ownership<ConfigT> &own, uint64_t target) -> st
   return std::chrono::steady_clock::now() - barrier_start;
 }
 
-// Publishes base_boundary, then rotates the WAL. No checkpoint_lsn needed (docs/specification/low_level_design.md
+// Publishes read_only_offset, then rotates the WAL. No checkpoint_lsn needed (docs/specification/low_level_design.md
 // 5.5): rotation only retires the previous cycle's generation, already covered by this cycle's
 // manifest by construction.
 inline auto publish_boundary_and_rotate(T2FlatFile &tier2, Wal &wal, uint64_t target) -> std::chrono::nanoseconds {
-  tier2.get_memory()->base_boundary.store(target, std::memory_order_release);
+  tier2.get_memory()->read_only_offset.store(target, std::memory_order_release);
   const auto rotate_start = std::chrono::steady_clock::now();
   wal.rotate_segment();
   return std::chrono::steady_clock::now() - rotate_start;
 }
 
-// Durabilizes T2's live tail grown since the last cycle, advances base_boundary in place, and
-// persists a manifest-committed checkpoint. Correctness argument:
-// docs/specification/why_vmemkv_does_not_need_undo_log.md; contract: docs/specification/low_level_design.md
-// 4.3/5.3.
-//
-// Capture -> claim/drain -> msync -> T1 publish -> boundary publish/rotate -> stats.
+// Durabilizes T2's live mutable region grown since the last cycle, advances read_only_offset in
+// place, and persists a manifest-committed checkpoint.
 template <typename ConfigT, typename PreStopHook, typename PreFinishHook>
   requires CheckpointHook<PreStopHook> && CheckpointHook<PreFinishHook>
-void checkpoint_internal(ReorgState &state,
+void checkpoint_internal(CheckpointState &state,
                          ShardedT1Index<ConfigT> &tier1,
                          T2FlatFile &tier2,
                          Wal &wal,
@@ -484,24 +482,18 @@ void checkpoint_internal(ReorgState &state,
     const vmemkv::T2Memory *mem = tier2.get_memory();
     const auto msync_start = std::chrono::steady_clock::now();
     g_checkpoint_debug_phase.store("checkpoint: msync_target_range", std::memory_order_release);
-    msync_target_range<ConfigT>(mem, checkpoint_target.old_base_boundary, checkpoint_target.target);
+    msync_target_range<ConfigT>(mem, checkpoint_target.old_read_only_offset, checkpoint_target.target);
     msync_phase = std::chrono::steady_clock::now() - msync_start;
 
     pre_finish_hook();
 
-    // The manifest frontier is read after the T1 merge snapshot above, so every offset the
-    // snapshot names precedes it; the sparse clone copy bounded by it never truncates
-    // file-referenced bytes.
-    // The manifest frontier is the capture target, not the post-snapshot size:
-    // post-target appends are WAL-covered only and must not be adopted as
-    // durable on restart (see publish_t1_checkpoint's filter).
     g_checkpoint_debug_phase.store("checkpoint: publish_t1_checkpoint", std::memory_order_release);
     t1_phase = publish_t1_checkpoint_and_manifest(
         state, tier1, t2_path, checkpoint_lsn, checkpoint_target.target, t1_write_phase);
   } catch (...) {
-    // Nothing durable happened yet (base_boundary hasn't advanced) -- un-claim so in-place
+    // Nothing durable happened yet (read_only_offset hasn't advanced) -- un-claim so in-place
     // updates aren't blocked forever for an unpublished cycle.
-    own.revert_watermark(checkpoint_target.old_base_boundary);
+    own.revert_watermark(checkpoint_target.old_read_only_offset);
     g_checkpoint_debug_phase.store("checkpoint: aborted", std::memory_order_release);
     throw;
   }
@@ -518,7 +510,7 @@ void checkpoint_internal(ReorgState &state,
   phases.t1_write = t1_write_phase;
   phases.rotate = rotate_phase;
   phases.total = std::chrono::steady_clock::now() - fn_start;
-  phases.old_base_boundary = checkpoint_target.old_base_boundary;
+  phases.old_read_only_offset = checkpoint_target.old_read_only_offset;
   phases.target = checkpoint_target.target;
   publish_cycle_stats(state.stats, wal.last_rotate_leader_wait_us(), phases);
 }
@@ -527,25 +519,25 @@ void checkpoint_internal(ReorgState &state,
 // CAS guard.
 template <typename ConfigT, typename PreStopHook, typename PreFinishHook>
   requires CheckpointHook<PreStopHook> && CheckpointHook<PreFinishHook>
-void reorganize_internal(ReorgState &state,
+void reorganize_internal(CheckpointState &state,
                          ShardedT1Index<ConfigT> &tier1,
                          T2FlatFile &tier2,
                          Wal &wal,
                          T2Ownership<ConfigT> &own,
                          const std::filesystem::path &t2_path,
                          [[maybe_unused]] bool recovering,
-                         ReorgMode mode,
+                         MaintenanceMode mode,
                          PreStopHook pre_stop_hook,
                          PreFinishHook pre_finish_hook) {
   // Checkpointing during WAL replay is unsafe (recovery is inside replay()'s callback, and a
   // cycle expects sole writer status). Recovery only passes T1Only -- throw, don't silently
   // override, so a future caller bug surfaces.
-  if (recovering && mode != ReorgMode::T1Only) {
+  if (recovering && mode != MaintenanceMode::T1Only) {
     throw std::logic_error("checkpoint during recovery");
   }
 
   switch (mode) {
-    case ReorgMode::Checkpoint:
+    case MaintenanceMode::Checkpoint:
       checkpoint_internal(state, tier1, tier2, wal, own, t2_path, pre_stop_hook, pre_finish_hook);
       // Punch eligibility trails checkpoint coverage: a segment evacuated at count
       // N is punchable only after a checkpoint completing past N. Recorded here,
@@ -553,7 +545,7 @@ void reorganize_internal(ReorgState &state,
       // background worker, and tests), so the ownership gate cannot miss one.
       own.note_checkpoint_completed(state.stats.checkpoint_count.load(std::memory_order_relaxed));
       break;
-    case ReorgMode::T1Only: {
+    case MaintenanceMode::T1Only: {
       // Zero-I/O T1 merge with untouched payloads. checkpoint_all_shards() with no-op writers
       // gives the same "every shard merged before return" contract.
       g_checkpoint_debug_phase.store("reorganize: T1Only checkpoint_all_shards", std::memory_order_release);
@@ -567,29 +559,25 @@ void reorganize_internal(ReorgState &state,
 }
 
 // Shared wait/CAS/run/retry loop for reorganize()/checkpoint(). Checkpoint always forces a
-// completed cycle (it needs a durabilized manifest, not just an empty append region); T1Only
+// completed cycle (it needs a durabilized manifest, not just an empty MemTable); T1Only
 // skips on empty.
-//
-// Runs (or waits out) exactly one cycle, then returns -- never re-checks for emptiness after.
-// Under sustained writes the region is never momentarily empty, so re-checking could win the
-// CAS against itself indefinitely and never return.
 template <typename ConfigT, typename PreStopHook, typename PreFinishHook>
   requires CheckpointHook<PreStopHook> && CheckpointHook<PreFinishHook>
-void run_reorganize(ReorgState &state,
+void run_reorganize(CheckpointState &state,
                     ShardedT1Index<ConfigT> &tier1,
                     T2FlatFile &tier2,
                     Wal &wal,
                     T2Ownership<ConfigT> &own,
                     const std::filesystem::path &t2_path,
                     bool recovering,
-                    ReorgMode mode,
+                    MaintenanceMode mode,
                     PreStopHook pre_stop_hook,
                     PreFinishHook pre_finish_hook) {
-  const bool force_run = (mode == ReorgMode::Checkpoint);
+  const bool force_run = (mode == MaintenanceMode::Checkpoint);
   const uint64_t start_chk_count = state.stats.checkpoint_count.load(std::memory_order_acquire);
 
   while (true) {
-    wait_until_reorg_not_running(state);
+    wait_until_checkpoint_not_running(state);
 
     // If another concurrent cycle (e.g. background worker) completed a checkpoint
     // while we waited, our durability guarantee is satisfied: avoid back-to-back duplicate cycles.
@@ -597,7 +585,7 @@ void run_reorganize(ReorgState &state,
       return;
     }
 
-    if (!force_run && tier1.append_size() == 0) {
+    if (!force_run && tier1.memtable_size() == 0) {
       return;
     }
 

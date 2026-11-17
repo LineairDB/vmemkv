@@ -180,30 +180,30 @@ auto try_in_place_update(T1 &tier1,
 
   const T2Memory *mem = tier2.get_memory();
   const uint64_t offset = res.payload_bits & t2_detail::kPayloadOffsetMask;
-  const uint64_t base_boundary = mem->base_boundary.load(std::memory_order_acquire);
+  const uint64_t read_only_offset = mem->read_only_offset.load(std::memory_order_acquire);
 
-  // Fast-path immutable base region:
-  // Base-region records cannot be mutated in place and must redirect to out-of-place append.
+  // Fast-path immutable region (FASTER ReadOnlyOffset invariant):
+  // Immutable-region records cannot be mutated in place and redirect to copy-on-write append.
   // Because T1 only stores a 16-byte prefix plus a 60-bit hash, we must verify that the full key
   // actually matches before allowing the out-of-place update. A hash collision on a nonexistent
   // key must abort (return false), never insert a new record or overwrite T1.
-  // Base records are immutable, so try_read_base_record() verifies the key seqlock-free.
-  if (offset < base_boundary) {
+  // Immutable records skip the seqlock via try_read_immutable_record().
+  if (offset < read_only_offset) {
     if (full_key.size() <= t1_detail::kPrefixBytes) {
       return {InPlaceOutcome::FellThrough};
     }
-    thread_local static std::vector<std::byte> tl_base_buf;
-    if (const auto base_record =
-            vmemkv::try_read_base_record<ConfigT>(mem, res.payload_bits, BaseReader::kGet, &tl_base_buf);
-        base_record.has_value()) {
-      if (!vmemkv::bytes_equal(base_record->key, full_key)) {
+    thread_local static std::vector<std::byte> tl_imm_buf;
+    if (const auto imm_record =
+            vmemkv::try_read_immutable_record<ConfigT>(mem, res.payload_bits, ImmutableReader::kGet, &tl_imm_buf);
+        imm_record.has_value()) {
+      if (!vmemkv::bytes_equal(imm_record->key, full_key)) {
         return {InPlaceOutcome::Aborted};
       }
       return {InPlaceOutcome::FellThrough};
     }
   }
 
-  // Mutable tail record (or base record whose direct read fell back to the tail path):
+  // Mutable-region record (or immutable record whose direct read fell back to the seqlock path):
   // Read key/alloc_len fresh under the seqlock: an unprotected t2_.at() isn't safe here.
   bool key_matches = false;
   uint32_t alloc_len = 0;
@@ -218,8 +218,8 @@ auto try_in_place_update(T1 &tier1,
     return {InPlaceOutcome::Aborted};
   }
 
-  // If claimed by an in-flight checkpoint or in the base region, redirect out-of-place.
-  if (offset < base_boundary || offset < own.load_watermark()) {
+  // If claimed by an in-flight checkpoint fuzzy watermark or in the immutable region, COW append.
+  if (offset < read_only_offset || offset < own.load_watermark()) {
     return {InPlaceOutcome::FellThrough};
   }
   if (value.size() > alloc_len) {

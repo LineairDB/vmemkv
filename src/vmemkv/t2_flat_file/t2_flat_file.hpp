@@ -44,7 +44,7 @@ inline auto make_record_view(const ValueRecordHeader *header) noexcept -> T2Reco
 namespace vmemkv {
 
 // Four handles over the same [0, capacity) bytes; the per-record choice is made by
-// try_read_base_record(). madvise is per mapping, hence one handle per readahead policy.
+// try_read_immutable_record(). madvise is per mapping, hence one handle per readahead policy.
 struct T2ReadHandles {
   // Primary read-write mapping, MADV_RANDOM. All appends/in-place updates land here;
   // small gets read here (1-op-1-record random access never pays for readahead).
@@ -52,11 +52,10 @@ struct T2ReadHandles {
   // Read-only, MADV_SEQUENTIAL. Small scans: the wide window folds many small faults
   // into few major faults.
   std::byte *sequential_mmap = nullptr;
-  // Read-only, kernel default readahead. Large scans, plus large gets whose pages
-  // mincore() found resident.
+  // Read-only, kernel default readahead. Used by large scans (> 1 page).
   std::byte *normal_mmap = nullptr;
-  // dup()'d fd for one bounded pread() of a non-resident large get. -1 when the
-  // best-effort setup failed; readers then fall back to random_mmap + seqlock.
+  // dup()'d fd for bounded pread() of large Gets (> 1 page) or ReadPolicyPreadOnly. -1 when
+  // best-effort setup failed; readers fall back to random_mmap + seqlock.
   int pread_fd = -1;
 };
 
@@ -67,14 +66,14 @@ struct T2Memory {
   T2ReadHandles reads;
   uint64_t capacity = 0;
 
-  // Monotonic append frontier. Mutable: mutated through the const pointer from get_memory().
-  mutable std::atomic<uint64_t> bytes_used{0};
-  // Durable + immutable prefix; reads below it skip the seqlock. Only grows.
-  mutable std::atomic<uint64_t> base_boundary{0};
+  // Monotonic append frontier (FASTER TailOffset). Mutable through const get_memory().
+  mutable std::atomic<uint64_t> tail_offset{0};
+  // Durable + immutable prefix boundary (FASTER ReadOnlyOffset); reads below skip seqlock.
+  mutable std::atomic<uint64_t> read_only_offset{0};
 
   // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-  T2Memory(std::byte *base_ptr, uint64_t capacity_bytes, uint64_t initial_bytes_used) noexcept
-      : capacity(capacity_bytes), bytes_used(initial_bytes_used), base_boundary(initial_bytes_used) {
+  T2Memory(std::byte *base_ptr, uint64_t capacity_bytes, uint64_t initial_tail_offset) noexcept
+      : capacity(capacity_bytes), tail_offset(initial_tail_offset), read_only_offset(initial_tail_offset) {
     reads.random_mmap = base_ptr;
   }
 
@@ -181,7 +180,7 @@ class T2FlatFile {
   enum class PunchOutcome : std::uint8_t { Punched, AlreadyHollow, Failed };
   auto punch_if_occupied(uint64_t offset, uint64_t len) const noexcept -> PunchOutcome;
 
-  auto bytes_used() const noexcept -> uint64_t { return get_memory()->bytes_used.load(std::memory_order_acquire); }
+  auto tail_offset() const noexcept -> uint64_t { return get_memory()->tail_offset.load(std::memory_order_acquire); }
   auto path() const noexcept -> const std::filesystem::path & { return path_; }
 
  private:

@@ -2,7 +2,7 @@
 
 ## 1. Overview
 
-vmemkv is a larger-than-memory KVS that delegates data management to the OS virtual-memory subsystem (`mmap`, `fork`, `mincore`, `madvise`) as much as possible. It consists of the following components.
+vmemkv is a larger-than-memory KVS that delegates data management to the OS virtual-memory subsystem (`mmap`, `madvise`, `msync`) as much as possible. It consists of the following components.
 
 - Tier 1: RAM-resident index layer
 - Tier 2: large-capacity data layer on file-backed mmap
@@ -25,39 +25,39 @@ vmemkv's goal is to leave the buffer pool, page replacement algorithms, complex 
 - Multi-operation transactions
 - Phantom avoidance
 
-## 3. Common Architecture: Reorganizing Two-Region
+## 3. Common Architecture: Dual-Buffer / Reorganizing Two-Region
 
-vmemkv's core concept is the `Reorganizing Two-Region` structure with `sorted_region` and `append_region`, where periodic `reorganize` absorbs `append_region` into `sorted_region`.
+vmemkv's core T1 index structure pairs an **In-Memory Sorted Run** (`sorted_run_`) with an **Active MemTable** (`memtable_active_`), where periodic **In-Memory Compaction** (`reorganize()`) absorbs the MemTable into the single Sorted Run (see [`terminology.md`](terminology.md)).
 
-- `sorted_region`: sorted region. Lookups are O(log N).
-- `append_region`: unsorted region receiving inserts. With a combined hash index, lookups are O(1) expected and writes are O(1).
+- **In-Memory Sorted Run** (`sorted_run`): sorted array. Lookups are O(log N) with Bloom filter miss bypass.
+- **Active MemTable** (`memtable_active`): unsorted write region. With a combined hash index, lookups are O(1) expected and writes are O(1).
 
 Shape language: `[box]` = component/region, `([rounded])` = instruction, `{diamond}` = decision, `[[double box]]` = background job.
 
 ```mermaid
 flowchart TB
-    subgraph R["one shard"]
+    subgraph R["one range shard"]
         direction LR
-        S["sorted region\nO(log N) binary search"]
-        A["append region\nO(1) hash lookup"]
+        S["In-Memory Sorted Run\nO(log N) binary search"]
+        A["Active MemTable\nO(1) hash lookup"]
     end
     G([Get / Scan / Update / Delete]) --> S & A
     I([Insert]) --> A
-    A --> RG[[reorganize:\nmerge + atomic swap]]
+    A --> RG[[In-Memory Compaction\nmerge + atomic swap]]
 ```
 
 The basic behavior of this structure is as follows.
 
-- `insert` adds a new entry to `append_region`
-- reads look at both `sorted_region` and `append_region`
+- `insert` adds a new entry to the shard's `Active MemTable`
+- reads check both `Active MemTable` (plus `Immutable MemTable` during compaction) and `Sorted Run`
 - `update` and `delete` basically update in place once the target entry is found
-- `reorganize` merges `append_region`'s contents into `sorted_region`, dropping old versions and unneeded entries
+- `reorganize` merges `Immutable MemTable` contents into `Sorted Run`, dropping old versions and tombstones
 
-This structure makes the steady-state insert path a simple append, and the update path an in-place update of the existing entry. It is therefore not an immutable design that stacks a new version per update like an LSM-tree.
+This structure makes the steady-state insert path a simple append, and the update path an in-place update of the existing entry. Unlike disk-backed multi-level LSM-trees, each shard keeps only one RAM-resident sorted run rather than stacking multiple disk runs.
 
 ## 4. Two-Tier Architecture
 
-vmemkv consists of a Tier 1 holding a `Reorganizing Two-Region` plus a Tier 2 value store referenced from Tier 1 offsets.
+vmemkv consists of a Tier 1 holding a sharded MemTable/Sorted-Run index plus a Tier 2 value store referenced from Tier 1 offsets.
 
 ### 4.1 Tier 1
 
@@ -66,21 +66,21 @@ Tier 1 is a fixed-size index layer. An `IndexEntry` holds `key prefix + key hash
 Tier 1 specifics:
 
 - fixed-size entries, easy to keep as a dense array
-- `sorted_region` is a key-ordered IndexEntry array, `append_region` an unordered IndexEntry array.
+- `Sorted Run` is a key-ordered IndexEntry array, `Active MemTable` an unordered IndexEntry array.
 
 Additionally, as an opt-in optimization, entries with values of 8 bytes or less support **entry-level adaptive covering**, interpreting the payload as a 64-bit value instead of an `offset`. For such entries `Get()` completes on the Tier 1 hit alone, skipping Tier 2 access. See low_level_design.md 2.1.1.
 
 ### 4.2 Tier 2
 
-Tier 2 is the variable-length value layer. Referenced by `offset` from Tier 1, it holds the actual key/value records.
+Tier 2 is the variable-length value layer aligned with FASTER's `HybridLog` terminology. Referenced by `offset` from Tier 1, it holds the actual key/value records across an **Immutable Region** (`[0, read_only_offset)`) and a **Mutable Region** (`[read_only_offset, tail_offset)`).
 
 Tier 2 specifics:
 
 - handles variable-size records
-- kept as a single byte array on file-backed mmap; `offset` is the byte offset from its start
-- inserts, and updates whose new value doesn't fit the existing record's allocated length, append a new record at the tail and store its offset in Tier 1
-- `update` rewrites the existing record in place when possible, otherwise appends a new record
-- carries larger-than-memory operation and durability
+- kept as a single byte array on file-backed `MAP_SHARED` mmap; `offset` is the byte offset from its start
+- inserts, and updates whose new value doesn't fit `alloc_len` or whose old record lies in the Immutable Region, append a new record at `tail_offset` and store its offset in Tier 1
+- `update` rewrites the existing record in place inside the Mutable Region when possible, otherwise performs copy-on-write append
+- carries larger-than-memory operation and durability via the OS page cache
 
 Tier 1/Tier 2 responsibility split and the `offset`-connected layout:
 
@@ -92,21 +92,21 @@ flowchart TB
     end
     subgraph T1["Tier 1: sharded index (RAM)"]
         direction LR
-        S1[shard 0\nsorted + append] --- S2[shard 1\nsorted + append] --- SD[... K shards]
+        S1[shard 0\nSorted Run + MemTable] --- S2[shard 1\nSorted Run + MemTable] --- SD[... K shards]
     end
     subgraph T2["Tier 2: file-backed mmap (MAP_SHARED)"]
         direction LR
-        BA[base region\nimmutable] --- TA[tail region\nmutable]
+        BA[Immutable Region\n< read_only_offset] --- TA[Mutable Region\n>= read_only_offset]
     end
     subgraph JOBS["background jobs"]
         direction LR
-        RG[[reorganize]] --- CK[[checkpoint\nmsync + manifest]]
+        RG[[T1 In-Memory Compaction]] --- CK[[Checkpoint\nmsync + manifest]]
     end
     WAL[WAL file]
     OPS --> T1
     OPS -.-> T2
     T1 -- offset --> T2
-    T1 -.->|append growth| JOBS
+    T1 -.->|MemTable growth| JOBS
     WAL -.->|WAL bytes| JOBS
     T2 -.->|space overhead| JOBS
 ```
@@ -115,9 +115,9 @@ flowchart TB
 
 ### 5.1 Get
 
-1. Search Tier 1's `sorted_region` / `append_region` for a candidate `IndexEntry`.
+1. Search Tier 1's `Active MemTable` / `Immutable MemTable` / `Sorted Run` for a candidate `IndexEntry`.
 
-- Complexity is O(1) on an `append_region` hit, plus O(log N) on a `sorted_region` hit. A miss costs O(1) + O(log N).
+- Complexity is O(1) on a MemTable hit, plus O(log N) on a Sorted Run hit. A miss costs O(1) + O(1) Bloom check.
 
 2. Verify the hash.
 
@@ -136,16 +136,16 @@ For inlined entries step 3. is unnecessary; the Tier 1 payload is returned direc
 ### 5.2 Insert
 
 1. `Get()` to check whether the entry already exists
-2. Append a value record at Tier 2's tail, obtaining the offset
-3. Add an `IndexEntry` to Tier 1's `append_region`, writing its offset
+2. Append a value record at Tier 2's `tail_offset`, obtaining the offset
+3. Add an `IndexEntry` to Tier 1's `Active MemTable`, writing its offset
 4. WAL append + `fsync`. Success is returned to the caller only after this `fsync` completes.
 
 For inline-eligible entries of 8 bytes or less, step 2. is skipped and the 64-bit value is written directly into the Tier 1 entry's payload.
 
 ### 5.3 Update / Delete / Scan
 
-- Update: locate the entry with `Get()`; rewrite the Tier 2 tail record in place when it fits. When the existing record resides in the immutable base region (`offset < base_boundary`), updates to keys $\le$ 16 bytes immediately redirect to out-of-place append without reading SSD base data (prefix containment guarantees full-key identity). Keys $> 16$ bytes verify the full key against the base record before appending.
-- Delete: locate the entry with `Get()`, tombstone the offset on Tier 1, then write the WAL. Tier 2 is untouched.
+- Update: locate the entry with `Get()`; rewrite the Tier 2 Mutable-Region record in place when it fits. When the existing record resides in the Immutable Region (`offset < read_only_offset`), updates to keys $\le$ 16 bytes immediately redirect to copy-on-write append without reading SSD immutable data (prefix containment guarantees full-key identity). Keys $> 16$ bytes verify the full key via `try_read_immutable_record()` before appending.
+- Delete: locate the entry with `Get()`, write a Tombstone (`STORE_NOT_FOUND`) on Tier 1, then write the WAL. Tier 2 is untouched.
 - Scan: narrow the range on Tier 1 first, then collect value records on Tier 2 in key order. Scan is purely read-only.
 
 For inlined entries, Update / Delete / Scan complete on the Tier 1 payload alone.
@@ -154,11 +154,10 @@ For offset-payload indexes, Update and Delete leave old Tier 2 records unreferen
 
 ## 6. Background Jobs (Reorganize, Checkpoint, Compaction)
 
-vmemkv coordinates three decoupled background maintenance mechanisms to balance foreground latency with memory/disk reclamation:
+vmemkv coordinates two decoupled background maintenance mechanisms along the memory/storage boundary:
 
-- **T1 Shard Reorganize**: Per-shard worker pool merges `append_region` into `sorted_region`, eliminating ordering fragmentation in memory and splitting shards when they reach one T2 segment ($8\,\text{MiB}$) of referenced live bytes or the entry-count threshold.
-- **Checkpoint Coordinator**: Pacing-gated coordinator synchronizes Tier 2's dirty tail to disk via chunked `msync(MS_SYNC)` with cooperative yielding, persists a T1 snapshot, advances `base_boundary`, and rotates the WAL.
-- **T2 Compaction & Unified Shard Repack**: Single-flight background worker repacks dirty T1 shards (and shards overlapping frozen segments below $50\%$ live bytes) contiguously in full-key order to the T2 append frontier, and hole-punches empty $8\,\text{MiB}$ segments after a two-checkpoint epoch gate.
+- **T1 Shard Reorganize (In-Memory Compaction)**: Per-shard worker pool merges `Immutable MemTable` into `Sorted Run`, eliminating ordering fragmentation in memory and splitting shards when they reach one T2 segment ($8\,\text{MiB}$) of referenced live bytes or the entry-count threshold.
+- **T2 Maintenance (Checkpoint & Compaction)**: Single dedicated storage worker synchronizes Tier 2's Mutable Region to disk via chunked `msync(MS_SYNC)` with cooperative yielding, persists T1 checkpoint chunks + `MANIFEST`, advances `read_only_offset`, rotates the WAL, repacks dirty T1 shards (and shards overlapping garbage segments below $50\%$ live bytes) in full-key order to `tail_offset`, and hole-punches empty $8\,\text{MiB}$ segments after a two-checkpoint epoch gate.
 
 See [`background_jobs.md`](background_jobs.md) for the unified design and lifecycle guarantees.
 

@@ -30,7 +30,7 @@ using Store = vmemkv::StoreAdapter<vmemkv::VMemKVImpl<vmemkv::Config<>>>;
 constexpr size_t kTestCapacityBytes = 256ULL * 1024 * 1024;
 
 struct TinyShardConfig : vmemkv::Config<> {
-  static constexpr size_t kAppendCapacityEntries = 128;
+  static constexpr size_t kMemTableCapacityEntries = 128;
   static constexpr size_t kShardTargetSizeEntries = 64;
 };
 using TinyShardStore = vmemkv::StoreAdapter<vmemkv::VMemKVImpl<TinyShardConfig>>;
@@ -204,11 +204,11 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "ordered dirty shard needs no T2 relocatio
   store->impl().t1().drain_maintenance();
   store->checkpoint();
   REQUIRE(store->get_statistics().t2_dirty_shard_count > 0);
-  const uint64_t used_before = store->impl().t2().bytes_used();
+  const uint64_t used_before = store->impl().t2().tail_offset();
   const uint64_t cycles_before = store->get_statistics().compaction_cycle_count;
   enable();
   wait_for_compaction(*store);
-  CHECK(store->impl().t2().bytes_used() == used_before);
+  CHECK(store->impl().t2().tail_offset() == used_before);
   CHECK(store->get_statistics().compaction_cycle_count == cycles_before);
   CHECK(store->get_statistics().t2_dirty_shard_count == 0);
   CHECK(inversion_rate(store) == 0.0);
@@ -346,12 +346,12 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "T2 segment evacuation includes current ve
   const uint64_t updated_offset =
       store->impl().t1().get_with_hash(vmemkv_test::to_span(make_key(kUpdatedKey))).payload_bits &
       vmemkv::t2_detail::kPayloadOffsetMask;
-  const uint64_t used_before_compact = store->impl().t2().bytes_used();
+  const uint64_t used_before_compact = store->impl().t2().tail_offset();
 
   enable();
   wait_for_compaction(*store);
 
-  const uint64_t moved_bytes = store->impl().t2().bytes_used() - used_before_compact;
+  const uint64_t moved_bytes = store->impl().t2().tail_offset() - used_before_compact;
   CHECK(moved_bytes > 0);
   CHECK(moved_bytes < used_before_compact / 2);
 
@@ -731,7 +731,7 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "64KB shuffled bulk load bounds T2 write a
   REQUIRE(store->impl().t1().shard_count() > 1);
   REQUIRE(inversion_rate(store) > 0.3);
 
-  const uint64_t used_after_load = store->impl().t2().bytes_used();
+  const uint64_t used_after_load = store->impl().t2().tail_offset();
   REQUIRE(used_after_load > 2 * vmemkv::Config<>::kSegmentBytes);
   store->checkpoint();
 
@@ -740,7 +740,7 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "64KB shuffled bulk load bounds T2 write a
   // Dirty shards compact independently in FIFO order, so only shard boundaries can invert.
   CHECK(count_inversions(store) < store->impl().t1().shard_count());
 
-  const uint64_t used_after_compact = store->impl().t2().bytes_used();
+  const uint64_t used_after_compact = store->impl().t2().tail_offset();
   const uint64_t relocated_bytes = used_after_compact - used_after_load;
   CHECK(relocated_bytes <= (used_after_load * 11) / 10);
 
@@ -756,17 +756,17 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "64KB shuffled bulk load bounds T2 write a
   // Growing-value updates (out-of-place appends) across 75% of keys must trigger
   // garbage-segment evacuation and hole punching without unbounded T2 growth.
   constexpr size_t kGrownValBytes = kValBytes + 512;
-  const uint64_t used_before_updates = store->impl().t2().bytes_used();
+  const uint64_t used_before_updates = store->impl().t2().tail_offset();
   for (size_t i = 0; i < kKeys; ++i) {
     if (i % 4 != 0) {
       REQUIRE(store->update(make_key(i), pattern_value(kGrownValBytes, kKeys + i)));
     }
   }
   drain_compaction(store, *this);
-  const uint64_t used_after_updates = store->impl().t2().bytes_used();
+  const uint64_t used_after_updates = store->impl().t2().tail_offset();
   CHECK((used_after_updates - used_before_updates) <= (used_after_load * 3) / 2);
 
-  // This checkpoint can advance base_boundary across dirty segments updated in Phase 2,
+  // This checkpoint can advance read_only_offset across dirty segments updated in Phase 2,
   // exposing one final frozen garbage evacuation before the two-checkpoint epoch gate runs.
   store->checkpoint();
   wait_for_compaction(*store);

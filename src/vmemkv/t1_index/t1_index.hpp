@@ -38,7 +38,7 @@ namespace vmemkv {
 // ─── T1Index Structure Overview ─────────────────────────────────────────────
 //
 //               +-----------------------------+
-//               |  sorted_region_ (raw ptr)   |
+//               |    sorted_run_ (raw ptr)    |
 //               +--------------+--------------+
 //                              |
 //                              v
@@ -46,28 +46,28 @@ namespace vmemkv {
 //             | SortedSlot0 | SortedSlot1 | ...  |
 //             +----------------------------------+
 //                    O(log N) Binary Search
-//                    (Cold / Read-Only Region)
+//                    (In-Memory Sorted Run)
 //
 //               +-----------------------------+
-//               |   append_active_ (raw ptr)  |
+//               |  memtable_active_ (raw ptr) |
 //               +--------------+--------------+
 //                              |
 //                              v
 //             +----------------------------------+
-//             | AppendSlot0 | AppendSlot1 | ...  |
+//             | MemTableSlot0 | MemTableSlot1 ...|
 //             +----------------------------------+
 //                    O(1) Lock-free Hash Table
-//                    (Hot / Active Write Region)
+//                    (Active MemTable)
 //
 //               +-----------------------------+
-//               | append_immutable_ (raw ptr) | -- (Only during reorganize)
+//               | memtable_immutable_ (ptr)   | -- (Only during reorganize)
 //               +-----------------------------+
 //
 // ─── Read Concurrency Protocol (EBR & Double-Buffering) ──────────────────────
-// 1. Enter epoch: register current reorg_epoch_ in thread-local slot (T1ReadHandle).
-// 2. Search append_active_. If found, return payload.
-// 3. Search append_immutable_ (if exists/not null). If found, return payload.
-// 4. Search sorted_region_. If found, return payload.
+// 1. Enter epoch: register current epoch in thread-local slot (T1ReadHandle).
+// 2. Search memtable_active_. If found, return payload.
+// 3. Search memtable_immutable_ (if exists/not null). If found, return payload.
+// 4. Search sorted_run_. If found, return payload.
 // 5. Exit epoch: clear thread-local slot registration upon handle destruction.
 //
 template <typename Config = vmemkv::Config<>>
@@ -79,30 +79,30 @@ class T1Index {
   // RAII epoch registration for readers (lets reorganize() know these buffers are in use).
   using T1ReadHandle = typename ThreadReferenceTracker<uint64_t>::Guard;
 
-  // `append_cap`: lock-free append-region (LSM-style MemTable) capacity, not whole-KVS capacity.
-  // Defaults to Config::kAppendCapacityEntries; sharded T1 passes a per-shard override plus its
-  // shared EpochDomain so shards omit per-shard ThreadReferenceTracker storage and nested guards.
-  explicit T1Index(size_t append_cap = Config::kAppendCapacityEntries, EpochDomain *shared_epoch = nullptr)
-      : append_cap_(append_cap),
+  // `memtable_cap`: lock-free active MemTable capacity, not whole-KVS capacity.
+  // Defaults to Config::kMemTableCapacityEntries; sharded T1 passes a per-shard override plus
+  // its shared EpochDomain so shards omit per-shard ThreadReferenceTracker storage and guards.
+  explicit T1Index(size_t memtable_cap = Config::kMemTableCapacityEntries, EpochDomain *shared_epoch = nullptr)
+      : memtable_cap_(memtable_cap),
         owned_epoch_(shared_epoch == nullptr ? std::make_unique<EpochDomain>() : nullptr),
         epoch_domain_(shared_epoch != nullptr ? shared_epoch : owned_epoch_.get()) {
-    auto *active_region = new AppendRegion(append_cap_);
-    note_append_region_created();
-    auto *active_index = new AppendIndex(append_cap_);
-    append_active_.store(new AppendGeneration{active_region, active_index}, std::memory_order_release);
-    sorted_region_.store(new SortedRegion(), std::memory_order_release);
+    auto *active_memtable = new MemTable(memtable_cap_);
+    note_memtable_created();
+    auto *active_index = new MemTableIndex(memtable_cap_);
+    memtable_active_.store(new MemTableGeneration{active_memtable, active_index}, std::memory_order_release);
+    sorted_run_.store(new SortedRun(), std::memory_order_release);
   }
 
   ~T1Index() noexcept {
-    if (AppendGeneration *active = append_active_.load(std::memory_order_relaxed); active != nullptr) {
-      note_append_region_destroyed();
+    if (MemTableGeneration *active = memtable_active_.load(std::memory_order_relaxed); active != nullptr) {
+      note_memtable_destroyed();
     }
-    if (AppendGeneration *imm = append_immutable_.get(); imm != nullptr) {
-      note_append_region_destroyed();
+    if (MemTableGeneration *imm = memtable_immutable_.get(); imm != nullptr) {
+      note_memtable_destroyed();
     }
-    delete_generation(append_active_.load(std::memory_order_relaxed));
-    delete_generation(append_immutable_.get());
-    delete sorted_region_.load(std::memory_order_relaxed);
+    delete_generation(memtable_active_.load(std::memory_order_relaxed));
+    delete_generation(memtable_immutable_.get());
+    delete sorted_run_.load(std::memory_order_relaxed);
   }
 
   T1Index(const T1Index &) = delete;
@@ -116,11 +116,11 @@ class T1Index {
 
   enum class PutResult : uint8_t {
     Applied,
-    AppendRegionFull,
+    MemTableFull,
   };
 
   // A live entry as reorganize() merges it. Exposed so a checkpoint writer can serialize the
-  // sorted region without T1Index knowing about files.
+  // sorted run without T1Index knowing about files.
   struct EntrySnapshot {
     Key key{};
     Payload payload_bits{STORE_NOT_FOUND};
@@ -143,30 +143,30 @@ class T1Index {
     const auto [prefix, hash] = prepare_key_and_hash(key);
     return run_in_epoch<AcquireGuard>([&]() -> LookupResult { return lookup_by_prefix_hash(prefix, hash); });
   }
-  // Lookup body for get_with_hash() -- call inside with_epoch_guard(). The (hash, payload)
+  // Lookup body for get_with_hash() -- call inside run_in_epoch(). The (hash, payload)
   // pair is read via load_slot_consistent(): independent loads could feed a torn pair onward.
   auto lookup_by_prefix_hash(const t1_detail::StoreKey &prefix, uint64_t hash) const -> LookupResult {
-    const AppendGeneration *active_gen = append_active_.load(std::memory_order_acquire);
-    const AppendRegion *active = active_gen->region;
+    const MemTableGeneration *active_gen = memtable_active_.load(std::memory_order_acquire);
+    const MemTable *active = active_gen->region;
 
-    // 1. check active append region
-    if (const AppendSlot *slot = active->find_with_index(*active_gen->index, prefix, hash)) {
+    // 1. check active MemTable
+    if (const MemTableSlot *slot = active->find_with_index(*active_gen->index, prefix, hash)) {
       const auto [slot_hash, slot_payload] = load_slot_consistent(*slot);
       return LookupResult{slot_payload, slot_hash};
     }
 
-    // 2. check immutable append region if exists
-    if (const AppendGeneration *imm_gen = append_immutable_.get()) {
-      const AppendRegion *imm = imm_gen->region;
-      if (const AppendSlot *slot = imm->find_with_index(*imm_gen->index, prefix, hash)) {
+    // 2. check immutable MemTable if exists
+    if (const MemTableGeneration *imm_gen = memtable_immutable_.get()) {
+      const MemTable *imm = imm_gen->region;
+      if (const MemTableSlot *slot = imm->find_with_index(*imm_gen->index, prefix, hash)) {
         const auto [slot_hash, slot_payload] = load_slot_consistent(*slot);
         return LookupResult{slot_payload, slot_hash};
       }
     }
 
-    // 3. check sorted region (loaded after immutable so a racing reorganize() that drained
+    // 3. check sorted run (loaded after immutable so a racing reorganize() that drained
     // immutable into next_sorted is visible here)
-    const SortedRegion *sorted = sorted_region_.load(std::memory_order_acquire);
+    const SortedRun *sorted = sorted_run_.load(std::memory_order_acquire);
     if (const SortedSlot *slot = find_sorted(*sorted, prefix, hash)) {
       const auto [slot_hash, slot_payload] = load_slot_consistent(*slot);
       return LookupResult{slot_payload, slot_hash};
@@ -178,54 +178,47 @@ class T1Index {
  public:
   auto get(std::span<const std::byte> key) const -> Payload { return get_with_hash(key).payload_bits; }
 
-  [[nodiscard]] auto append_size() const noexcept -> size_t { return append_size_impl<true>(); }
-  [[nodiscard]] auto append_size(CallerHeldEpochTag /*tag*/) const noexcept -> size_t {
-    return append_size_impl<false>();
+  [[nodiscard]] auto memtable_size() const noexcept -> size_t { return memtable_size_impl<true>(); }
+  [[nodiscard]] auto memtable_size(CallerHeldEpochTag /*tag*/) const noexcept -> size_t {
+    return memtable_size_impl<false>();
   }
 
-  // Approximate total entry count (sorted plus active append, including dead entries).
-  // Cheap enough to poll: two atomic loads under an epoch guard, no merge. Over-approximates
-  // live entries, so it gates expensive work, never correctness.
+  // Approximate total entry count (sorted run plus active MemTable, including dead entries).
   [[nodiscard]] auto approx_entry_count() const noexcept -> size_t { return approx_entry_count_impl<true>(); }
   [[nodiscard]] auto approx_entry_count(CallerHeldEpochTag /*tag*/) const noexcept -> size_t {
     return approx_entry_count_impl<false>();
   }
 
   // Fixed for this instance's lifetime.
-  [[nodiscard]] auto append_capacity() const noexcept -> size_t { return append_cap_; }
+  [[nodiscard]] auto memtable_capacity() const noexcept -> size_t { return memtable_cap_; }
 
-  // True while a reorganize() has frozen the previous active region and not yet
-  // published its replacement: a snapshot that reads only the sorted region is
-  // incomplete until the merge lands.
-  [[nodiscard]] auto has_immutable() const noexcept -> bool { return append_immutable_.get() != nullptr; }
+  // True while a reorganize() has frozen the previous active MemTable and not yet
+  // published its replacement.
+  [[nodiscard]] auto has_immutable() const noexcept -> bool { return memtable_immutable_.get() != nullptr; }
 
-  // Streams every live sorted-region entry in key order without merging. Behind
-  // checkpoint_all_shards()'s clean-shard shortcut (identical output to a merge when both
-  // the active append and the frozen immutable are empty; callers check has_immutable()).
-  // Epoch-guarded; tombstones skipped as a merge would skip them.
-  void dump_sorted_region(std::vector<EntrySnapshot> &out) const {
+  // Streams every live sorted-run entry in key order without merging.
+  void dump_sorted_run(std::vector<EntrySnapshot> &out) const {
     run_in_epoch<true>([&] {
       out.clear();
-      const SortedRegion *sorted = sorted_region_.load(std::memory_order_acquire);
+      const SortedRun *sorted = sorted_run_.load(std::memory_order_acquire);
       Key max_key;
       max_key.fill(t1_detail::kMaxKeyFillByte);
-      walk_sorted_region(sorted, Key{}, max_key, [&](const SortedSlot &slot, uint64_t hash, Payload payload) {
+      walk_sorted_run(sorted, Key{}, max_key, [&](const SortedSlot &slot, uint64_t hash, Payload payload) {
         out.push_back(EntrySnapshot{slot.key, payload, hash});
       });
     });
   }
 
-  // One append slot's bytes, for cache-derived entry budgets without depending on layout.
-  static auto append_slot_bytes() noexcept -> size_t;
+  // One MemTable slot's bytes, for cache-derived entry budgets without depending on layout.
+  static auto memtable_slot_bytes() noexcept -> size_t;
 
-  // Resident AppendRegion instances (active + not-yet-reclaimed retiring generations) and the
-  // lifetime peak. Each carries an append_cap_ * sizeof(AppendSlot) mmap footprint that stays
-  // near-fully resident from light occupancy, so this pile-up directly bounds T1's RSS churn.
-  [[nodiscard]] auto append_region_live_count() const noexcept -> int64_t {
-    return append_region_live_count_.load(std::memory_order_relaxed);
+  // Resident MemTable instances (active + not-yet-reclaimed retiring generations) and the
+  // lifetime peak.
+  [[nodiscard]] auto memtable_live_count() const noexcept -> int64_t {
+    return memtable_live_count_.load(std::memory_order_relaxed);
   }
-  [[nodiscard]] auto append_region_peak_count() const noexcept -> int64_t {
-    return append_region_peak_count_.load(std::memory_order_relaxed);
+  [[nodiscard]] auto memtable_peak_count() const noexcept -> int64_t {
+    return memtable_peak_count_.load(std::memory_order_relaxed);
   }
 
   auto put(std::span<const std::byte> key,
@@ -246,16 +239,16 @@ class T1Index {
 
  private:
   template <bool AcquireGuard>
-  [[nodiscard]] auto append_size_impl() const noexcept -> size_t {
+  [[nodiscard]] auto memtable_size_impl() const noexcept -> size_t {
     return run_in_epoch<AcquireGuard>(
-        [&]() noexcept { return append_active_.load(std::memory_order_acquire)->region->size(); });
+        [&]() noexcept { return memtable_active_.load(std::memory_order_acquire)->region->size(); });
   }
 
   template <bool AcquireGuard>
   [[nodiscard]] auto approx_entry_count_impl() const noexcept -> size_t {
     return run_in_epoch<AcquireGuard>([&]() noexcept {
-      return sorted_region_.load(std::memory_order_acquire)->size +
-             append_active_.load(std::memory_order_acquire)->region->size();
+      return sorted_run_.load(std::memory_order_acquire)->size +
+             memtable_active_.load(std::memory_order_acquire)->region->size();
     });
   }
 
@@ -309,15 +302,15 @@ class T1Index {
           continue;
         }
 
-        AppendGeneration *active_gen = append_active_.load(std::memory_order_acquire);
-        AppendRegion *active = active_gen->region;
+        MemTableGeneration *active_gen = memtable_active_.load(std::memory_order_acquire);
+        MemTable *active = active_gen->region;
         const size_t index = active->reserve();
-        if (index >= append_cap_) {
-          return PutResult::AppendRegionFull;
+        if (index >= memtable_cap_) {
+          return PutResult::MemTableFull;
         }
 
         active->publish(index, prefix, stored_hash, value);
-        publish_append_index(*active_gen->index, *active, index, prefix, hash);
+        publish_memtable_index(*active_gen->index, *active, index, prefix, hash);
         return PutResult::Applied;
       }
     });
@@ -363,15 +356,15 @@ class T1Index {
     std::pmr::monotonic_buffer_resource mem_res(stack_buf.data(), stack_buf.size());
     std::pmr::vector<ScanCandidate> candidates(&mem_res);
 
-    // Fast path: when active and immutable append regions are disjoint from the range,
+    // Fast path: when active and immutable MemTables are disjoint from the range,
     // stream sorted entries directly to callback without candidates buffering, sorting, or dedup.
     const auto fast_res = run_in_epoch<AcquireGuard>([&]() -> std::optional<size_t> {
-      const SortedRegion *sorted = sorted_region_.load(std::memory_order_acquire);
-      const AppendRegion *active = append_active_.load(std::memory_order_acquire)->region;
-      const AppendGeneration *imm_gen = append_immutable_.get();
-      const AppendRegion *imm = imm_gen != nullptr ? imm_gen->region : nullptr;
+      const SortedRun *sorted = sorted_run_.load(std::memory_order_acquire);
+      const MemTable *active = memtable_active_.load(std::memory_order_acquire)->region;
+      const MemTableGeneration *imm_gen = memtable_immutable_.get();
+      const MemTable *imm = imm_gen != nullptr ? imm_gen->region : nullptr;
 
-      auto region_disjoint = [&](const AppendRegion *region) {
+      auto region_disjoint = [&](const MemTable *region) {
         if (region == nullptr || region->size() == 0) {
           return true;
         }
@@ -385,11 +378,10 @@ class T1Index {
 
       if (region_disjoint(active) && region_disjoint(imm)) {
         size_t match_count = 0;
-        walk_sorted_region(
-            sorted, lower_bound, upper_bound, [&](const SortedSlot &slot, uint64_t hash, Payload payload) {
-              ++match_count;
-              return scan_detail::invoke_callback(callback, std::span<const std::byte>(slot.key), payload, hash);
-            });
+        walk_sorted_run(sorted, lower_bound, upper_bound, [&](const SortedSlot &slot, uint64_t hash, Payload payload) {
+          ++match_count;
+          return scan_detail::invoke_callback(callback, std::span<const std::byte>(slot.key), payload, hash);
+        });
         return match_count;
       }
       return std::nullopt;
@@ -402,18 +394,18 @@ class T1Index {
     // Step 1: Extract candidate entries under epoch guard (fast, microseconds, in-memory index only).
     // NOLINTNEXTLINE(readability-function-cognitive-complexity)
     run_in_epoch<AcquireGuard>([&] {
-      const SortedRegion *sorted = sorted_region_.load(std::memory_order_acquire);
-      const AppendRegion *active = append_active_.load(std::memory_order_acquire)->region;
-      const AppendGeneration *imm_gen = append_immutable_.get();
-      const AppendRegion *imm = imm_gen != nullptr ? imm_gen->region : nullptr;
+      const SortedRun *sorted = sorted_run_.load(std::memory_order_acquire);
+      const MemTable *active = memtable_active_.load(std::memory_order_acquire)->region;
+      const MemTableGeneration *imm_gen = memtable_immutable_.get();
+      const MemTable *imm = imm_gen != nullptr ? imm_gen->region : nullptr;
 
-      // Extract from sorted_region using binary search (O(log S))
-      walk_sorted_region(sorted, lower_bound, upper_bound, [&](const SortedSlot &slot, uint64_t hash, Payload payload) {
+      // Extract from sorted_run_ using binary search (O(log S))
+      walk_sorted_run(sorted, lower_bound, upper_bound, [&](const SortedSlot &slot, uint64_t hash, Payload payload) {
         candidates.push_back({slot.key, payload, hash, 0});
       });
 
-      // Extract from append active/immutable regions
-      auto extract_append = [&](const AppendRegion *region, int gen) {
+      // Extract from active/immutable MemTables
+      auto extract_memtable = [&](const MemTable *region, int gen) {
         if (!region) {
           return;
         }
@@ -432,7 +424,7 @@ class T1Index {
           }
         }
         for (size_t i = 0; i < count; ++i) {
-          const AppendSlot &slot = region->data()[i];
+          const MemTableSlot &slot = region->data()[i];
           if (!slot.published.load(std::memory_order_acquire)) {
             continue;
           }
@@ -449,8 +441,8 @@ class T1Index {
 
       const size_t sorted_count = candidates.size();
 
-      extract_append(active, 2);
-      extract_append(imm, 1);
+      extract_memtable(active, 2);
+      extract_memtable(imm, 1);
 
       if (candidates.size() > sorted_count) {
         // Sort candidates by Key ASC, then Generation DESC (newest first).
@@ -531,32 +523,32 @@ class T1Index {
       return;
     }
 
-    // 1. Prepare new active buffers
-    auto *next_active_region = new AppendRegion(append_cap_);
-    note_append_region_created();
-    auto *next_active_index = new AppendIndex(append_cap_);
-    auto *next_active_gen = new AppendGeneration{next_active_region, next_active_index};
+    // 1. Prepare new active MemTable buffers
+    auto *next_active_region = new MemTable(memtable_cap_);
+    note_memtable_created();
+    auto *next_active_index = new MemTableIndex(memtable_cap_);
+    auto *next_active_gen = new MemTableGeneration{next_active_region, next_active_index};
 
-    // 2. Freeze current active to immutable, publish a fresh active. Single atomic stores, so
-    // a reader never sees a region paired with the wrong generation's index.
-    AppendGeneration *old_active_gen = append_active_.load(std::memory_order_acquire);
-    append_immutable_.freeze(old_active_gen);
-    append_active_.store(next_active_gen, std::memory_order_release);
+    // 2. Freeze current active to immutable MemTable, publish a fresh active. Single atomic stores,
+    // so a reader never sees a region paired with the wrong generation's index.
+    MemTableGeneration *old_active_gen = memtable_active_.load(std::memory_order_acquire);
+    memtable_immutable_.freeze(old_active_gen);
+    memtable_active_.store(next_active_gen, std::memory_order_release);
 
-    // Advance epoch and wait out writers on the old region. After this: no new reserve() on
+    // Advance epoch and wait out writers on the old MemTable. After this: no new reserve() on
     // it, and every reserved slot is fully published -- straggler and post-freeze races closed.
     uint64_t freeze_epoch = epoch_domain_->epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
     epoch_domain_->tracker.wait_until_epoch(freeze_epoch);
 
-    // 3. Rebuild sorted region from sorted_region and append_immutable
-    const auto sorted = sorted_region_.load(std::memory_order_acquire);
+    // 3. Rebuild sorted run from sorted_run_ and memtable_immutable_
+    const auto sorted = sorted_run_.load(std::memory_order_acquire);
     // Freeze before the merge reads a slot: until the replacement publishes, `sorted` is frozen
     // for writers (an in-place write here would be a silent Lost Update -- see FreezableRegion).
     sorted_write_frozen_.freeze(sorted);
-    AppendRegion *old_active = old_active_gen->region;
+    MemTable *old_active = old_active_gen->region;
     const size_t imm_n = old_active->size();
 
-    // Extract append immutable entries (unsorted)
+    // Extract immutable MemTable entries (unsorted)
     std::vector<EntrySnapshot> imm_entries;
     imm_entries.reserve(imm_n);
     old_active->collect_live_entries(imm_entries, imm_n);
@@ -567,14 +559,14 @@ class T1Index {
       return t1_detail::entry_less(lhs.key, lhs.hash, rhs.key, rhs.hash);
     };
 
-    // Sort the smaller append-immutable side (parallel unless the caller opts out, see above).
+    // Sort the smaller immutable-MemTable side (parallel unless the caller opts out, see above).
     if (parallel_sort) {
       std::sort(std::execution::par, imm_entries.begin(), imm_entries.end(), comp);
     } else {
       std::sort(imm_entries.begin(), imm_entries.end(), comp);
     }
 
-    // Merge sorted_region with imm_entries in one pass (no redundant O(sorted) copy).
+    // Merge sorted_run_ with imm_entries in one pass (no redundant O(sorted) copy).
     // Hand-written loop, not std::merge: the sorted side needs live-filtering interleaved.
     std::vector<EntrySnapshot> merged;
     merged.reserve(sorted->size + imm_entries.size());
@@ -627,12 +619,12 @@ class T1Index {
 
     offset_mapper(std::span<EntrySnapshot>(merged));
 
-    auto *next_sorted = new SortedRegion(merged);
+    auto *next_sorted = new SortedRun(merged);
 
-    // Unfreeze right after publish: resolve() sees the complete unfrozen region; bypass over.
-    sorted_region_.store(next_sorted, std::memory_order_release);
+    // Unfreeze right after publish: resolve() sees the complete unfrozen sorted run; bypass over.
+    sorted_run_.store(next_sorted, std::memory_order_release);
     sorted_write_frozen_.unfreeze();
-    append_immutable_.unfreeze();
+    memtable_immutable_.unfreeze();
 
     chk_writer(std::span<const EntrySnapshot>(merged));
 
@@ -641,7 +633,7 @@ class T1Index {
     epoch_domain_->tracker.wait_until_epoch(target_epoch);
 
     delete old_active_gen->region;
-    note_append_region_destroyed();
+    note_memtable_destroyed();
     delete old_active_gen->index;
     delete old_active_gen;
     delete sorted;
@@ -649,13 +641,13 @@ class T1Index {
     reorg_in_progress_.store(false, std::memory_order_release);
   }
 
-  // Installs a pre-built sorted region (from a T1 checkpoint file) as the entire live state.
+  // Installs a pre-built sorted run (from a T1 checkpoint file) as the entire live state.
   // No synchronization or retirement -- construction-time only. `entries` must be key-ascending.
-  void load_sorted_region_from_checkpoint(std::span<const EntrySnapshot> entries) {
+  void load_sorted_run_from_checkpoint(std::span<const EntrySnapshot> entries) {
     // Build before teardown so a throwing constructor leaves the original pointer intact.
-    auto *next_sorted = new SortedRegion(entries);
-    delete sorted_region_.load(std::memory_order_relaxed);
-    sorted_region_.store(next_sorted, std::memory_order_relaxed);
+    auto *next_sorted = new SortedRun(entries);
+    delete sorted_run_.load(std::memory_order_relaxed);
+    sorted_run_.store(next_sorted, std::memory_order_relaxed);
   }
 
  private:
@@ -699,20 +691,20 @@ class T1Index {
 
   struct SortedSlot : SlotBase {};
 
-  struct AppendSlot : SlotBase {
+  struct MemTableSlot : SlotBase {
     std::atomic<bool> published{false};
     // Version unneeded for the initial publish() (published's release already makes
     // hash/payload visible together); only for later in-place updates.
   };
 
-  struct SortedRegion {
+  struct SortedRun {
     size_t size = 0;
     // NOLINTNEXTLINE(modernize-avoid-c-arrays)
     std::unique_ptr<SortedSlot[]> slots;
     [[no_unique_address]] std::conditional_t<Config::UseBloomFilter, t1_detail::BloomFilter, EmptyOption> bloom;
 
-    SortedRegion() = default;
-    explicit SortedRegion(std::span<const EntrySnapshot> entries)
+    SortedRun() = default;
+    explicit SortedRun(std::span<const EntrySnapshot> entries)
         // NOLINTNEXTLINE(modernize-avoid-c-arrays)
         : size(entries.size()), slots(size == 0 ? nullptr : std::make_unique<SortedSlot[]>(size)) {
       if constexpr (Config::UseBloomFilter) {
@@ -729,13 +721,12 @@ class T1Index {
     }
   };
 
-  // Walks the sorted region within [lower_bound, upper_bound), calling sink(slot, hash,
+  // Walks the sorted run within [lower_bound, upper_bound), calling sink(slot, hash,
   // payload) per live match. One implementation for scan()'s fast and slow paths; the sink
   // decides per match. Templated (not std::function) so sinks inline.
   template <typename Sink>
   // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-  static auto walk_sorted_region(const SortedRegion *sorted, Key lower_bound, Key upper_bound, Sink &&sink)
-      -> ScanControl {
+  static auto walk_sorted_run(const SortedRun *sorted, Key lower_bound, Key upper_bound, Sink &&sink) -> ScanControl {
     if (sorted == nullptr || sorted->size == 0) {
       return ScanControl::Continue;
     }
@@ -759,23 +750,23 @@ class T1Index {
     return ScanControl::Continue;
   }
 
-  using AppendIndex = LockFreeHashTable<Key, AppendSlot>;
+  using MemTableIndex = LockFreeHashTable<Key, MemTableSlot>;
 
   struct ResolvedSlot {
-    AppendSlot *append = nullptr;
+    MemTableSlot *memtable = nullptr;
     const SortedSlot *sorted = nullptr;
 
-    [[nodiscard]] auto found() const noexcept -> bool { return append != nullptr || sorted != nullptr; }
+    [[nodiscard]] auto found() const noexcept -> bool { return memtable != nullptr || sorted != nullptr; }
 
     // Which physical slot, not its contents: lets put()'s retry tell an ordinary delete
     // (same slot) from a concurrent displacement (different slot).
     [[nodiscard]] auto same_slot_as(const ResolvedSlot &other) const noexcept -> bool {
-      return append == other.append && sorted == other.sorted;
+      return memtable == other.memtable && sorted == other.sorted;
     }
 
     [[nodiscard]] auto load() const noexcept -> Payload {
-      if (append != nullptr) {
-        return append->payload_bits.load(std::memory_order_acquire);
+      if (memtable != nullptr) {
+        return memtable->payload_bits.load(std::memory_order_acquire);
       }
       return sorted->payload_bits.load(std::memory_order_acquire);
     }
@@ -784,8 +775,8 @@ class T1Index {
     // (on_displaced), resurrecting an orphaned slot that walks would carry forward as a
     // permanent duplicate. On failure the caller must not retry blindly (see put()).
     [[nodiscard]] auto try_store(Payload &expected_current, Payload value) const noexcept -> bool {
-      if (append != nullptr) {
-        return append->payload_bits.compare_exchange_strong(
+      if (memtable != nullptr) {
+        return memtable->payload_bits.compare_exchange_strong(
             expected_current, value, std::memory_order_release, std::memory_order_acquire);
       }
       return sorted->payload_bits.compare_exchange_strong(
@@ -793,15 +784,15 @@ class T1Index {
     }
 
     void store_hash(uint64_t hash) const noexcept {
-      if (append != nullptr) {
-        append->hash.store(hash, std::memory_order_release);
+      if (memtable != nullptr) {
+        memtable->hash.store(hash, std::memory_order_release);
       } else {
         sorted->hash.store(hash, std::memory_order_release);
       }
     }
 
     [[nodiscard]] auto version_ref() const noexcept -> std::atomic<uint64_t> & {
-      return append != nullptr ? append->version : sorted->version;
+      return memtable != nullptr ? memtable->version : sorted->version;
     }
 
     // Brackets put()'s in-place update with the seqlock. Safe unconditionally: put() holds the
@@ -832,19 +823,19 @@ class T1Index {
     }
   }
 
-  class AppendRegion {
+  class MemTable {
    public:
     // Unpublished slots stay all-zero like MAP_ANONYMOUS memory: never faulted or zeroed upfront.
-    explicit AppendRegion(size_t capacity)
+    explicit MemTable(size_t capacity)
         : capacity_(capacity),
-          mapping_(mmap_anon_or_throw(capacity_ * sizeof(AppendSlot)), capacity_ * sizeof(AppendSlot)),
-          slots_(static_cast<AppendSlot *>(mapping_.get())) {}
+          mapping_(mmap_anon_or_throw(capacity_ * sizeof(MemTableSlot)), capacity_ * sizeof(MemTableSlot)),
+          slots_(static_cast<MemTableSlot *>(mapping_.get())) {}
 
-    AppendRegion(const AppendRegion &) = delete;
-    auto operator=(const AppendRegion &) -> AppendRegion & = delete;
+    MemTable(const MemTable &) = delete;
+    auto operator=(const MemTable &) -> MemTable & = delete;
 
-    auto data() noexcept -> AppendSlot * { return slots_; }
-    [[nodiscard]] auto data() const noexcept -> const AppendSlot * { return slots_; }
+    auto data() noexcept -> MemTableSlot * { return slots_; }
+    [[nodiscard]] auto data() const noexcept -> const MemTableSlot * { return slots_; }
 
     [[nodiscard]] auto size() const noexcept -> size_t { return tail_.load(std::memory_order_acquire); }
 
@@ -865,13 +856,13 @@ class T1Index {
       slots_[index].key = key;
       slots_[index].hash.store(hash, std::memory_order_relaxed);
       slots_[index].payload_bits.store(value, std::memory_order_relaxed);
-      // Bounds before the published flag: scan() may skip this region on bounds(), so the
+      // Bounds before the published flag: scan() may skip this MemTable on bounds(), so the
       // reverse order could hide an already-visible key as "out of range".
       update_bounds(key);
       slots_[index].published.store(true, std::memory_order_release);
     }
 
-    // Conservative [min, max] envelope letting scan() skip this region's O(size()) walk on a
+    // Conservative [min, max] envelope letting scan() skip this MemTable's O(size()) walk on a
     // disjoint range. Key isn't lock-free atomic without -mcx16, so a dedicated spinlock guards
     // just this pair, off the lock-free insert path.
     void update_bounds(Key key) noexcept {
@@ -910,22 +901,22 @@ class T1Index {
       return present;
     }
 
-    auto find_with_index(const AppendIndex &index, Key key, uint64_t hash) noexcept -> AppendSlot * {
-      return const_cast<AppendSlot *>(static_cast<const AppendRegion *>(this)->find_with_index(index, key, hash));
+    auto find_with_index(const MemTableIndex &index, Key key, uint64_t hash) noexcept -> MemTableSlot * {
+      return const_cast<MemTableSlot *>(static_cast<const MemTable *>(this)->find_with_index(index, key, hash));
     }
 
-    [[nodiscard]] auto find_with_index(const AppendIndex &index,
+    [[nodiscard]] auto find_with_index(const MemTableIndex &index,
                                        Key key,
-                                       uint64_t hash) const noexcept -> const AppendSlot * {
+                                       uint64_t hash) const noexcept -> const MemTableSlot * {
       if (tail_.load(std::memory_order_acquire) == 0) {
         return nullptr;
       }
-      const auto slot_plus_one =
-          index.find_slot_index(key, hash, [&](size_t slot_index) -> const AppendSlot & { return slots_[slot_index]; });
-      if (slot_plus_one == AppendIndex::kNotFound) {
+      const auto slot_plus_one = index.find_slot_index(
+          key, hash, [&](size_t slot_index) -> const MemTableSlot & { return slots_[slot_index]; });
+      if (slot_plus_one == MemTableIndex::kNotFound) {
         return nullptr;
       }
-      const AppendSlot &slot = slots_[static_cast<size_t>(slot_plus_one - 1)];
+      const MemTableSlot &slot = slots_[static_cast<size_t>(slot_plus_one - 1)];
       if (!slot.published.load(std::memory_order_acquire)) {
         return nullptr;
       }
@@ -934,7 +925,7 @@ class T1Index {
 
     void collect_live_entries(std::vector<EntrySnapshot> &out, size_t count) const {
       for (size_t i = 0; i < count; ++i) {
-        const AppendSlot &slot = slots_[i];
+        const MemTableSlot &slot = slots_[i];
         if (!slot.published.load(std::memory_order_acquire)) {
           continue;
         }
@@ -951,7 +942,7 @@ class T1Index {
    private:
     size_t capacity_;
     MmapGuard mapping_;  // Owns the slots below; unmaps on destruction.
-    AppendSlot *slots_;
+    MemTableSlot *slots_;
     std::atomic<size_t> tail_{0};
 
     // See update_bounds()/bounds() above. mutable: bounds() is logically const (just a read),
@@ -962,14 +953,14 @@ class T1Index {
     Key bounds_max_{};
   };
 
-  // Bundles a region with its hash index as one atomically-swappable unit: two independent
-  // atomics could be read as a torn pair (region with the wrong generation's index).
-  struct AppendGeneration {
-    AppendRegion *region;
-    AppendIndex *index;
+  // Bundles a MemTable with its hash index as one atomically-swappable unit: two independent
+  // atomics could be read as a torn pair (MemTable with the wrong generation's index).
+  struct MemTableGeneration {
+    MemTable *region;
+    MemTableIndex *index;
   };
 
-  static void delete_generation(AppendGeneration *generation) noexcept {
+  static void delete_generation(MemTableGeneration *generation) noexcept {
     if (generation == nullptr) {
       return;
     }
@@ -978,13 +969,13 @@ class T1Index {
     delete generation;
   }
 
-  void note_append_region_created() noexcept {
-    int64_t live = append_region_live_count_.fetch_add(1, std::memory_order_relaxed) + 1;
-    int64_t peak = append_region_peak_count_.load(std::memory_order_relaxed);
-    while (live > peak && !append_region_peak_count_.compare_exchange_weak(peak, live, std::memory_order_relaxed)) {
+  void note_memtable_created() noexcept {
+    int64_t live = memtable_live_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+    int64_t peak = memtable_peak_count_.load(std::memory_order_relaxed);
+    while (live > peak && !memtable_peak_count_.compare_exchange_weak(peak, live, std::memory_order_relaxed)) {
     }
   }
-  void note_append_region_destroyed() noexcept { append_region_live_count_.fetch_sub(1, std::memory_order_relaxed); }
+  void note_memtable_destroyed() noexcept { memtable_live_count_.fetch_sub(1, std::memory_order_relaxed); }
 
   // ─── Helper Methods: Key and Lookup ────────────────────────────────────
   auto prepare_key_and_hash(std::span<const std::byte> key) const noexcept -> std::pair<t1_detail::StoreKey, uint64_t> {
@@ -994,7 +985,7 @@ class T1Index {
 
   static auto is_live(Payload value) noexcept -> bool { return value != STORE_NOT_FOUND; }
 
-  auto find_sorted(const SortedRegion &sorted, Key key, uint64_t hash) const noexcept -> const SortedSlot * {
+  auto find_sorted(const SortedRun &sorted, Key key, uint64_t hash) const noexcept -> const SortedSlot * {
     if constexpr (Config::UseBloomFilter) {
       if (!sorted.bloom.maybe_contains(hash)) {
         return nullptr;
@@ -1035,27 +1026,27 @@ class T1Index {
   }
 
   auto resolve(Key key, uint64_t hash) noexcept -> ResolvedSlot {
-    AppendGeneration *active_gen = append_active_.load(std::memory_order_acquire);
-    if (AppendSlot *slot = active_gen->region->find_with_index(*active_gen->index, key, hash)) {
+    MemTableGeneration *active_gen = memtable_active_.load(std::memory_order_acquire);
+    if (MemTableSlot *slot = active_gen->region->find_with_index(*active_gen->index, key, hash)) {
       return ResolvedSlot{slot, nullptr};
     }
 
-    // A frozen-region hit means an in-place update would be a Lost Update this cycle (see
+    // A frozen-MemTable hit means an in-place update would be a Lost Update this cycle (see
     // FreezableRegion) -- bypass to a fresh active entry instead. Safe: T2 never relocates, so
     // the bypass offset stays valid; a later reorganize() dedups by key + clean hash.
-    if (AppendGeneration *imm_gen = append_immutable_.get()) {
+    if (MemTableGeneration *imm_gen = memtable_immutable_.get()) {
       if (imm_gen->region->find_with_index(*imm_gen->index, key, hash) != nullptr) {
         return ResolvedSlot{};
       }
     }
 
-    if (const SortedRegion *frozen_sorted = sorted_write_frozen_.get()) {
-      // While frozen, sorted_region_ points at this same region, so no second check below.
+    if (const SortedRun *frozen_sorted = sorted_write_frozen_.get()) {
+      // While frozen, sorted_run_ points at this same run, so no second check below.
       if (find_sorted(*frozen_sorted, key, hash) != nullptr) {
         return ResolvedSlot{};
       }
     } else {
-      const auto sorted = sorted_region_.load(std::memory_order_acquire);
+      const auto sorted = sorted_run_.load(std::memory_order_acquire);
       if (const SortedSlot *slot = find_sorted(*sorted, key, hash)) {
         return ResolvedSlot{nullptr, slot};
       }
@@ -1064,15 +1055,15 @@ class T1Index {
     return ResolvedSlot{};
   }
 
-  void publish_append_index(
-      AppendIndex &idx, const AppendRegion &region, size_t index, Key key, uint64_t hash) noexcept {
-    const auto slot_plus_one = static_cast<typename AppendIndex::slot_index_type>(index + 1);
+  void publish_memtable_index(
+      MemTableIndex &idx, const MemTable &region, size_t index, Key key, uint64_t hash) noexcept {
+    const auto slot_plus_one = static_cast<typename MemTableIndex::slot_index_type>(index + 1);
     idx.publish_slot(
         key,
         slot_plus_one,
         hash,
-        [&](size_t slot_index) -> const AppendSlot & { return region.data()[slot_index]; },
-        [](const AppendSlot &displaced) {
+        [&](size_t slot_index) -> const MemTableSlot & { return region.data()[slot_index]; },
+        [](const MemTableSlot &displaced) {
           // Same-key insert-race loser, unreachable via the index now. Tombstone it so walks
           // (which don't consult the index) don't carry it forward as a duplicate.
           displaced.payload_bits.store(vmemkv::STORE_NOT_FOUND, std::memory_order_release);
@@ -1090,24 +1081,24 @@ class T1Index {
   }
 
   // ─── Member Variables ──────────────────────────────────────────────────
-  const size_t append_cap_;
+  const size_t memtable_cap_;
   std::unique_ptr<EpochDomain> owned_epoch_;
   EpochDomain *const epoch_domain_;
   mutable std::atomic<bool> reorg_in_progress_{false};
 
-  std::atomic<const SortedRegion *> sorted_region_{nullptr};
-  std::atomic<AppendGeneration *> append_active_{nullptr};
-  FreezableRegion<AppendGeneration *> append_immutable_;
-  std::atomic<int64_t> append_region_live_count_{0};
-  std::atomic<int64_t> append_region_peak_count_{0};
-  // Frozen for the merge loop's duration (same region sorted_region_ points at); closes the
-  // sorted-region Lost Update counterpart append_immutable_ already guards.
-  FreezableRegion<const SortedRegion *> sorted_write_frozen_;
+  std::atomic<const SortedRun *> sorted_run_{nullptr};
+  std::atomic<MemTableGeneration *> memtable_active_{nullptr};
+  FreezableRegion<MemTableGeneration *> memtable_immutable_;
+  std::atomic<int64_t> memtable_live_count_{0};
+  std::atomic<int64_t> memtable_peak_count_{0};
+  // Frozen for the merge loop's duration (same run sorted_run_ points at); closes the
+  // sorted-run Lost Update counterpart memtable_immutable_ already guards.
+  FreezableRegion<const SortedRun *> sorted_write_frozen_;
 };
 
 template <typename Config>
-auto T1Index<Config>::append_slot_bytes() noexcept -> size_t {
-  return sizeof(AppendSlot);
+auto T1Index<Config>::memtable_slot_bytes() noexcept -> size_t {
+  return sizeof(MemTableSlot);
 }
 
 }  // namespace vmemkv

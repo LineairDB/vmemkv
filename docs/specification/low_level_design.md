@@ -8,9 +8,9 @@ Following [high_level_design.md](./high_level_design.md), this document defines 
 
 ### 2.1 Tier 1
 
-Tier 1 is an index layer holding fixed-size entries. It is implemented as a range partition over K independent shards, each independently holding the `sorted_region` / `append_region` pair described in this section. For the directory layer, split protocol, and cross-shard concurrency control see [`t1_sharding_design.md`](t1_sharding_design.md). Below, unless noted, internal structure and operations of one shard are described as a single T1 index.
+Tier 1 is an index layer holding fixed-size entries aligned with LSM-tree MemTable / Sorted-Run terminology (see [`terminology.md`](terminology.md)). It is implemented as a range partition over K independent shards, each independently holding an `Active MemTable` (`memtable_active_`) + `In-Memory Sorted Run` (`sorted_run_`) pair sharing one `EpochDomain`. For the directory layer, split protocol, and cross-shard concurrency control see [`t1_sharding_design.md`](t1_sharding_design.md). Below, unless noted, internal structure and operations of one shard are described as a single T1 index.
 
-`sorted_region` and `append_region` both hold entry arrays, but their field layout differs between the runtime and on-disk (checkpoint) representations.
+`sorted_run` and `memtable` both hold entry arrays, but their field layout differs between the runtime and on-disk (checkpoint) representations.
 
 **Conceptual model** (core fields common to both representations):
 
@@ -32,16 +32,16 @@ constexpr uint64_t STORE_NOT_FOUND = ~0ULL; // tombstone marker
 | `hash` | Full-key hash. Narrows candidates indistinguishable by prefix alone. |
 | `payload_bits` | Normally a Tier 2 byte offset. The value itself for entry-level inlined entries (2.1.1). `STORE_NOT_FOUND` is a tombstone. |
 
-**Runtime representation**: `sorted_region` holds an array of `SortedSlot` (40 bytes: the 32-byte core fields above + `version`), `append_region` an array of `AppendSlot` (48 bytes: all `SortedSlot` fields + a `published` flag). `version` is the seqlock guaranteeing consistency during in-place updates (chapter 6). `hash`/`payload_bits`/`version` are all `std::atomic`, combining concurrent reads with in-place put() updates.
+**Runtime representation**: `sorted_run` holds an array of `SortedSlot` (40 bytes: the 32-byte core fields above + `version`), `MemTable` an array of `MemTableSlot` (48 bytes: all `SortedSlot` fields + a `published` flag). `version` is the seqlock guaranteeing consistency during in-place updates (chapter 6). `hash`/`payload_bits`/`version` are all `std::atomic`, combining concurrent reads with in-place put() updates.
 
 **On-disk (checkpoint) representation**: `T1ChkEntry` (32 bytes, core fields only). `version`/`published` serve runtime concurrency control only and are not persisted — a single-process load completes the checkpoint (5.4). `hash` is persisted as-is including the top 4 bits for inline decisions, still used to decode inline values after reload.
 
 **Invariants**
 
-- `sorted_region` is ascending in `key_prefix`.
-- `append_region` is unordered.
-- A Tier 1 live entry is expected to number at most 1 per logical key across `sorted_region` and `append_region` combined.
-- Entries with `payload_bits == STORE_NOT_FOUND` are deleted; exclude them from Get / Scan results.
+- `sorted_run` is ascending in `key_prefix`.
+- `MemTable` (`memtable_active`) is unordered.
+- A Tier 1 live entry is expected to number at most 1 per logical key across `sorted_run` and `MemTable` combined.
+- Entries with `payload_bits == STORE_NOT_FOUND` are tombstones; exclude them from Get / Scan results.
 
 ### 2.1.1 Dynamic Inline Optimizations
 
@@ -65,57 +65,58 @@ struct ValueRecordHeader {
 // Layout on disk / mmap:
 // [ValueRecordHeader][key bytes][value bytes][padding up to alloc_len]
 
-struct T2Store {
+struct T2Memory {
     std::byte* base;
-    uint64_t bytes_used;      // next append offset
-    uint64_t bytes_capacity;  // mapped byte length
+    uint64_t tail_offset;       // next append offset (FASTER TailOffset)
+    uint64_t read_only_offset;  // immutable prefix boundary (FASTER ReadOnlyOffset)
+    uint64_t capacity;          // mapped byte length
 };
 ```
 
 **Offset Space**
 
 - `base`'s start offset is `0`.
-- `bytes_used` is the next record's append offset.
-- Record offsets must satisfy `0 <= offset < bytes_used`.
-- Record start offsets align to `alignof(ValueRecordHeader)` (8-byte) boundaries. Records of 1 page (4096 bytes) or less never cross a page boundary, skipping to the next page start when they would. Records over 1 page pack densely (no alignment gaps). Page-contained layout minimizes cold-read fault counts for sub-page records; multi-page records touch the same page count either way, while layout gaps would break Scan's readahead merging. Skipped blanks hold no live records, so `bytes_used` monotonicity, hole-punch eligibility, and live accounting are unaffected. Physical layout is 8-byte granular, but `payload_bits`' embedded block count is a 16-byte-granular size hint (`aligned_len / 16` truncated), at most 8 bytes short. Readers decide with a +16-byte margin over the hint. Huge records whose block count overflows 16 bits fail at append time, distinguished from capacity shortage.
+- `tail_offset` is the next record's append offset.
+- Record offsets must satisfy `0 <= offset < tail_offset`.
+- Record start offsets align to `alignof(ValueRecordHeader)` (8-byte) boundaries. Records of 1 page (4096 bytes) or less never cross a page boundary, skipping to the next page start when they would. Records over 1 page pack densely (no alignment gaps). Page-contained layout minimizes cold-read fault counts for sub-page records; multi-page records touch the same page count either way, while layout gaps would break Scan's readahead merging. Skipped blanks hold no live records, so `tail_offset` monotonicity, hole-punch eligibility, and live accounting are unaffected. Physical layout is 8-byte granular, but `payload_bits`' embedded block count is a 16-byte-granular size hint (`aligned_len / 16` truncated), at most 8 bytes short. Readers decide with a +16-byte margin over the hint. Huge records whose block count overflows 16 bits fail at append time, distinguished from capacity shortage.
 - To reference a record offset, interpret `base + offset` as `ValueRecordHeader*` and read the following key bytes / value bytes.
 
 **Payload Bit Layout**
 
-When Tier 1's `payload_bits` is a Tier 2 offset (2.1), unused high bits embed the record size so base-region reads and segment live-byte accounting size spans with no extra T2 access. This form is always used for offset payloads, not opt-in.
+When Tier 1's `payload_bits` is a Tier 2 offset (2.1), unused high bits embed the record size so immutable-region reads and segment live-byte accounting size spans with no extra T2 access. This form is always used for offset payloads, not opt-in.
 
 * **Bits 0-47 (48-bit):** `T2 Offset` (record offset pointer in the physical file; maps up to 256 TiB of virtual address space).
 * **Bits 48-63 (16-bit):** `Embedded Block Count` (record footprint block count in 16-byte alignment, `aligned_len / 16`). Maximum expressible size: $(2^{16} - 1) \times 16 \text{ bytes} \approx \mathbf{1.04 \text{ MB}}$.
 
 Decoding: physical offset is `payload_bits & 0xFFFFFFFFFFFFULL`, record size is `(payload_bits >> 48) << 4`.
 
-**Base/Tail Split**
+**Immutable / Mutable Split (FASTER HybridLog Alignment)**
 
-`T2Store` holds `base_boundary`: the boundary value expressing the invariant that `[0, base_boundary)` is safely readable via base-region-only read paths (7.5 — three exist, by purpose/record size) with no seqlock. `base_boundary` advances atomically only through `checkpoint_internal()` (4.3).
+`T2Memory` holds `read_only_offset`: the boundary value expressing the invariant that `[0, read_only_offset)` is safely readable via immutable-region read paths (7.5) with no seqlock. `read_only_offset` advances atomically only through `checkpoint_internal()` (4.3).
 
-- Records with `offset < base_boundary` are the **base** region, `offset >= base_boundary` the **tail** region.
-- The base region is never rewritten in place once inside `base_boundary` (3.3). Base reads are therefore safe on dedicated read paths bypassing the main mmap's `MADV_RANDOM` (7.4), needing no seqlock (path selection: 7.5).
-- The tail region may be updated in place as usual, so it is only safely readable via the main mmap (latest view, seqlock-guarded).
+- Records with `offset < read_only_offset` form the **Immutable Region**, `offset >= read_only_offset` the **Mutable Region**.
+- The Immutable Region is never rewritten in place once below `read_only_offset` (3.3). Immutable reads are therefore safe on dedicated read paths bypassing the main mmap's `MADV_RANDOM` (7.4), needing no seqlock (path selection: 7.5).
+- The Mutable Region may be updated in place as usual, so it is read through the main mmap under the record `version` seqlock.
 
 **Invariants**
 
 - A Tier 2 live record is always reachable from some live `IndexEntry.payload_bits` on Tier 1.
-- A Tier 2 record no longer referenced from Tier 1 is garbage. Storage reclamation is specified in `t2_compaction_design.md`; `bytes_used` only grows monotonically. Reclamation hole-punches; offset space is never reused.
-- `update` overwrites the existing record in place when possible.
-- When a new value exceeds `alloc_len`, a new record goes at `bytes_used` and Tier 1's `offset` is swapped.
-- The `bytes_used` increment at append equals `ValueRecordHeader + key bytes + value bytes + padding (up to alloc_len)`, plus adjustment aligning the next record start to an `alignof(ValueRecordHeader)` boundary.
-- Always satisfies `bytes_used <= bytes_capacity`.
-- Capacity shortage at append (`bytes_used + required_bytes > bytes_capacity`) fails the write request (no queueing or automatic retry).
+- A Tier 2 record no longer referenced from Tier 1 is garbage. Storage reclamation is specified in `t2_compaction_design.md`; `tail_offset` only grows monotonically. Reclamation hole-punches; offset space is never reused.
+- `update` overwrites the existing record in place inside the Mutable Region when possible.
+- When a new value exceeds `alloc_len`, or the existing record is in the Immutable Region, a new record appends at `tail_offset` and Tier 1's `offset` is swapped.
+- The `tail_offset` increment at append equals `ValueRecordHeader + key bytes + value bytes + padding (up to alloc_len)`, plus adjustment aligning the next record start to an `alignof(ValueRecordHeader)` boundary.
+- Always satisfies `tail_offset <= capacity`.
+- Capacity shortage at append (`tail_offset + required_bytes > capacity`) fails the write request (no queueing or automatic retry).
 
 ### 2.3 VMemKV State
 
 ```c++
 struct VMemKV {
     ShardedT1Index t1;
-    T2Store t2;
+    T2FlatFile t2;
     Wal wal;
-    T2Ownership t2_own;   // segment live-byte accounting, checkpoint watermark, in-place barrier
-    ReorgState reorg;     // checkpoint/reorganize single-flight state
+    T2Ownership t2_own;           // segment live-byte accounting, fuzzy watermark, in-place barrier
+    CheckpointState checkpoint;   // checkpoint single-flight state and phase stats
     // + key stripe 256, background workers (T1 pool + single T2 maintenance worker), bulk-load throttle
 };
 ```
@@ -140,11 +141,11 @@ Input is the full key. Tier 1 narrows candidates by `key_prefix` and `hash`, Tie
 **Procedure**
 
 1. Compute `key_prefix = prefix(full_key)` and `hash = hash(full_key)`.
-2. Search the hash index (`append_index`) tied to `t1.append_region` for candidates matching `key_prefix` and `hash`.
-3. If append-side misses, binary-search `t1.sorted_region` by `key_prefix` for the candidate range (with opt-in Bloom filter, cut misses off at O(1)).
+2. Search the hash index (`MemTableIndex`) tied to `t1.memtable_active` (and `memtable_immutable` if compacting) for candidates matching `key_prefix` and `hash`.
+3. If MemTable misses, binary-search `t1.sorted_run` by `key_prefix` for the candidate range (with Bloom filter miss bypass at O(1)).
 4. Verify `hash` on candidate `IndexEntry`s.
-5. Not found if `payload_bits == STORE_NOT_FOUND`.
-6. Fetch the Tier 2 record from `payload_bits`. Small records read directly from the main mmap (`random_mmap`); large records check residency (`mincore`) and split between mmap reads from `normal_mmap` and `pread()` via `pread_fd` (7.5).
+5. Not found if `payload_bits == STORE_NOT_FOUND` (Tombstone).
+6. Fetch the Tier 2 record from `payload_bits`. For Immutable Region offsets (`< read_only_offset`), small records read directly from `random_mmap` while large records (`> 1 page`) use bounded `pread()` via `pread_fd` (7.5).
 7. Compare the Tier 2 record's full key, returning the value on match. Not found otherwise.
 
 ```mermaid
@@ -153,28 +154,26 @@ flowchart TD
     T -- inline value --> RV([return payload])
     T -- offset --> SZ{size hint?}
     SZ -- "≤1 page" --> B[random_mmap\nMADV_RANDOM]
-    SZ -- ">1 page" --> MC{mincore resident?}
-    MC -- yes --> MS[normal_mmap]
-    MC -- no --> PF([pread via pread_fd])
+    SZ -- ">1 page" --> PF([pread via pread_fd])
 ```
 
 **Complexity**
 
-- `O(1) + O(log |t1.sorted_region|)` expected
+- `O(1) + O(log |t1.sorted_run|)` expected
 
 ### 3.2 Insert
 
 **Procedure**
 
 1. Run `Get(full_key)`; continue if no existing entry.
-2. Write a new `ValueRecord` at Tier 2's `bytes_used`, obtaining the logical `offset`.
-3. Build `IndexEntry{key_prefix, hash, payload_bits}` and add it to Tier 1's `append_region`.
+2. Write a new `ValueRecord` at Tier 2's `tail_offset`, obtaining the logical `offset`.
+3. Build `IndexEntry{key_prefix, hash, payload_bits}` and add it to Tier 1's `Active MemTable`.
 4. Append an insert record to the WAL and `fsync`. Success returns to the caller only after this `fsync` completes.
 
 **Failure Rule**
 
 - WAL-append only after Tier 1 / Tier 2 application (2.–3.) is confirmed successful. Never log operations that exceptions/failures left incomplete.
-- Capacity shortage at 2. (`bytes_used + required_bytes > bytes_capacity`) fails the operation and logs nothing to the WAL (2.2).
+- Capacity shortage at 2. (`tail_offset + required_bytes > capacity`) fails the operation and logs nothing to the WAL (2.2).
 
 ### 3.3 Update
 
@@ -182,8 +181,8 @@ flowchart TD
 
 1. Locate the target entry with `Get(full_key)`. Not found if absent.
 2. Look at Tier 2's existing record.
-3. If `new_value_len <= alloc_len`, update the Tier 2 record in place.
-4. Otherwise add a new record at Tier 2's `bytes_used`, obtain the new `offset`, and rewrite the corresponding `IndexEntry.payload_bits` on Tier 1.
+3. If `new_value_len <= alloc_len`, update the Tier 2 Mutable-Region record in place.
+4. Otherwise add a new record at Tier 2's `tail_offset`, obtain the new `offset`, and rewrite the corresponding `IndexEntry.payload_bits` on Tier 1.
 5. Append an update record to the WAL and `fsync`. Success returns to the caller only after this `fsync` completes.
 
 **Notes**
@@ -191,14 +190,14 @@ flowchart TD
 - The old Tier 2 record is not deleted on the spot.
 - The old Tier 2 record becomes unreachable from Tier 1; physical reclamation is specified in `t2_compaction_design.md`.
 - Failure Rule as in 3.2: never log operations whose 2.–4. failed.
-- Step 3's in-place decision also includes the `offset >= base_boundary` and `offset >= capture watermark` conditions (2.2). Updates to records below either boundary take the step-4 append path unconditionally, even when `new_value_len <= alloc_len` fits. The base region's dedicated-mmap direct-read paths (7.5) depend on "never rewritten", so this holds. When `offset < base_boundary`, keys $\le$ 16 bytes (`t1_detail::kPrefixBytes`) fall through to the append path immediately without reading SSD base data, because T1 prefix containment guarantees full-key identity without seqlock or page faults. Keys $> 16$ bytes verify the full key via `try_read_base_record()` to eliminate hash collision false positives before appending. `base_boundary` is an atomic advanced only by `checkpoint_internal()` (2.2), and this check is safe as a single atomic load — reading a stale value during advancement only ever errs safe (tail-side = append path) and never wrongly permits in-place writes into the base region.
+- Step 3's in-place decision also includes the `offset >= read_only_offset` and `offset >= watermark_` conditions (2.2). Updates to records below either boundary take the step-4 copy-on-write append path unconditionally, even when `new_value_len <= alloc_len` fits. The Immutable Region's dedicated-mmap direct-read paths (7.5) depend on "never rewritten", so this holds. When `offset < read_only_offset`, keys $\le$ 16 bytes (`t1_detail::kPrefixBytes`) fall through to the append path immediately without reading SSD immutable data, because T1 prefix containment guarantees full-key identity without seqlock or page faults. Keys $> 16$ bytes verify the full key via `try_read_immutable_record()` to eliminate hash collision false positives before appending. `read_only_offset` advances atomically only through `checkpoint_internal()` (2.2).
 
 ### 3.4 Delete
 
 **Procedure**
 
 1. Locate the target entry with `Get(full_key)`. Not found if absent.
-2. Rewrite the corresponding `IndexEntry.payload_bits` on Tier 1 to `STORE_NOT_FOUND`.
+2. Rewrite the corresponding `IndexEntry.payload_bits` on Tier 1 to `STORE_NOT_FOUND` (Tombstone).
 3. Append a delete record to the WAL and `fsync`. Success returns to the caller only after this `fsync` completes.
 
 **Notes**
@@ -211,8 +210,8 @@ flowchart TD
 
 **Procedure**
 
-1. Walk Tier 1's `append_region`, gathering in-range `IndexEntry`s as candidates.
-2. Binary-search Tier 1's `sorted_region` by `key_prefix`, enumerating in-range candidates.
+1. Walk Tier 1's `MemTable` generations, gathering in-range `IndexEntry`s as candidates.
+2. Binary-search Tier 1's `sorted_run` by `key_prefix`, enumerating in-range candidates.
 3. Confirm `payload_bits != STORE_NOT_FOUND` per candidate. Inline entries restore the value by byte-copying `payload_bits` per `inline_size`, restoring the key by trimming trailing zeros of the 16-byte prefix.
 4. Read T2 records sequentially for non-inline candidates in T1's yield (key) order.
 5. Fetch Tier 2 records from `payload_bits`.
@@ -230,7 +229,7 @@ flowchart TD
 
 `bulk_load()` ingests entries via `write_entry_lockfree()`, bypassing the WAL.
 No post-crash durability guarantee; only portions followed by `checkpoint()`
-become durable. T1-only reorganize fires normally on the soft threshold. T2
+become durable. T1-only `reorganize` fires normally on the soft threshold. T2
 appends mark their T1 shards dirty for background compaction, which can process
 them while ingestion continues. Concurrent calls with other writers are
 disallowed. Ingest pacing is throttled by `CgroupMemoryThrottle` under cgroup v2
@@ -240,72 +239,70 @@ memory pressure.
 
 ### 4.1 Purpose
 
-`reorganize` resolves Ordering Fragmentation: Tier 1 `append_region` growth inflates candidate search/verification cost, slowing Get / Scan.
+`reorganize()` (In-Memory Compaction) resolves Ordering Fragmentation: Tier 1 `Active MemTable` growth inflates candidate search/verification cost, slowing Get / Scan.
 
-Tier 2 also holds Storage Fragmentation (old Tier 2 records unreferenced from Tier 1 from delete and append-update, plus key-order vs physical-offset correlation decay from out-of-place writes). `checkpoint_internal()` (4.3) does not resolve it; T2 compaction (`t2_compaction_design.md`) does.
+Tier 2 also holds Storage Fragmentation (old Tier 2 records unreferenced from Tier 1 from delete and COW update, plus key-order vs physical-offset correlation decay from out-of-place writes). `checkpoint_internal()` (4.3) does not resolve it; T2 compaction (`t2_compaction_design.md`) does.
 
 ### 4.2 T1 Reorganize
 
-T1 `reorganize` runs independently of T2.
+T1 `reorganize()` runs independently of T2.
 
 **Input**
 
-- Current `t1.sorted_region`
-- Current `t1.append_region`
+- Current `t1.sorted_run`
+- Current `t1.memtable_active` (frozen to `memtable_immutable`)
 
 **Output**
 
-- New `t1.sorted_region`
-- Empty `t1.append_region`
+- New `t1.sorted_run`
+- Fresh empty `t1.memtable_active`
 
 **Procedure**
 
-1. Read out all `IndexEntry`s of `sorted_region` and `append_region`.
-2. Drop entries with `payload_bits == STORE_NOT_FOUND`.
-3. Sort by `key_prefix`.
-4. Resolve duplicate keys as needed.
-5. Build the new `sorted_region`.
-6. Empty `append_region`.
-7. Fully clear (reinitialize empty) the hash index (`append_index`) tied to `append_region`.
+1. Read out all `IndexEntry`s of `sorted_run` and `memtable_immutable`.
+2. Drop entries with `payload_bits == STORE_NOT_FOUND` (Tombstones).
+3. Sort by `key_prefix` + clean hash.
+4. Resolve duplicate keys (keeping newer MemTable version).
+5. Build the new `sorted_run`.
+6. Reclaim the old `MemTable` generation after `EpochDomain` drain.
 
 **Effect**
 
 - Resolves Ordering Fragmentation.
-- Removes deleted entries from Tier 1.
+- Removes tombstoned entries from Tier 1.
 
 ### 4.3 T2 Checkpoint (`checkpoint_internal()`)
 
 Entries inlined entry-level (2.1.1, 7.2) never touch Tier 2 and are outside this procedure's scope.
 
-`checkpoint_internal()` persists the tail region (`[old_base_boundary, bytes_used)`) of Tier 2's single persistent file with `msync()` and commits the matching T1 checkpoint and manifest. T2 repack and segment reclamation run in the background (see 4.5).
+`checkpoint_internal()` persists the Mutable Region (`[old_read_only_offset, tail_offset)`) of Tier 2's single persistent file with `msync()` and commits the matching T1 checkpoint chunks and `MANIFEST`. T2 repack and segment reclamation run in the background (see 4.5).
 
 **Input**
 
-- Dirty pages in Tier 2's `[old_base_boundary, bytes_used)`
-- T1's current `append_region`
+- Dirty pages in Tier 2's `[old_read_only_offset, tail_offset)`
+- T1's per-shard `Sorted Run` + `MemTable`
 
 **Output**
 
-- Advanced `base_boundary`
-- T1 checkpoint file (5.4)
+- Advanced `read_only_offset`
+- T1 checkpoint chunk files (5.4) + `MANIFEST`
 
 **Procedure**
 
 1. Read `checkpoint_lsn = wal.next_lsn() - 1` (5.3).
-2. Briefly stop new appends (`stop_writers_and_wait()`), fixing `bytes_used` at this point as `target`.
+2. Briefly stop new appends (`stop_writers_and_wait()`), fixing `tail_offset` at this point as `target`.
 3. Immediately resume new appends (`resume_writers()`). In-place updates never stop during this procedure.
-4. Store `target` in `capture_watermark_` and drain in-flight in-place writes to the target range with `InPlaceUpdateBarrier::wait_until_retired(target)`. Later in-place updates are allowed only at `offset >= base_boundary` and `offset >= capture_watermark_`.
-5. `msync(MS_SYNC)` `[old_base_boundary, target)` in chunks of `kMsyncChunkBytes` (64 MiB), yielding (`std::this_thread::yield()`) between chunks. Round the start down to a page boundary; tolerate redundant re-syncs overlapping the previous cycle as idempotent.
-6. Per shard, merge `append_region` into `sorted_region` via `checkpoint_all_shards()` (empty-append sorted-dump shortcut, pause+retry mid-split), writing out the T1 checkpoint file (temp + `rename`, 5.4). Pass the identity mapping that never rewrites `payload_bits`.
-7. Read the current `bytes_used` frontier (covering every offset the step-6 snapshot names) and write it with `checkpoint_lsn` to the manifest (5.3).
-8. Atomically advance `base_boundary` to `target`.
+4. Store `target` in the fuzzy `watermark_` and drain in-flight in-place writes to the target range with `InPlaceUpdateBarrier::wait_until_retired(target)`. Later in-place updates are allowed only at `offset >= read_only_offset` and `offset >= watermark_`.
+5. `msync(MS_SYNC)` `[old_read_only_offset, target)` in chunks of `kMsyncChunkBytes` (64 MiB), yielding (`std::this_thread::yield()`) between chunks. Round the start down to a page boundary; tolerate redundant re-syncs overlapping the previous cycle as idempotent.
+6. Per shard, merge `MemTable` into `sorted_run` via `checkpoint_all_shards()` (empty-MemTable sorted-dump shortcut, pause+retry mid-split), writing out dirty/coalesced T1 checkpoint chunk files (`VLK2`, temp + `rename`, 5.4). Pass the identity mapping that never rewrites `payload_bits`.
+7. Write `target` with `checkpoint_lsn` and chunk metadata to `<t2>.manifest` (5.3).
+8. Atomically advance `read_only_offset` to `target`.
 9. Call `Wal::rotate_segment()` (5.5). No arguments. Generation-sequence switching only; `checkpoint_lsn` is not passed.
 
 **Effect**
 
-- Persists Tier 2's tail region, advancing `base_boundary`.
-
-- Merges T1's `append_region`, updating the T1 checkpoint file.
+- Persists Tier 2's Mutable Region, advancing `read_only_offset`.
+- Flushes T1 `MemTable`s and updates T1 checkpoint chunks + `MANIFEST`.
 - Does not resolve Storage Fragmentation (4.1).
 
 ```mermaid
@@ -315,11 +312,11 @@ sequenceDiagram
     participant T2 as Tier 2
     participant T1 as T1
     Note over C,W: appends pause only to record the target offset
-    C->>W: pause appends, record target = bytes_used
+    C->>W: pause appends, record target = tail_offset
     C->>W: resume appends (in-place updates never stop)
-    C->>T2: chunked msync [old boundary, target) with yield
-    C->>T1: merge append to sorted, write T1 chk file
-    C->>C: publish manifest, advance base_boundary
+    C->>T2: chunked msync [old read_only_offset, target) with yield
+    C->>T1: merge MemTable to Sorted Run, write T1 chk chunks
+    C->>C: publish MANIFEST, advance read_only_offset
     C->>C: rotate WAL past checkpoint_lsn
 ```
 
@@ -332,45 +329,45 @@ $$\text{Checkpoint\_Trigger} = \text{WAL\_Bytes} \ge \text{WAL\_MAX\_BYTES} \lor
 * **`WAL_MAX_BYTES`**: 64 MiB appended to the WAL since the last checkpoint, bounding startup WAL replay time. Fires immediately.
 * **`Backlog_Cap_Reached`**: queued punch candidates $\ge$ 1,058 segments (`kPunchBacklogCheckpointCapSegments`), bounding unreclaimed space.
 * **`Force`**: explicit `checkpoint()` call.
-* The public API is **`reorganize()`** (T1-only in-memory merge, untouched T2, no checkpoint) and **`checkpoint()`**. `checkpoint()` calls `checkpoint_internal()`.
+* The public API is **`reorganize()`** (T1-only in-memory compaction, untouched T2, no checkpoint) and **`checkpoint()`**. `checkpoint()` calls `checkpoint_internal()`.
 
 | API | Effect |
 |---|---|
-| `reorganize()` | T1 Append→Sorted merge only. No T2/disk involvement |
-| `checkpoint()` | Persists Tier 2's tail in place, commits the manifest, rotates the WAL |
+| `reorganize()` | T1 `MemTable` → `Sorted Run` compaction only. No T2/disk involvement |
+| `checkpoint()` | Persists Tier 2's Mutable Region in place, commits `MANIFEST`, rotates WAL |
 
 ### 4.5 T2 Compaction
 
 The T2 maintenance worker restores 4KiB page locality for scans and reclaims sparse 8MiB segments through a single primitive: **whole-shard key-ordered repack (`repack_dirty_shard`)**.
-- **Dirty-shard repack (`dirty_queue_`)**: Shards receiving T2 offset writes are enqueued in $O(1)$ on their first write. The worker checks in RAM whether the shard's live entries are already 4KiB-page-local; if not (or if any entry overlaps a frozen garbage segment), the entire shard is rewritten contiguously in full-key order to the T2 append frontier.
+- **Dirty-shard repack (`dirty_queue_`)**: Shards receiving T2 offset writes are enqueued in $O(1)$ on their first write. The worker checks in RAM whether the shard's live entries are already 4KiB-page-local; if not (or if any entry overlaps a frozen garbage segment), the entire shard is rewritten contiguously in full-key order to `tail_offset`.
 - **Garbage-segment evacuation (`garbage_head_`)**: When overwrites or deletes reduce a segment's live bytes below 50% of `kSegmentBytes` ($< 4\,\text{MiB}$), `subtract_segment()` pushes the segment onto `garbage_head_` in $O(1)$. The worker visits T1 shards and runs the same `repack_dirty_shard()` on any shard overlapping a frozen garbage segment, emptying the source segment.
 
 Relocations update T1 via stripe-locked CAS without emitting WAL records. Hole punching reclaims 8MiB segments whose live-byte count is zero after an epoch gate (two completed checkpoints). See `t2_compaction_design.md` and `background_jobs.md` for full design and coordination details.
 
 ### 4.6 T1 Reorganize Auto-Trigger
 
-Each shard's `append_region` is watched independently by a dedicated background worker thread pool. When a shard's `append_size()` reaches `maintenance_soft_threshold(append_capacity)` or its referenced T2 bytes reach `kSegmentBytes` (8 MiB), that shard enters the maintenance queue, and a worker runs `reorganize()` (splitting when live entries exceed the entry-count threshold or `kSegmentBytes` of referenced T2 bytes). Neither other shards nor caller threads block. For delete-heavy cases where append never swells, `tombstones_since_maintenance >= target_shard_size` also enqueues. See [`t1_sharding_design.md`](t1_sharding_design.md)'s background-worker-thread-pool section.
+Each shard's `Active MemTable` is watched independently by a dedicated background worker thread pool. When a shard's `memtable_size()` reaches `maintenance_soft_threshold(memtable_capacity)` or its referenced T2 bytes reach `kSegmentBytes` (8 MiB), that shard enters the maintenance queue, and a worker runs `reorganize()` (splitting when live entries exceed the entry-count threshold or `kSegmentBytes` of referenced T2 bytes). Neither other shards nor caller threads block. For delete-heavy cases where MemTable never swells, `tombstones_since_maintenance >= target_shard_size` also enqueues. See [`t1_sharding_design.md`](t1_sharding_design.md)'s background-worker-thread-pool section.
 
 ## 5. Checkpoint Reload
 
 ### 5.1 Motivation
 
-T2's live mmap is `MAP_SHARED` (NOTE below). Writes land directly in the page cache, so `checkpoint_internal()` (4.3) only settles tail-region reflection to physical disk with `msync()`. At boot, with a valid checkpoint (manifest), the same persistent file is directly `mmap`ed and adopted as the live one.
+T2's live mmap is `MAP_SHARED` (NOTE below). Writes land directly in the page cache, so `checkpoint_internal()` (4.3) only settles Mutable-Region reflection to physical disk with `msync()`. At boot, with a valid checkpoint (`MANIFEST`), the same persistent file is directly `mmap`ed and adopted as the live one.
 
 > [!NOTE]
 > T2's mmap uses `MAP_SHARED | MAP_NORESERVE | PROT_READ | PROT_WRITE`. `MAP_NORESERVE` keeps the kernel from bulk-reserving swap at mmap time. This avoids ENOMEM when securing virtual address space far beyond physical RAM (e.g. 64 GB). Physical pages allocate on demand at access time and swap out normally.
 
 ### 5.2 Flow (Startup)
 
-1. Read the manifest. With none, or on read failure, create Tier 2's persistent file anew and replay the whole WAL from LSN 1 (skip the rest).
-2. `mmap` Tier 2's persistent file, adopting `base_boundary` = `manifest.t2_bytes_used`.
-3. Read the T1 checkpoint file (5.4), rebuilding the directory and each shard's `sorted_region`.
+1. Read the `MANIFEST`. With none, or on read failure, create Tier 2's persistent file anew and replay the whole WAL from LSN 1 (skip the rest).
+2. `mmap` Tier 2's persistent file, adopting `read_only_offset` = `tail_offset` = `manifest.t2_bytes_used`.
+3. Read the T1 checkpoint chunks (5.4), rebuilding the directory and each shard's `sorted_run`.
 4. Replay the WAL tail from after `checkpoint_lsn` to the end.
 
 **Hash Index Lifecycle in Checkpoint**
 
-- Right after checkpoint `append_region` is empty (size = 0), so the T1 checkpoint file sequentially writes only `sorted_region` data; the `append_index` state itself is never serialized (persisted).
-- At boot, a freshly mapped T1 instance starts with `append_index` initialized empty, registering/updating the hash index as WAL replay and new client writes require.
+- Right after checkpoint each MemTable is empty (`size = 0`), so the T1 checkpoint chunks sequentially write only `sorted_run` data; the `MemTableIndex` state itself is never persisted.
+- At boot, freshly rebuilt shards start with empty `MemTableIndex`es, registering entries as WAL tail replay and new client writes require.
 
 ```mermaid
 flowchart TD
@@ -487,22 +484,22 @@ The table below defines concurrent-execution eligibility and handling per operat
 
 #### T1 Reorganize vs Readers
 
-- Get / Scan may run concurrently with T1 `reorganize`.
+- Get / Scan may run concurrently with T1 `reorganize()`.
 - Readers must keep consistency by either
-  - reading through the old `sorted_region` / `append_region` snapshot
+  - reading through the old `sorted_run` / `memtable` snapshot
   - or detecting the switch and retrying.
 
 #### T1 Reorganize vs Writers
 
-- Insert / Update / Delete may run concurrently with T1 `reorganize`.
+- Insert / Update / Delete may run concurrently with T1 `reorganize()`.
 - Writes a writer issues against old-generation buffers (reserve & publish) are fully drained by the first-stage epoch sync barrier (`wait_until_epoch`) the merge thread runs before starting the merge. This distributes every in-flight update safely to old or new generation with no writer-side retry or explicit lock sync, losing no data.
-- This drain covers only `append_region` (active/immutable generation switching). In-place updates to keys **already in `sorted_region`** are guarded by a separate mechanism (`FreezableRegion`): between a merge snapshotting that key's value and publishing the new `sorted_region`, writes to that key pass through `sorted_region` (treated undetected) and bypass into an append to the new `append_region`. Without bypass, in-place updates landing after the snapshot but before publish would miss the new `sorted_region` and silently drop (Lost Update).
+- This drain covers only `MemTable` (active/immutable generation switching). In-place updates to keys **already in `sorted_run`** are guarded by a separate mechanism (`FreezableRegion`): between a merge snapshotting that key's value and publishing the new `sorted_run`, writes to that key pass through `sorted_run` (treated undetected) and bypass into the fresh `Active MemTable`. Without bypass, in-place updates landing after the snapshot but before publish would miss the new `sorted_run` and silently drop (Lost Update).
 
 #### Checkpoint vs All Operations
 
 - Checkpoint only briefly stops new appends; in-flight in-place updates and record relocation need nothing.
-- New appends pause issuance only during `stop_writers_and_wait()`'s window, resuming once `bytes_used` is fixed.
-- `base_boundary` advances only after the manifest's `rename()` completes (5.3).
+- New appends pause issuance only during `stop_writers_and_wait()`'s window, resuming once `tail_offset` is fixed.
+- `read_only_offset` advances only after the manifest's `rename()` completes (5.3).
 
 ### 6.5 Implementation Contract
 
@@ -510,7 +507,7 @@ This document does not mandate mutex-free implementation. The requirement is sat
 
 ## 7. Optimizations
 
-Adaptive covering, Bloom filter, Group Commit, `MADV_RANDOM`, base-region-only read paths, and page-contained layout are enabled in the system configuration.
+Adaptive covering, Bloom filter, Group Commit, `MADV_RANDOM`, immutable-region read paths, and page-contained layout are enabled in the system configuration.
 
 ### 7.1 Group Commit
 
@@ -549,7 +546,7 @@ T1's index slots lack spare bit area, so the 64-bit hash field's (`hash`) top 4 
 
 ### 7.3 Sorted Bloom Filter
 
-Grants a Bloom filter over the whole `sorted_region`, speeding negative lookups.
+Grants a Bloom filter over the whole `sorted_run`, speeding negative lookups.
 
 The Bloom filter is enabled by every `vmemkv::Config` configuration.
 
@@ -557,17 +554,17 @@ The Bloom filter is enabled by every `vmemkv::Config` configuration.
 
 Right after mapping Tier 2's main mmap (`random_mmap`, 2.2), calls `madvise(..., MADV_RANDOM)` to suppress kernel readahead (read-ahead) and kernel-space memory-bus bandwidth waste, optimizing random-access performance. Always on; no disable path exists.
 
-### 7.5 Base-Region-Only Read Paths for Scan/Get
+### 7.5 Immutable-Region Read Paths for Scan/Get
 
-T2's "base" region (2.2) never changes after writing, so it reads directly from dedicated read paths bypassing the main mmap's `MADV_RANDOM` (7.4), needing no seqlock retry (3.3's forced base-region detour for in-place updates guarantees this invariance).
+T2's Immutable Region (`< read_only_offset`, 2.2) never changes after writing, so it reads directly from dedicated read paths bypassing the main mmap's `MADV_RANDOM` (7.4), needing no seqlock retry (3.3's forced immutable-region COW detour for in-place updates guarantees this invariance).
 
-- **Premise T2 changes**: base/tail split (2.2) and forced base-region detour for in-place updates (3.3).
-- **One record's own length (2.1's Embedded Block Count) selects among the 3 mmap paths plus the pread fallback**. madvise is a VMA (whole-mapping) attribute, not a per-read one, so serving both small and large records well takes multiple paths. Every path points at the same byte run, so a wrong choice only mismatches the readahead policy — data never corrupts:
-  - `random_mmap` (main mmap, `MADV_RANDOM`): Get reads of sub-page records. One-op-one-record random access never pays readahead back, so read directly with no seqlock, mincore, or pread.
+- **Premise**: Immutable/Mutable split (2.2) and forced immutable-region COW detour for in-place updates (3.3).
+- **One record's own length (2.1's Embedded Block Count) selects among the 3 mmap paths plus `pread_fd`**. `madvise` is a VMA (whole-mapping) attribute, not a per-read one, so serving both small and large records well takes multiple paths. Every path points at the same byte run, so a wrong choice only mismatches the readahead policy — data never corrupts:
+  - `random_mmap` (main mmap, `MADV_RANDOM`): Get reads of sub-page records. One-op-one-record random access never pays readahead back, so read directly with no seqlock or pread.
   - `sequential_mmap` (read-only mmap, `MADV_SEQUENTIAL`): Scan reads of sub-page records. A wide readahead window folds many small records' faults into few major faults. Get's read-policy ablation (`SeqOnly`) also pins here.
-  - `normal_mmap` (read-only mmap, kernel default (adaptive) readahead policy): Scan reads of over-page records, and among `get_impl()` large-record reads those with confirmed page-cache residency (`mincore()`).
-  - `pread_fd` (via a `dup()`ed file descriptor, `pread()`): `get_impl()` large-record reads where the above page-cache residency check failed, reading trimmed to just that one record.
-- Read-policy pins (`ReadPolicyRandomOnly`, `ReadPolicySeqOnly`, `ReadPolicyNormalOnly`, `ReadPolicyPreadOnly`) force every base-region read through one handle for ablation: `NormalOnly` always uses the plain mapping, `PreadOnly` always preads into a thread-local scratch buffer (falling back to the seqlock path only when pread itself is unavailable). Tail-region reads keep the seqlock path under every policy.
+  - `normal_mmap` (read-only mmap, kernel default adaptive readahead policy): Scan reads of over-page records.
+  - `pread_fd` (via a `dup()`ed file descriptor, `pread()`): `get_impl()` large-record reads (`> 1 page`), issuing a single bounded read sized by the T1 size hint instead of multi-page synchronous faults.
+- Read-policy pins (`ReadPolicyRandomOnly`, `ReadPolicySeqOnly`, `ReadPolicyNormalOnly`, `ReadPolicyPreadOnly`) force every immutable-region read through one handle for ablation: `NormalOnly` always uses the plain mapping, `PreadOnly` always preads into a thread-local scratch buffer (falling back to the seqlock path only when pread itself is unavailable). Mutable-region reads keep the seqlock path under every policy.
 - `Scan` uses the master corpus shared with other Ops.
 
 ### 7.6 Recommended Paging Regime
@@ -578,13 +575,13 @@ For LTM operation, classic LRU (MGLRU disabled) is recommended. MGLRU (Multi-Gen
 
 | Parameter | Meaning |
 | --- | --- |
-| `kAppendCapacityEntries` | Per-shard `append_region` capacity (entries) |
+| `kMemTableCapacityEntries` | Per-shard `MemTable` capacity (entries) |
 | `kShardTargetSizeEntries` | Fallback target live entries per shard (for inline/standalone T1). Background workers split shards reaching `kShardSplitThresholdPercent`% of this value or `kSegmentBytes` of referenced T2 live bytes |
 | `kShardSplitThresholdPercent` | Split-fire threshold (%) against `kShardTargetSizeEntries` |
 | `kDefaultCapacityBytes` | Tier 2 maximum virtual address space |
 | `kMaxBytesSinceCheckpoint` | Cap on WAL-accumulated bytes since the last checkpoint. Exceeding promotes to checkpoint() |
 | `kSegmentBytes` | Tier 2 fixed segment length (8 MiB) and T1 shard T2-byte split threshold. Not a tuning knob |
 | `kCompactionMaxMoveBytesPerCycle` | Per-compaction-cycle T2 relocation budget (bytes). A single T1 shard is the indivisible unit |
-| `maintenance_soft_threshold` | 50% of shard append capacity. Background maintenance enqueue threshold |
+| `maintenance_soft_threshold` | 50% of shard MemTable capacity. Background maintenance enqueue threshold |
 | `kWalCheckStride` | WAL size-trigger sampling interval. Every 64 writes |
 | `T1` background worker pool size | No configuration knob. Default max(1, hardware_concurrency/4) |

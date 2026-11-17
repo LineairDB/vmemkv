@@ -89,13 +89,13 @@ auto T2FlatFile::append_default(const T2Memory *mem,
                                 std::span<const std::byte> value) -> uint64_t {
   const uint64_t required = vmemkv::record_aligned_len(sizeof(ValueRecordHeader), key.size(), value.size());
 
-  uint64_t frontier = mem->bytes_used.load(std::memory_order_relaxed);
+  uint64_t frontier = mem->tail_offset.load(std::memory_order_relaxed);
   while (true) {
     const uint64_t skip = page_skip_bytes(frontier, required);
     if (frontier + skip + required > mem->capacity) {
       throw std::runtime_error("T2 storage capacity exceeded");
     }
-    if (mem->bytes_used.compare_exchange_weak(frontier, frontier + skip + required, std::memory_order_relaxed)) {
+    if (mem->tail_offset.compare_exchange_weak(frontier, frontier + skip + required, std::memory_order_relaxed)) {
       const uint64_t offset = frontier + skip;
       write_record(mem->reads.random_mmap + offset, key, value);
       return offset;

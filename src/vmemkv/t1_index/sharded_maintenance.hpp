@@ -17,8 +17,6 @@
 namespace vmemkv::sharded_detail {
 
 inline constexpr size_t kPercentScale = 100;
-inline constexpr uint64_t kPayloadSizeShift = 48;
-inline constexpr uint64_t kRecordBlockAlignment = 16;
 
 // Pure split-size threshold shared by run_maintenance().
 inline auto split_threshold(size_t target_shard_size, uint32_t percent) noexcept -> size_t {
@@ -30,7 +28,7 @@ inline auto payload_t2_bytes(uint64_t payload_bits, bool is_inline) noexcept -> 
   if (payload_bits == STORE_NOT_FOUND || is_inline) {
     return 0;
   }
-  return (payload_bits >> kPayloadSizeShift) * kRecordBlockAlignment;
+  return vmemkv::t2_detail::payload_hint_bytes(payload_bits);
 }
 
 template <typename EntryRange>

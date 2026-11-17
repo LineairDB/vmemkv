@@ -375,7 +375,7 @@ TEST_CASE("checkpoint with concurrent appends recovers all keys") {
       REQUIRE(store->insert("base_" + std::to_string(i), big_value));
     }
     store->checkpoint();
-    store->impl().reorganize_internal(ImplT::ReorgMode::Checkpoint, vmemkv::NoOpPreStopHook{}, [&] {
+    store->impl().reorganize_internal(ImplT::MaintenanceMode::Checkpoint, vmemkv::NoOpPreStopHook{}, [&] {
       for (int i = 0; i < kLateKeys; ++i) {
         if (!store->insert("late_" + std::to_string(i), late_value)) {
           throw std::runtime_error("late append failed");

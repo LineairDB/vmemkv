@@ -39,24 +39,24 @@ flowchart TB
 
 | Subsystem | Primary Guarantee | Execution Model | Trigger Mechanism |
 |---|---|---|---|
-| **T1 Shard Reorganize** | Preserves $O(\log N)$ binary search latency, L2 cache locality, and $\le 8\,\text{MiB}$ T2 bytes per shard. | Per-shard worker thread pool (`workers_`, isolated per shard, zero I/O). | Shard `append_size()` reaches soft threshold ($50\%$ of append capacity, i.e., $16384$ entries), tombstone threshold, or `approx_t2_bytes` $\ge 8\,\text{MiB}$. |
-| **T2 Maintenance** | Bounds WAL replay ($\le 64\,\text{MiB}$), freezes immutable T2 base data, restores 4KiB scan locality, and reclaims sparse 8MiB segments. | Single dedicated background worker (`t2_worker_`). | **Checkpoint**: WAL $\ge 64\,\text{MiB}$ or punch backlog $\ge 1058$ segs (10ms poll).<br>**Compaction & Punch**: `dirty_queue_`, `garbage_head_`, or `punch_head_` (1s idle cadence; continuous while garbage segments remain). |
+| **T1 Shard Reorganize** | Preserves $O(\log N)$ binary search latency, L2 cache locality, and $\le 8\,\text{MiB}$ T2 bytes per shard. | Per-shard worker thread pool (`workers_`, isolated per shard, zero I/O). | Shard `memtable_size()` reaches soft threshold ($50\%$ of MemTable capacity, i.e., $16384$ entries), tombstone threshold, or `approx_t2_bytes` $\ge 8\,\text{MiB}$. |
+| **T2 Maintenance** | Bounds WAL replay ($\le 64\,\text{MiB}$), freezes T2 Immutable Region (`read_only_offset`), restores 4KiB scan locality, and reclaims sparse 8MiB segments. | Single dedicated background worker (`t2_worker_`). | **Checkpoint**: WAL $\ge 64\,\text{MiB}$ or punch backlog $\ge 1058$ segs (10ms poll).<br>**Compaction & Punch**: `dirty_queue_`, `garbage_head_`, or `punch_head_` (1s idle cadence; continuous while garbage segments remain). |
 
 ---
 
 ## 2. Tier-1 Shard Reorganize
 
 ### 2.1 Purpose & Guarantees
-Tier-1 index shards receive new inserts into an unsorted `append_region`. Unchecked growth inflates lookup and scan costs from $O(1) + O(\log N)$ toward $O(N_{\text{append}})$. T1 Reorganize guarantees:
-- Bounded append size: Restores pure $O(\log N)$ sorted lookup performance.
+Tier-1 range shards receive new inserts into an unsorted `Active MemTable` (`memtable_active_`). Unchecked growth inflates lookup and scan costs from $O(1) + O(\log N)$ toward $O(N_{\text{memtable}})$. T1 Reorganize guarantees:
+- Bounded MemTable size: Restores pure $O(\log N)$ sorted lookup performance.
 - Tombstone reclamation: Purges deleted entries without leaving lingering memory overhead.
 - Autonomous shard splitting: Halves oversized shards when merged entries exceed either the entry-count threshold or one T2 segment (`kSegmentBytes` = $8\,\text{MiB}$) of referenced T2 payload bytes.
 
 ### 2.2 Mechanism & Components
-- **Generation Switching**: The active append region rotates to an immutable generation under an atomic pointer swap, allowing concurrent writes to continue immediately into a fresh append buffer.
-- **Merge & Shard Split**: The worker merges the immutable append generation with the existing `sorted_region` into a new contiguous array. If the resulting entry count or referenced T2 byte sum exceeds the split threshold, the shard splits into two key-partitioned child shards.
-- **FreezableRegion (Lost-Update Protection)**: While a merge runs, in-place updates to keys present in the snapshot bypass the old array and append to the new active generation, preventing concurrent mutations from being overwritten by the merge output.
-- **Epoch Drain**: Old sorted and append buffers are deallocated only after all in-flight readers exit via hazard/epoch tracking (`with_epoch_guard`).
+- **Generation Switching**: The `Active MemTable` rotates to `Immutable MemTable` under an atomic pointer swap, allowing concurrent writes to continue immediately into a fresh MemTable buffer.
+- **Merge & Shard Split**: The worker merges the `Immutable MemTable` with the existing `Sorted Run` into a new contiguous array. If the resulting entry count or referenced T2 byte sum exceeds the split threshold, the shard splits into two key-partitioned child shards.
+- **FreezableRegion (Lost-Update Protection)**: While a merge runs, in-place updates to keys present in the snapshot bypass the old array and append to the fresh `Active MemTable`, preventing concurrent mutations from being overwritten by the merge output.
+- **Epoch Drain**: Old sorted and MemTable buffers are deallocated only after all in-flight readers exit via the store-wide `EpochDomain` (`ThreadReferenceTracker`).
 
 ---
 
@@ -64,13 +64,13 @@ Tier-1 index shards receive new inserts into an unsorted `append_region`. Unchec
 
 ### 3.1 Purpose & Guarantees
 Tier-2 storage operates over a `MAP_SHARED` sparse flat file. Mutations land directly in the Linux page cache. Checkpoint guarantees:
-- Durability: Flushes uncommitted page cache writes in `[old_base, target)` to physical storage.
+- Durability: Flushes uncommitted page cache writes in `[old_read_only_offset, target)` to physical storage.
 - Startup Bounding: Replays at most $64\,\text{MiB}$ of WAL logs on reboot.
-- Base Region Invariance: Advances `base_boundary`, rendering flushed T2 segments permanently immutable and enabling seqlock-free, direct zero-copy reads.
+- Immutable-Region Invariance: Advances `read_only_offset` (FASTER `ReadOnlyOffset`), rendering flushed T2 segments permanently immutable and enabling seqlock-free, direct zero-copy reads.
 
 ### 3.2 Mechanism & Components
 - **Chunked Synchronization**: Synchronizes dirty log ranges using `msync(MS_SYNC)` in chunks of $64\,\text{MiB}$ (`kMsyncChunkBytes`), cooperatively calling `std::this_thread::yield()` between chunks to prevent kernel I/O queue monopolization.
-- **Atomic Manifest Publication**: Writes the snapshot manifest to a temporary file and atomically replaces `manifest.json` via filesystem `rename()`.
+- **Atomic `MANIFEST` Publication**: Writes `<t2>.t1chk/chunk_*.chk` (`VLK2` files) and atomically replaces `<t2>.manifest` via filesystem `rename()`.
 - **WAL Log Rotation**: Truncates and advances active WAL log segments past the checkpointed LSN, recycling disk space.
 - **Trigger Condition**:
   $$\text{Checkpoint\_Trigger} = \text{WAL} \ge 64\,\text{MiB} \lor \text{Backlog} \ge 1058 \lor \text{Force}$$
@@ -103,11 +103,11 @@ const bool has_work =
 ```
 
 1. **Punch Evacuated Segments**: Drains `punch_head_` and punches empty segments whose evacuation epoch has passed the two-checkpoint gate.
-2. **Drain `dirty_queue_`**: Pops dirty shards and calls `repack_dirty_shard()`. If a shard's live entries are already 4KiB-page-local and do not touch any frozen garbage segment, it is skipped with zero T2 writes. Otherwise, all live entries in the shard are rewritten contiguously in full-key order to the T2 append frontier.
-3. **Evacuate Frozen Garbage Segments**: If budget remains and `garbage_head_` has frozen segments below `base_boundary`, the worker iterates shards via `for_each_shard_for_compaction()` and runs `repack_dirty_shard()` on any shard overlapping a frozen garbage segment. Once all shards have been inspected, `clear_garbage_segments()` clears the evacuated segments from `garbage_head_`.
+2. **Drain `dirty_queue_`**: Pops dirty shards and calls `repack_dirty_shard()`. If a shard's live entries are already 4KiB-page-local and do not touch any frozen garbage segment, it is skipped with zero T2 writes. Otherwise, all live entries in the shard are rewritten contiguously in full-key order to `tail_offset`.
+3. **Evacuate Frozen Garbage Segments**: If budget remains and `garbage_head_` has frozen segments below `read_only_offset`, the worker iterates shards via `for_each_shard_for_compaction()` and runs `repack_dirty_shard()` on any shard overlapping a frozen garbage segment. Once all shards have been inspected, `clear_garbage_segments()` clears the evacuated segments from `garbage_head_`.
 
 ### 4.4 Relocation & Epoch-Gated Hole Punching
-- **Stripe-Locked CAS Relocation**: Live records are copied to the append frontier in key order. T1 slot offsets are updated under the key's stripe lock with offset validation (`mark_t2_dirty = false`). If a concurrent foreground update has already modified the key, the relocation safely skips it.
+- **Stripe-Locked CAS Relocation**: Live records are copied to `tail_offset` in key order. T1 slot offsets are updated under the key's stripe lock with offset validation (`mark_t2_dirty = false`). If a concurrent foreground update has already modified the key, the relocation safely skips it.
 - **Hole Punching (`fallocate`)**: Empty 8MiB segments (`seg_live == 0`) enter `punch_head_`.
 - **Epoch Gate Rule**: A candidate segment is eligible for physical hole punching (`FALLOC_FL_PUNCH_HOLE`) only after two subsequent checkpoints have completed since evacuation (`evacuated_epoch + 1 < covered_through`). This guarantees that no concurrent readers or recovering boot processes can reference the deallocated physical offset.
 
@@ -119,13 +119,13 @@ const bool has_work =
 
 | Job A / Job B | T1 Shard Reorganize | T2 Maintenance (Checkpoint / Compaction) |
 |---|---|---|
-| **T1 Shard Reorganize** | Concurrent (independent per shard) | Serialized on `reorg_.running` against explicit/bg checkpoints; concurrent with compaction via T1 stripe locks |
-| **T2 Maintenance** | Serialized on `reorg_.running` for checkpoint; concurrent with compaction | Single worker thread (`t2_worker_`); explicit `checkpoint()` / `drain_compaction()` coordinate via `reorg_.running` and `compact_.running` |
+| **T1 Shard Reorganize** | Concurrent (independent per shard) | Serialized on `checkpoint_.running` against explicit/bg checkpoints; concurrent with compaction via T1 stripe locks |
+| **T2 Maintenance** | Serialized on `checkpoint_.running` for checkpoint; concurrent with compaction | Single worker thread (`t2_worker_`); explicit `checkpoint()` / `drain_compaction()` coordinate via `checkpoint_.running` and `compact_.running` |
 
 ### 5.2 Ordering & Safety Rules
-1. **Lock Hierarchy**: Key Stripe Lock $\rightarrow$ Shard Routing Guard $\rightarrow$ T2 Ownership Stack. Workers never acquire locks in reverse order.
+1. **Lock Hierarchy**: Key Stripe Lock $\rightarrow$ Shard Epoch Domain (`with_routing_guard`) $\rightarrow$ T2 Ownership Stack. Workers never acquire locks in reverse order.
 2. **Zero-WAL Relocation**: Compaction relocations never write to the WAL. Durability of relocated records is established exclusively through subsequent checkpoints.
-3. **Immutable Base Decoupling**: Checkpoint and Compaction exclusively mutate the tail region and base index pointers; the physical byte content of the base region remains completely immutable.
+3. **Immutable Region Decoupling**: Checkpoint and Compaction exclusively mutate the Mutable Region and index pointers; physical byte contents below `read_only_offset` remain completely immutable.
 
 ---
 

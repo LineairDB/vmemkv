@@ -26,7 +26,7 @@ using vmemkv_test::identity_offset_mapper;
 using vmemkv_test::to_span;
 
 // 1024-entry append region: holds this file's largest key count (800) without overflowing
-// before an explicit split -- these tests cover routing/splits, not AppendRegionFull
+// before an explicit split -- these tests cover routing/splits, not MemTableFull
 // backpressure (see test_t1_index.cpp).
 using TinyAppendConfig = vmemkv_test::TinyAppendConfig<10>;
 
@@ -35,7 +35,7 @@ using TestIndex = vmemkv::ShardedT1Index<TinyAppendConfig>;
 auto make_index() -> std::unique_ptr<TestIndex> { return std::make_unique<TestIndex>(); }
 
 auto make_index_with_target_size(size_t target_shard_size, size_t worker_threads = 2) -> std::unique_ptr<TestIndex> {
-  return std::make_unique<TestIndex>(TinyAppendConfig::kAppendCapacityEntries, target_shard_size, worker_threads);
+  return std::make_unique<TestIndex>(TinyAppendConfig::kMemTableCapacityEntries, target_shard_size, worker_threads);
 }
 
 // Fixed-width keys ("k" + zero-padded index) so boundary comparisons match numeric order.
@@ -325,7 +325,7 @@ TEST_CASE("ShardedT1Index: delete pressure triggers maintenance below the occupa
   // 400 live keys stay under the 50%-of-1024 occupancy trigger and the split threshold, so only
   // the tombstone count (400 deletes >= target 400) can request maintenance. Without the
   // delete-pressure trigger the tombstones would sit in append indefinitely; with it, a
-  // background merge drains append_size() to 0.
+  // background merge drains memtable_size() to 0.
   constexpr size_t kTargetShardSize = 400;
   constexpr int kKeyCount = 400;
   auto idx = make_index_with_target_size(kTargetShardSize, /*worker_threads=*/2);
@@ -333,18 +333,18 @@ TEST_CASE("ShardedT1Index: delete pressure triggers maintenance below the occupa
   for (int i = 0; i < kKeyCount; ++i) {
     CHECK(idx->put(to_span(ikey(i)), static_cast<uint64_t>(i)) == TestIndex::PutResult::Applied);
   }
-  CHECK(idx->append_size() > 0);
+  CHECK(idx->memtable_size() > 0);
   for (int i = 0; i < kKeyCount; ++i) {
     CHECK(idx->put(to_span(ikey(i)), vmemkv::STORE_NOT_FOUND) == TestIndex::PutResult::Applied);
   }
 
   for (int round = 0; round < 300; ++round) {
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    if (idx->append_size() == 0) {
+    if (idx->memtable_size() == 0) {
       break;
     }
   }
-  CHECK(idx->append_size() == 0);
+  CHECK(idx->memtable_size() == 0);
   CHECK(idx->shard_count() == 1);
   for (int i = 0; i < kKeyCount; ++i) {
     CHECK(idx->get(to_span(ikey(i))) == vmemkv::STORE_NOT_FOUND);
@@ -368,7 +368,7 @@ TEST_CASE("ShardedT1Index: checkpoint on clean shards matches a full merge") {
   CHECK(merged_total == static_cast<size_t>(kKeyCount));
 
   // No writes since: every shard's append region is empty, so this is the dump path throughout.
-  CHECK(idx->append_size() == 0);
+  CHECK(idx->memtable_size() == 0);
   const ShardSnapshot dumped = capture_all(*idx);
   CHECK(dumped.boundaries == merged.boundaries);
   REQUIRE(dumped.per_shard.size() == merged.per_shard.size());
@@ -596,7 +596,7 @@ TEST_CASE("ShardedT1Index: worker_threads=0 defers background maintenance until 
   // target 50 with 0 workers: puts land and cross thresholds, but nothing splits -- the
   // deferred-start contract for single-threaded setup (e.g. checkpoint load) before any
   // background thread may touch the instance.
-  auto idx = std::make_unique<TestIndex>(TinyAppendConfig::kAppendCapacityEntries,
+  auto idx = std::make_unique<TestIndex>(TinyAppendConfig::kMemTableCapacityEntries,
                                          /*target_shard_size=*/50,
                                          /*worker_threads=*/0);
   constexpr int kCount = 600;

@@ -57,7 +57,7 @@ The background compaction worker runs in a single-flight loop:
    CAS (`mark_t2_dirty = false`) without emitting WAL records.
 3. **Garbage-Segment Evacuation (`for_each_shard_for_compaction`)**:
    If movement budget remains (`moved_bytes < kCompactionMaxMoveBytesPerCycle`) and
-   `garbage_head_` holds any frozen segment below `base_boundary` (`has_garbage_segment`),
+   `garbage_head_` holds any frozen segment below `read_only_offset` (`has_garbage_segment`),
    the worker visits T1 shards and runs the same `repack_dirty_shard()` on any shard
    referencing a frozen garbage segment. Evacuating those shards drops the source
    segments' `seg_live_` to zero, moving them into `punch_head_`. Once all shards
@@ -82,12 +82,12 @@ filesystem via `fallocate(FALLOC_FL_PUNCH_HOLE)`:
 
 ## Checkpoint Coordination and Pacing
 
-Checkpoint durabilizes T2's tail region and updates the T1 index snapshot and
-manifest.
+Checkpoint durabilizes T2's Mutable Region and updates the T1 checkpoint chunks
+and `MANIFEST`.
 
 ### Subdivided Synchronization
 
-Checkpoint synchronizes `[old_base_boundary, target)` using `msync(MS_SYNC)`
+Checkpoint synchronizes `[old_read_only_offset, target)` using `msync(MS_SYNC)`
 subdivided into chunks of `kMsyncChunkBytes` (64 MiB). The coordinator yields
 execution (`std::this_thread::yield()`) between chunks to prevent writeback
 monopolization and reduce foreground latency spikes.

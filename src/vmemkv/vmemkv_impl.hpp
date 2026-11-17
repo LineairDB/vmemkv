@@ -134,11 +134,10 @@ class VMemKVImpl {
   }
 
   using T1IndexT = vmemkv::ShardedT1Index<ConfigT>;
-  // Re-exported for API compatibility (tests name ImplT::ReorgMode::Checkpoint).
-  using ReorgMode = vmemkv::ReorgMode;
+  using MaintenanceMode = vmemkv::MaintenanceMode;
 
   // T1 payload codec, re-exported as ImplT::X names (tests use ImplT::kBlockAlignment et al.).
-  // Canonical values live in t2_ownership.hpp's t2_detail namespace.
+  // Canonical values live in t1_codec.hpp's vmemkv::t2_detail namespace.
   static constexpr uint64_t kSizeEmbeddingShift = t2_detail::kPayloadSizeShift;
   static constexpr uint64_t kOffsetMask = t2_detail::kPayloadOffsetMask;
   static constexpr uint64_t kBlockAlignment = t2_detail::kRecordBlockAlignment;
@@ -150,11 +149,11 @@ class VMemKVImpl {
   // 1. validate_swap: fail fast before any mmap/recovery work.
   // 2. load_checkpoint_if_present: single-threaded adopt (t1_ starts with 0 workers so its
   //    shard can be wholesale-replaced; workers start right after, before replay, because
-  //    replay put()s like live traffic and needs drainable append regions).
+  //    replay put()s like live traffic and needs drainable MemTables).
   // 3. recover_from_wal, then clear recovering_.
   // 4. spawn_background_workers, last: workers must never observe recovering_ state.
   VMemKVImpl(const std::filesystem::path &t2_path, uint64_t t2_bytes_capacity)
-      : t1_(ConfigT::kAppendCapacityEntries, ConfigT::kShardTargetSizeEntries, /*worker_threads=*/0),
+      : t1_(ConfigT::kMemTableCapacityEntries, ConfigT::kShardTargetSizeEntries, /*worker_threads=*/0),
         t2_(t2_path, t2_bytes_capacity, adopted_t2_bytes_used(t2_path)),
         wal_(vmemkv::derive_wal_path(t2_path)),
         t2_own_((t2_bytes_capacity + ConfigT::kSegmentBytes - 1) / ConfigT::kSegmentBytes) {
@@ -164,7 +163,7 @@ class VMemKVImpl {
     t1_.start_workers();
     recover_from_wal();
     recovering_ = false;
-    t2_own_.queue_empty_segments(t2_.get_memory()->base_boundary.load(std::memory_order_acquire));
+    t2_own_.queue_empty_segments(t2_.get_memory()->read_only_offset.load(std::memory_order_acquire));
     spawn_background_workers();
   }
 
@@ -178,21 +177,21 @@ class VMemKVImpl {
   // Throws std::system_error on I/O failure (msync/open/fstat); logic errors report bool.
   template <typename PreStopHook = NoOpPreStopHook, typename PreFinishHook = NoOpPreFinishHook>
     requires CheckpointHook<PreStopHook> && CheckpointHook<PreFinishHook>
-  void reorganize_internal(ReorgMode mode,
+  void reorganize_internal(MaintenanceMode mode,
                            PreStopHook pre_stop_hook = PreStopHook{},
                            PreFinishHook pre_finish_hook = PreFinishHook{}) {
     checkpoint_detail::reorganize_internal(
-        reorg_, t1_, t2_, wal_, t2_own_, t2_path(), recovering_, mode, pre_stop_hook, pre_finish_hook);
+        checkpoint_, t1_, t2_, wal_, t2_own_, t2_path(), recovering_, mode, pre_stop_hook, pre_finish_hook);
   }
 
   // T1-only in-memory merge, zero I/O. Safe anytime. (The KVStore concept names it
   // reorganize().)
   // Throws std::system_error on I/O failure (msync/open/fstat); logic errors report bool.
-  void reorganize() { run_reorganize(ReorgMode::T1Only); }
+  void reorganize() { run_reorganize(MaintenanceMode::T1Only); }
 
-  // Durabilizes T2's append tail in place and commits the T1 checkpoint/manifest.
+  // Durabilizes T2's mutable region in place and commits the T1 checkpoint/manifest.
   // Throws std::system_error on I/O failure (msync/open/fstat); logic errors report bool.
-  void checkpoint() { run_reorganize(ReorgMode::Checkpoint); }
+  void checkpoint() { run_reorganize(MaintenanceMode::Checkpoint); }
 
   // Drains in-flight background compaction, dirty segments, and dirty shards until clean.
   void drain_compaction() {
@@ -215,19 +214,21 @@ class VMemKVImpl {
   auto t2() noexcept -> vmemkv::T2FlatFile & { return t2_; }
   auto t2() const noexcept -> const vmemkv::T2FlatFile & { return t2_; }
   auto compaction_probe_state() const noexcept -> const vmemkv::CompactionState & { return compact_; }
-  void set_t1_chunk_split_bytes_for_test(uint64_t split_bytes) noexcept { reorg_.t1_chunk_split_bytes = split_bytes; }
-  auto t1_checkpoint_chunks() const -> std::vector<vmemkv::T1ChunkMeta> { return reorg_.t1_chunks; }
+  void set_t1_chunk_split_bytes_for_test(uint64_t split_bytes) noexcept {
+    checkpoint_.t1_chunk_split_bytes = split_bytes;
+  }
+  auto t1_checkpoint_chunks() const -> std::vector<vmemkv::T1ChunkMeta> { return checkpoint_.t1_chunks; }
   auto pending_segment_count() const -> size_t {
     const T2Memory *mem = t2_.get_memory();
-    const uint64_t base = mem != nullptr ? mem->base_boundary.load(std::memory_order_acquire) : 0;
-    const uint64_t used = mem != nullptr ? mem->bytes_used.load(std::memory_order_acquire) : 0;
-    return t2_own_.garbage_segment_count(base, used);
+    const uint64_t read_only = mem != nullptr ? mem->read_only_offset.load(std::memory_order_acquire) : 0;
+    const uint64_t tail = mem != nullptr ? mem->tail_offset.load(std::memory_order_acquire) : 0;
+    return t2_own_.garbage_segment_count(read_only, tail);
   }
   auto has_garbage_segments() const -> bool {
     const T2Memory *mem = t2_.get_memory();
-    const uint64_t base = mem != nullptr ? mem->base_boundary.load(std::memory_order_acquire) : 0;
-    const uint64_t used = mem != nullptr ? mem->bytes_used.load(std::memory_order_acquire) : 0;
-    return t2_own_.has_garbage_segment(base, used);
+    const uint64_t read_only = mem != nullptr ? mem->read_only_offset.load(std::memory_order_acquire) : 0;
+    const uint64_t tail = mem != nullptr ? mem->tail_offset.load(std::memory_order_acquire) : 0;
+    return t2_own_.has_garbage_segment(read_only, tail);
   }
   auto has_compaction_work() const -> bool {
     return t2_own_.has_punch_candidates() || t1_.has_dirty_shard() || has_garbage_segments();
@@ -240,11 +241,11 @@ class VMemKVImpl {
     stats.t1_split_count = t1_.total_splits();
     stats.t1_last_split_pause_us = t1_.last_split_pause_us();
     stats.t1_last_split_pause_end_ns = t1_.last_split_pause_end_ns();
-    stats.checkpoint_count = reorg_.stats.checkpoint_count.load(std::memory_order_relaxed);
-    vmemkv::snapshot_checkpoint_stats(reorg_.stats, stats);
-    stats.total_reorganize_wait_duration_us = reorg_.stats.total_wait_us.load(std::memory_order_relaxed);
-    stats.append_region_live_count = t1_.append_region_live_count();
-    stats.append_region_peak_count = t1_.append_region_peak_count();
+    stats.checkpoint_count = checkpoint_.stats.checkpoint_count.load(std::memory_order_relaxed);
+    vmemkv::snapshot_checkpoint_stats(checkpoint_.stats, stats);
+    stats.total_reorganize_wait_duration_us = checkpoint_.stats.total_wait_us.load(std::memory_order_relaxed);
+    stats.append_region_live_count = t1_.memtable_live_count();
+    stats.append_region_peak_count = t1_.memtable_peak_count();
     stats.bulk_load_throttle_events = bulk_load_throttle_.throttle_events();
     stats.compaction_cycle_count = compact_.cycle_count.load(std::memory_order_relaxed);
     stats.t2_dirty_shard_count = t1_.dirty_shard_count();
@@ -296,14 +297,14 @@ class VMemKVImpl {
     // Scratch for both paths below, used sequentially (never overlapping): the base region's
     // pread() destination, then the seqlock path's owned copy. thread_local/static: per-thread
     // reuse, no per-call allocation.
-    // Ownership: tl_get_buf/tl_scan_* live here (get/scan callback buffers); tl_mincore_vec and
-    // tl_pread_scratch live in read_path.hpp (base-region probe/scratch). No sharing across units.
+    // Ownership: tl_get_buf/tl_scan_* live here (get/scan callback buffers); read_path.hpp
+    // owns tl_pread_scratch. No sharing across units.
     thread_local static std::vector<std::byte> tl_get_buf;
-    if (const auto base_record =
-            vmemkv::try_read_base_record<ConfigT>(mem, res.payload_bits, BaseReader::kGet, &tl_get_buf);
-        base_record.has_value()) {
-      if (vmemkv::bytes_equal(base_record->key, full_key)) {
-        callback(base_record->value);
+    if (const auto imm_record =
+            vmemkv::try_read_immutable_record<ConfigT>(mem, res.payload_bits, ImmutableReader::kGet, &tl_get_buf);
+        imm_record.has_value()) {
+      if (vmemkv::bytes_equal(imm_record->key, full_key)) {
+        callback(imm_record->value);
         return true;
       }
       // Defensive mismatch (bounds check already guards garbage): fall through to the
@@ -413,68 +414,68 @@ class VMemKVImpl {
     // full-key containment, skipping the per-entry recheck when it does.
     const bool bounds_clean = vmemkv::scan_bounds_clean(lower_bound, upper_bound);
 
-    t1_.scan(lower_bound,
-             upper_bound,
-             // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-             [&](std::span<const std::byte> index_key, uint64_t payload, uint64_t hash) -> ScanControl {
-               if (payload == vmemkv::STORE_NOT_FOUND) {
-                 return ScanControl::Continue;
-               }
+    t1_.scan(
+        lower_bound,
+        upper_bound,
+        // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+        [&](std::span<const std::byte> index_key, uint64_t payload, uint64_t hash) -> ScanControl {
+          if (payload == vmemkv::STORE_NOT_FOUND) {
+            return ScanControl::Continue;
+          }
 
-               ScanControl inline_control = ScanControl::Continue;
-               if (vmemkv::try_read_inline_value<ConfigT>(payload, hash, [&](std::span<const std::byte> value) {
-                     const size_t key_len = vmemkv::inline_key_len(index_key);
-                     if (!bounds_clean) {
-                       const std::span<const std::byte> key_view(index_key.data(), key_len);
-                       if (!vmemkv::bytes_in_range(key_view, lower_bound, upper_bound)) {
-                         return;
-                       }
-                     }
-                     inline_control = scan_detail::invoke_callback(
-                         callback, std::span<const std::byte>(index_key.data(), key_len), value);
-                     ++total_count;
-                   })) {
-                 return inline_control;
-               }
+          ScanControl inline_control = ScanControl::Continue;
+          if (vmemkv::try_read_inline_value<ConfigT>(payload, hash, [&](std::span<const std::byte> value) {
+                const size_t key_len = vmemkv::inline_key_len(index_key);
+                if (!bounds_clean) {
+                  const std::span<const std::byte> key_view(index_key.data(), key_len);
+                  if (!vmemkv::bytes_in_range(key_view, lower_bound, upper_bound)) {
+                    return;
+                  }
+                }
+                inline_control = scan_detail::invoke_callback(
+                    callback, std::span<const std::byte>(index_key.data(), key_len), value);
+                ++total_count;
+              })) {
+            return inline_control;
+          }
 
-               const T2Memory *mem = t2_.get_memory();
+          const T2Memory *mem = t2_.get_memory();
 
-               // Base-region fast path, no seqlock (immutable bytes: live spans straight in).
-               if (const auto base_record =
-                       vmemkv::try_read_base_record<ConfigT>(mem, payload, vmemkv::BaseReader::kScan, nullptr);
-                   base_record.has_value()) {
-                 if (!vmemkv::bytes_in_range(base_record->key, lower_bound, upper_bound)) {
-                   return ScanControl::Continue;
-                 }
-                 ++total_count;
-                 return scan_detail::invoke_callback(callback, base_record->key, base_record->value);
-               }
+          // Immutable-region fast path, no seqlock (immutable bytes: live spans straight in).
+          if (const auto imm_record =
+                  vmemkv::try_read_immutable_record<ConfigT>(mem, payload, vmemkv::ImmutableReader::kScan, nullptr);
+              imm_record.has_value()) {
+            if (!vmemkv::bytes_in_range(imm_record->key, lower_bound, upper_bound)) {
+              return ScanControl::Continue;
+            }
+            ++total_count;
+            return scan_detail::invoke_callback(callback, imm_record->key, imm_record->value);
+          }
 
-               // t2_.at() inside read_t2_record_seqlock() (as AtFunc), matching get_impl().
-               //
-               // Torn-read fix: copy into an owned buffer and return, never callback from inside
-               // (see get_impl()). thread_local/static: concurrent-safe, no per-call reallocation.
-               // Ownership: see tl_get_buf above; read_path.hpp owns tl_mincore_vec/tl_pread_scratch.
-               thread_local static std::vector<std::byte> tl_scan_key_buf;
-               thread_local static std::vector<std::byte> tl_scan_value_buf;
-               const bool in_range = vmemkv::read_t2_record_seqlock(
-                   [&]() -> T2RecordView { return T2FlatFile::at(payload & kOffsetMask, mem); },
-                   [&](const T2RecordView &record) -> bool {
-                     if (!vmemkv::bytes_in_range(record.key, lower_bound, upper_bound)) {
-                       return false;
-                     }
-                     tl_scan_key_buf.assign(record.key.begin(), record.key.end());
-                     tl_scan_value_buf.assign(record.value.begin(), record.value.end());
-                     return true;
-                   });
-               if (in_range) {
-                 ++total_count;
-                 return scan_detail::invoke_callback(callback,
-                                                     std::span<const std::byte>(tl_scan_key_buf),
-                                                     std::span<const std::byte>(tl_scan_value_buf));
-               }
-               return ScanControl::Continue;
-             });
+          // t2_.at() inside read_t2_record_seqlock() (as AtFunc), matching get_impl().
+          //
+          // Torn-read fix: copy into an owned buffer and return, never callback from inside
+          // (see get_impl()). thread_local/static: concurrent-safe, no per-call reallocation.
+          // Ownership: see tl_get_buf above; read_path.hpp owns tl_pread_scratch.
+          thread_local static std::vector<std::byte> tl_scan_key_buf;
+          thread_local static std::vector<std::byte> tl_scan_value_buf;
+          const bool in_range = vmemkv::read_t2_record_seqlock(
+              [&]() -> T2RecordView { return T2FlatFile::at(payload & kOffsetMask, mem); },
+              [&](const T2RecordView &record) -> bool {
+                if (!vmemkv::bytes_in_range(record.key, lower_bound, upper_bound)) {
+                  return false;
+                }
+                tl_scan_key_buf.assign(record.key.begin(), record.key.end());
+                tl_scan_value_buf.assign(record.value.begin(), record.value.end());
+                return true;
+              });
+          if (in_range) {
+            ++total_count;
+            return scan_detail::invoke_callback(
+                callback, std::span<const std::byte>(tl_scan_key_buf), std::span<const std::byte>(tl_scan_value_buf));
+          }
+          return ScanControl::Continue;
+        });
 
     return total_count;
   }
@@ -484,9 +485,9 @@ class VMemKVImpl {
     return compaction_detail::compact_cycle<ConfigT>(compact_, t1_, t2_, t2_own_, t2_path(), lock_stripe_fn());
   }
 
-  void run_reorganize(ReorgMode mode) {
+  void run_reorganize(MaintenanceMode mode) {
     checkpoint_detail::run_reorganize(
-        reorg_, t1_, t2_, wal_, t2_own_, t2_path(), recovering_, mode, NoOpPreStopHook{}, NoOpPreFinishHook{});
+        checkpoint_, t1_, t2_, wal_, t2_own_, t2_path(), recovering_, mode, NoOpPreStopHook{}, NoOpPreFinishHook{});
   }
 
   auto lock_stripe_fn() {
@@ -558,8 +559,8 @@ class VMemKVImpl {
     }
 
     t1_.load_from_checkpoint(boundaries, per_shard_entries);
-    reorg_.t1_chunks = manifest->t1_chunks;
-    reorg_.next_t1_chunk_id = manifest->next_t1_chunk_id;
+    checkpoint_.t1_chunks = manifest->t1_chunks;
+    checkpoint_.next_t1_chunk_id = manifest->next_t1_chunk_id;
     for (size_t shard_index = 0; shard_index < per_shard_entries.size(); ++shard_index) {
       t1_.mark_t2_shard_state(shard_index, !shard_local[shard_index]);
     }
@@ -607,19 +608,19 @@ class VMemKVImpl {
     if (checkpoint_detail::auto_reorg_suppressed() || !checkpoint_detail::checkpoint_due<ConfigT>(wal_, t2_own_)) {
       return false;
     }
-    auto guard = SingleFlightGuard::try_acquire(reorg_.running);
+    auto guard = SingleFlightGuard::try_acquire(checkpoint_.running);
     if (!guard.holds) {
       return false;
     }
     try {
-      checkpoint_detail::reorganize_internal(reorg_,
+      checkpoint_detail::reorganize_internal(checkpoint_,
                                              t1_,
                                              t2_,
                                              wal_,
                                              t2_own_,
                                              t2_path(),
                                              recovering_,
-                                             ReorgMode::Checkpoint,
+                                             MaintenanceMode::Checkpoint,
                                              NoOpPreStopHook{},
                                              NoOpPreFinishHook{});
       // NOLINTNEXTLINE(bugprone-empty-catch)
@@ -630,7 +631,7 @@ class VMemKVImpl {
   }
 
   void maybe_run_auto_compaction(std::chrono::steady_clock::time_point &next_compact_at, uint64_t &observed_chk_count) {
-    const uint64_t chk_now = reorg_.stats.checkpoint_count.load(std::memory_order_acquire);
+    const uint64_t chk_now = checkpoint_.stats.checkpoint_count.load(std::memory_order_acquire);
     if (chk_now != observed_chk_count) {
       observed_chk_count = chk_now;
       next_compact_at = std::chrono::steady_clock::now();
@@ -654,7 +655,7 @@ class VMemKVImpl {
   // frozen garbage segments remain or right after any checkpoint advances).
   void t2_maintenance_loop(std::stop_token stop_token) {
     auto next_compact_at = std::chrono::steady_clock::now();
-    uint64_t observed_chk_count = reorg_.stats.checkpoint_count.load(std::memory_order_acquire);
+    uint64_t observed_chk_count = checkpoint_.stats.checkpoint_count.load(std::memory_order_acquire);
     poll_worker_until_stop(stop_token, kDefaultPoll10ms, [&] {
       if (recovering_) {
         return false;
@@ -686,12 +687,12 @@ class VMemKVImpl {
   vmemkv::Wal wal_;
   // Paces bulk_load_impl() against cgroup memory pressure (count survives here for stats).
   vmemkv::CgroupMemoryThrottle bulk_load_throttle_;
-  // T2 checkpoint watermark and in-place-update barrier.
+  // T2 checkpoint fuzzy watermark and in-place-update barrier.
   T2Ownership<ConfigT> t2_own_;
   // Dirty-shard repack state and delayed segment-punch request.
   mutable CompactionState compact_;
   // Checkpoint single-flight state and phase stats.
-  ReorgState reorg_;
+  CheckpointState checkpoint_;
 
   bool recovering_ = false;  // True only during the constructor's initial WAL replay.
 

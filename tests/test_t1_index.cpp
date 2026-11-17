@@ -30,7 +30,7 @@ using TestIndex = vmemkv::T1Index<TinyAppendConfig>;
 // Heap-allocate: the append-region hash index embeds a large bucket array unsuited to the stack.
 auto make_index() -> std::unique_ptr<TestIndex> { return std::make_unique<TestIndex>(); }
 
-// Builds an EntrySnapshot the way put()/reorganize() would (load_sorted_region_from_checkpoint
+// Builds an EntrySnapshot the way put()/reorganize() would (load_sorted_run_from_checkpoint
 // bypasses put()'s own hashing).
 auto make_entry(const std::string &key_string, TestIndex::Payload payload) -> TestIndex::EntrySnapshot {
   TestIndex::Key key{};
@@ -65,7 +65,7 @@ TEST_CASE("T1Index: put on an existing key overwrites in place, does not grow th
   CHECK(idx->put(to_span("a"), 1) == TestIndex::PutResult::Applied);
   CHECK(idx->put(to_span("a"), 2) == TestIndex::PutResult::Applied);
   CHECK(idx->get(to_span("a")) == 2U);
-  CHECK(idx->append_size() == 1);
+  CHECK(idx->memtable_size() == 1);
 }
 
 TEST_CASE("T1Index: put with STORE_NOT_FOUND tombstones the key") {
@@ -75,13 +75,13 @@ TEST_CASE("T1Index: put with STORE_NOT_FOUND tombstones the key") {
   CHECK(idx->get(to_span("a")) == vmemkv::STORE_NOT_FOUND);
 }
 
-TEST_CASE("T1Index: append region reports AppendRegionFull once capacity is exhausted") {
+TEST_CASE("T1Index: append region reports MemTableFull once capacity is exhausted") {
   auto idx = make_index();
-  const size_t append_cap = idx->append_capacity();
+  const size_t append_cap = idx->memtable_capacity();
   size_t applied = 0;
   for (size_t i = 0; i < append_cap + 1; ++i) {
     const std::string key = "k" + std::to_string(i);
-    if (idx->put(to_span(key), static_cast<uint64_t>(i)) == TestIndex::PutResult::AppendRegionFull) {
+    if (idx->put(to_span(key), static_cast<uint64_t>(i)) == TestIndex::PutResult::MemTableFull) {
       break;
     }
     ++applied;
@@ -93,11 +93,11 @@ TEST_CASE("T1Index: reorganize merges append region into sorted region, keeps li
   auto idx = make_index();
   constexpr int key_count = 100;
   fill_sequential(*idx, key_count);
-  CHECK(idx->append_size() == static_cast<size_t>(key_count));
+  CHECK(idx->memtable_size() == static_cast<size_t>(key_count));
 
   idx->reorganize(identity_offset_mapper());
 
-  CHECK(idx->append_size() == 0);
+  CHECK(idx->memtable_size() == 0);
   for (int i = 0; i < key_count; ++i) {
     CHECK(idx->get(to_span("k" + std::to_string(i))) == static_cast<uint64_t>(i));
   }
@@ -145,31 +145,31 @@ TEST_CASE("T1Index: reorganize's chk_writer sees exactly the merged, sorted, off
   CHECK(observed[1].payload_bits == 102U);
 }
 
-TEST_CASE("T1Index: load_sorted_region_from_checkpoint adopts entries as the live sorted region") {
+TEST_CASE("T1Index: load_sorted_run_from_checkpoint adopts entries as the live sorted region") {
   auto idx = make_index();
   const std::vector<TestIndex::EntrySnapshot> entries = {make_entry("a", 111), make_entry("b", 222)};
 
-  idx->load_sorted_region_from_checkpoint(entries);
+  idx->load_sorted_run_from_checkpoint(entries);
 
   CHECK(idx->get(to_span("a")) == 111U);
   CHECK(idx->get(to_span("b")) == 222U);
-  CHECK(idx->append_size() == 0);
+  CHECK(idx->memtable_size() == 0);
 }
 
-TEST_CASE("T1Index: load_sorted_region_from_checkpoint replaces any previously loaded sorted region") {
+TEST_CASE("T1Index: load_sorted_run_from_checkpoint replaces any previously loaded sorted region") {
   auto idx = make_index();
-  idx->load_sorted_region_from_checkpoint(std::vector<TestIndex::EntrySnapshot>{make_entry("a", 1)});
+  idx->load_sorted_run_from_checkpoint(std::vector<TestIndex::EntrySnapshot>{make_entry("a", 1)});
   CHECK(idx->get(to_span("a")) == 1U);
 
-  idx->load_sorted_region_from_checkpoint(std::vector<TestIndex::EntrySnapshot>{make_entry("a", 2)});
+  idx->load_sorted_run_from_checkpoint(std::vector<TestIndex::EntrySnapshot>{make_entry("a", 2)});
   CHECK(idx->get(to_span("a")) == 2U);
 }
 
-// put/get_with_hash/append_size must all hold the epoch guard for their duration, or
+// put/get_with_hash/memtable_size must all hold the epoch guard for their duration, or
 // reorganize() can delete buffers still in use. Hammering reorganize() concurrently with all
 // three exercises that directly.
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-TEST_CASE("T1Index: concurrent put/get_with_hash/append_size survive racing reorganize") {
+TEST_CASE("T1Index: concurrent put/get_with_hash/memtable_size survive racing reorganize") {
   auto idx = make_index();
   std::atomic<bool> stop{false};
   std::atomic<uint64_t> reorganize_count{0};
@@ -191,7 +191,7 @@ TEST_CASE("T1Index: concurrent put/get_with_hash/append_size survive racing reor
     readers.emplace_back([&]() {
       while (!stop.load(std::memory_order_relaxed)) {
         (void)idx->get_with_hash(to_span(std::string("w0_0")));
-        (void)idx->append_size();
+        (void)idx->memtable_size();
       }
     });
   }
@@ -202,7 +202,7 @@ TEST_CASE("T1Index: concurrent put/get_with_hash/append_size survive racing reor
     writers.emplace_back([&, writer_id]() {
       for (int i = 0; i < iterations_per_writer; ++i) {
         const std::string key = "w" + std::to_string(writer_id) + "_" + std::to_string(i);
-        while (idx->put(to_span(key), static_cast<uint64_t>(i)) == TestIndex::PutResult::AppendRegionFull) {
+        while (idx->put(to_span(key), static_cast<uint64_t>(i)) == TestIndex::PutResult::MemTableFull) {
           std::this_thread::yield();
         }
       }
@@ -229,8 +229,8 @@ TEST_CASE("T1Index: concurrent put/get_with_hash/append_size survive racing reor
 // put() racing the frozen-region bypass across an inline transition still resolves to one
 // logical key instead of two live entries.
 struct TinyInlineConfig : vmemkv::Config<> {
-  static constexpr size_t kAppendCapacityLog2 = 8;
-  static constexpr size_t kAppendCapacityEntries = size_t{1} << kAppendCapacityLog2;
+  static constexpr size_t kMemTableCapacityLog2 = 8;
+  static constexpr size_t kMemTableCapacityEntries = size_t{1} << kMemTableCapacityLog2;
 };
 using InlineTestIndex = vmemkv::T1Index<TinyInlineConfig>;
 
@@ -242,7 +242,7 @@ TEST_CASE(
   // "k" starts inline; its stored hash carries the inline metadata bits.
   REQUIRE(idx->put(to_span("k"), 111, /*is_inline=*/true, /*inline_size=*/8) == InlineTestIndex::PutResult::Applied);
 
-  // reorg #1 freezes "k" into append_immutable_, then parks inside offset_mapper.
+  // reorg #1 freezes "k" into memtable_immutable_, then parks inside offset_mapper.
   std::atomic<bool> reorg1_entered_offset_mapper{false};
   std::atomic<bool> proceed{false};
   std::thread reorg1([&] {
@@ -256,7 +256,7 @@ TEST_CASE(
 
   reorg1_entered_offset_mapper.wait(false, std::memory_order_acquire);
 
-  // "k" is only live in append_immutable_ now, so resolve()'s bypass must append a *new* entry
+  // "k" is only live in memtable_immutable_ now, so resolve()'s bypass must append a *new* entry
   // (with a different, non-inline stored hash) instead of updating the frozen one in place.
   REQUIRE(idx->put(to_span("k"), 222, /*is_inline=*/false) == InlineTestIndex::PutResult::Applied);
 
@@ -264,7 +264,7 @@ TEST_CASE(
   proceed.notify_all();
   reorg1.join();
 
-  // sorted has (k, inline hash); append_active_ separately holds the bypass (k, non-inline
+  // sorted has (k, inline hash); memtable_active_ separately holds the bypass (k, non-inline
   // hash), still unmerged.
   CHECK(idx->get(to_span("k")) == 222U);
 
@@ -292,7 +292,7 @@ TEST_CASE("T1Index: concurrent updates to already-sorted keys survive racing reo
   }
   // Moves every key into sorted_region, so the in-place update reaches store_hash().
   idx->reorganize(identity_offset_mapper());
-  REQUIRE(idx->append_size() == 0);
+  REQUIRE(idx->memtable_size() == 0);
 
   std::atomic<bool> stop{false};
   std::atomic<uint64_t> reorganize_count{0};
@@ -387,7 +387,7 @@ TEST_CASE("T1Index: get() never observes a live key as absent while a concurrent
   CHECK_FALSE(saw_missing.load());
 }
 
-// The merge loop snapshots a sorted slot and publishes a brand-new SortedRegion; put()'s
+// The merge loop snapshots a sorted slot and publishes a brand-new SortedRun; put()'s
 // in-place path must route through sorted_write_frozen_ (see FreezableRegion) so a write
 // between snapshot and publish is never lost. One writer per key (well-defined "last write")
 // races a hammering reorganizer; the mapper sleep widens the merge-to-publish window toward
@@ -450,7 +450,7 @@ TEST_CASE("T1Index: concurrent puts racing the same immutable-bypass window coll
     const std::string hot_key = "hot" + std::to_string(round);
     REQUIRE(idx->put(to_span(hot_key), 0) == TestIndex::PutResult::Applied);
 
-    // reorg #1 freezes the key into append_immutable_ and parks inside offset_mapper, giving
+    // reorg #1 freezes the key into memtable_immutable_ and parks inside offset_mapper, giving
     // every racer a window where resolve() is guaranteed not-found.
     std::atomic<bool> reorg1_entered_offset_mapper{false};
     std::atomic<bool> proceed{false};
@@ -489,7 +489,7 @@ TEST_CASE("T1Index: concurrent puts racing the same immutable-bypass window coll
     proceed.notify_all();
     reorg1.join();
 
-    // append_active_ now holds up to racer_count bypass entries for hot_key -- at most one
+    // memtable_active_ now holds up to racer_count bypass entries for hot_key -- at most one
     // survives live; the rest were retired as orphaned duplicates.
     CHECK(idx->get(to_span(hot_key)) != vmemkv::STORE_NOT_FOUND);
 

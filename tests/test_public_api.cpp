@@ -243,7 +243,7 @@ TEST_CASE("public API: update verifies full key under prefix collision in base a
   CHECK(store.get(key_prefix_alice, [&](std::span<const std::byte> val) { seen = span_to_string(val); }));
   CHECK(seen == val_updated);
 
-  // 2. Checkpoint moves records into immutable base region (offset < base_boundary)
+  // 2. Checkpoint moves records into immutable base region (offset < read_only_offset)
   store.checkpoint();
 
   // Base region: updating nonexistent bob must still fail (not fall through to insert)

@@ -63,7 +63,7 @@ TEST_CASE("bulk_load: an entry whose value equals STORE_NOT_FOUND round-trips vi
 
 // Regression test: a same-size update targeting a record in T2's "base" region (already
 // checkpointed) must be redirected out-of-place instead of taking the in-place fast path -- see
-// update_impl()'s base_boundary check and T2Memory::base_boundary's declaration. Base-region reads
+// update_impl()'s read_only_offset check and T2Memory::read_only_offset's declaration. Base-region reads
 // go through a seqlock-free path (docs/specification/low_level_design.md 7.5) that assumes the bytes never change again
 // once a record is base-resident; an in-place write there would violate that assumption. If the redirect were missing
 // or wrong, this test would observe Scan (normal_mmap-served) and Get (random_mmap-served) silently disagreeing on
@@ -76,7 +76,7 @@ TEST_CASE("vmemkv: update after reorganize redirects out-of-place, Scan sees fre
   REQUIRE(store->insert("key_a", value_a));
   REQUIRE(store->insert("key_b", value_b));
 
-  store->checkpoint();  // Advances base_boundary: both records now sit in the base region.
+  store->checkpoint();  // Advances read_only_offset: both records now sit in the base region.
 
   // Same-size update: would take the in-place fast path if key_a's offset weren't in the base.
   const std::string value_a_updated(kValue200Bytes, 'A');
@@ -158,12 +158,12 @@ void check_final_value_sizes(StorePtr &store, int key_count, std::size_t value_b
 
 }  // namespace
 
-// Regression test for base_boundary coverage across repeated checkpoint() cycles: each cycle
-// advances base_boundary to cover everything durabilized so far, not just whatever the first
+// Regression test for read_only_offset coverage across repeated checkpoint() cycles: each cycle
+// advances read_only_offset to cover everything durabilized so far, not just whatever the first
 // forced checkpoint() established. Without this, a long-running insert-only process would have
 // Scan's base-region coverage frozen forever at the first checkpoint, even as the live corpus
 // kept growing past it.
-TEST_CASE("vmemkv: checkpoint() extends base_boundary coverage across repeated cycles") {
+TEST_CASE("vmemkv: checkpoint() extends read_only_offset coverage across repeated cycles") {
   using TestStore = vmemkv::variants::VMemKV_Default;
   constexpr uint64_t kStoreCapacityBytes = 8ULL * 1024 * 1024;
   auto store = std::make_unique<TestStore>(reserve_temp_path().string(), kStoreCapacityBytes);
@@ -174,19 +174,19 @@ TEST_CASE("vmemkv: checkpoint() extends base_boundary coverage across repeated c
   }
   store->checkpoint();  // First checkpoint: creates the T2 checkpoint file.
 
-  const uint64_t boundary_after_first = store->impl().t2().get_memory()->base_boundary;
+  const uint64_t boundary_after_first = store->impl().t2().get_memory()->read_only_offset;
   CHECK(boundary_after_first > 0);
   CHECK(store->impl().t2().get_memory()->reads.normal_mmap != nullptr);
   CHECK(store->impl().t2().get_memory()->reads.sequential_mmap != nullptr);
   CHECK(store->impl().t2().get_memory()->reads.pread_fd >= 0);
 
-  // Insert more, then checkpoint again -- base_boundary advances further in place.
+  // Insert more, then checkpoint again -- read_only_offset advances further in place.
   for (int i = 10; i < 20; ++i) {
     REQUIRE(store->insert(vmemkv_test::padded_key("key", i, 2), value));
   }
   store->checkpoint();
 
-  const uint64_t boundary_after_second = store->impl().t2().get_memory()->base_boundary;
+  const uint64_t boundary_after_second = store->impl().t2().get_memory()->read_only_offset;
   CHECK(boundary_after_second > boundary_after_first);
 
   // Confirm the newly-promoted range is actually reachable and correct via the normal_mmap
@@ -261,11 +261,11 @@ TEST_CASE("vmemkv: checkpoint() on an empty store still establishes normal_mmap/
   constexpr uint64_t kStoreCapacityBytes = 8ULL * 1024 * 1024;
   auto store = std::make_unique<TestStore>(reserve_temp_path().string(), kStoreCapacityBytes);
 
-  store->checkpoint();  // No-op promotion: zero live entries, base_boundary stays at 0.
+  store->checkpoint();  // No-op promotion: zero live entries, read_only_offset stays at 0.
   CHECK(store->impl().t2().get_memory()->reads.normal_mmap != nullptr);
   CHECK(store->impl().t2().get_memory()->reads.sequential_mmap != nullptr);
   CHECK(store->impl().t2().get_memory()->reads.pread_fd >= 0);
-  CHECK(store->impl().t2().get_memory()->base_boundary == 0);
+  CHECK(store->impl().t2().get_memory()->read_only_offset == 0);
 
   const std::string value(kValue200Bytes, 'a');
   for (int i = 0; i < 10; ++i) {
@@ -273,7 +273,7 @@ TEST_CASE("vmemkv: checkpoint() on an empty store still establishes normal_mmap/
   }
   store->checkpoint();  // Cheap path now: normal_mmap/pread_fd already existed, just needs promoting.
 
-  CHECK(store->impl().t2().get_memory()->base_boundary > 0);
+  CHECK(store->impl().t2().get_memory()->read_only_offset > 0);
 
   std::map<std::string, std::string> seen;
   std::ignore = store->scan("key0", "key9~", [&](std::span<const std::byte> key, std::span<const std::byte> val) {
@@ -296,11 +296,11 @@ TEST_CASE("vmemkv: checkpoint preserves correctness across garbage from update/r
   CHECK(store->insert("k1", val1));
   CHECK(store->insert("k2", val1));
 
-  uint64_t bytes_used_before = store->t2().bytes_used();
+  uint64_t bytes_used_before = store->t2().tail_offset();
 
   // Grow-update leaves the old value as garbage; remove leaves k1's record as garbage too.
   CHECK(store->update("k2", val2));
-  uint64_t bytes_used_after_update = store->t2().bytes_used();
+  uint64_t bytes_used_after_update = store->t2().tail_offset();
   CHECK(bytes_used_after_update > bytes_used_before);
 
   CHECK(store->remove("k1"));
@@ -356,14 +356,14 @@ TEST_CASE("Value Inlining: verify that short/8B-aligned values bypass T2 write p
   using InlineStore = vmemkv::variants::VMemKV_Default;
   auto store = std::make_unique<InlineStore>(path, kInlineStoreCapacityBytes);
 
-  uint64_t initial_bytes = store->t2().bytes_used();
+  uint64_t initial_bytes = store->t2().tail_offset();
   CHECK(initial_bytes == 0);
 
   // 1-7 bytes: should inline (no T2 usage).
   std::vector<std::byte> val_short(kShortInlineValueBytes, kShortFillByte);
   store->insert("key1", val_short);
 
-  CHECK(store->t2().bytes_used() == 0);
+  CHECK(store->t2().tail_offset() == 0);
 
   auto res = vmemkv_test::get_optional_bytes(store, "key1");
   if (!res.has_value()) {
@@ -379,7 +379,7 @@ TEST_CASE("Value Inlining: verify that short/8B-aligned values bypass T2 write p
   std::memcpy(val_odd_bytes.data(), &val_odd, kInlineValueBytes);
 
   store->insert("key_odd", val_odd_bytes);
-  CHECK(store->t2().bytes_used() == 0);
+  CHECK(store->t2().tail_offset() == 0);
 
   auto res_odd = vmemkv_test::get_optional_bytes(store, "key_odd");
   if (!res_odd.has_value()) {
@@ -397,7 +397,7 @@ TEST_CASE("Value Inlining: verify that short/8B-aligned values bypass T2 write p
   std::memcpy(val_even_bytes.data(), &val_even, kInlineValueBytes);
 
   store->insert("key_even", val_even_bytes);
-  CHECK(store->t2().bytes_used() == 0);
+  CHECK(store->t2().tail_offset() == 0);
 
   auto res_even = vmemkv_test::get_optional_bytes(store, "key_even");
   if (!res_even.has_value()) {
@@ -413,7 +413,7 @@ TEST_CASE("Value Inlining: verify that short/8B-aligned values bypass T2 write p
   std::vector<std::byte> val_long(kLongValueBytes, kLongFillByte);
   store->insert("key2", val_long);
 
-  CHECK(store->t2().bytes_used() > 0);
+  CHECK(store->t2().tail_offset() > 0);
 
   std::filesystem::remove(path);
   vmemkv::remove_wal_segments(vmemkv::derive_wal_path(path));
@@ -617,7 +617,7 @@ TEST_CASE(
   // acquire_write_handle() call is guaranteed to register with the reference tracker before
   // stop_writers_and_wait() ever scans it.
   using ImplT = std::decay_t<decltype(store->impl())>;
-  store->impl().reorganize_internal(ImplT::ReorgMode::Checkpoint,
+  store->impl().reorganize_internal(ImplT::MaintenanceMode::Checkpoint,
                                     /*pre_stop_hook=*/
                                     [&] {
                                       straggler_writer = std::thread([&] {
@@ -669,7 +669,7 @@ TEST_CASE(
   std::atomic<bool> writer_registered{false};
 
   using ImplT = std::decay_t<decltype(store->impl())>;
-  store->impl().reorganize_internal(ImplT::ReorgMode::Checkpoint,
+  store->impl().reorganize_internal(ImplT::MaintenanceMode::Checkpoint,
                                     /*pre_stop_hook=*/
                                     [&] {
                                       straggler_writer = std::thread([&] {
@@ -727,7 +727,7 @@ TEST_CASE("vmemkv: exception before T1 publish during a T2 rebuild leaves the st
 
   bool threw = false;
   try {
-    store->impl().reorganize_internal(std::decay_t<decltype(store->impl())>::ReorgMode::Checkpoint,
+    store->impl().reorganize_internal(std::decay_t<decltype(store->impl())>::MaintenanceMode::Checkpoint,
                                       /*pre_stop_hook=*/vmemkv::NoOpPreStopHook{},
                                       /*pre_finish_hook=*/[] { throw InjectedFault{}; });
   } catch (const InjectedFault &) {

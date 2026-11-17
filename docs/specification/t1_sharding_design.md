@@ -7,7 +7,7 @@ Eliminates the O(corpus) cost of `reorganize()`/`checkpoint()` (see [`t1_index_s
 T1 becomes two layers:
 
 - **Directory**: an array sorted by boundary keys, mapping each interval to one shard.
-- **Shard**: K instances of `T1Index<Config>`. Each shard holds only data in its own key range, an independent sorted region + append region pair.
+- **Shard**: K instances of `T1Index<Config>`. Each shard holds only data in its own key range, an independent In-Memory Sorted Run + MemTable pair sharing a single store-wide `EpochDomain`.
 
 The key space is range-partitioned (not hashed): shards stay disjoint and ordered at all times, so cross-shard Scan needs no k-way merge — concatenating each intersecting shard's `scan()` results in shard order already yields a fully sorted result.
 
@@ -15,7 +15,7 @@ The initial state is K=1 (identical behavior to the existing single T1Index), sp
 
 ## Directory Concurrency
 
-The directory applies one level up the RCU-style pattern T1Index itself already uses (`AppendGeneration`/`SortedRegion` atomic pointer swaps + epoch-based reclamation). The directory is an immutable object, atomically swapped for a new instance only on split/merge. Readers load the directory once at operation start and keep using that shard reference until the operation completes.
+The directory applies one level up the RCU-style pattern T1Index itself already uses (`MemTableGeneration`/`SortedRun` atomic pointer swaps + unified store-wide `EpochDomain`). The directory is an immutable object, atomically swapped for a new instance only on split/merge. Readers enter `EpochDomain` once at operation start, load the directory, and hold that single epoch guard through the resolved shard lookup (`kCallerHeldEpoch`).
 
 ## Splitting
 
@@ -41,9 +41,9 @@ if the resulting (`merged`) live entries reach either `kSegmentBytes` (8 MiB) of
           Cost is amortized O(1) /
           insert; worst-case one-shot cost is O(shard size), independent of total corpus size (the second `reorganize()` is also O(shard size), adding only a constant factor). Even with monotonically increasing keys like `bench_helpers.hpp`'s `ikey()` (`"k"` + 15 hex digits), only the rightmost shard keeps growing, so this property holds.
 
-## APPEND_CAP and Byte-Bounded Shard Splitting
+## MemTable Capacity and Byte-Bounded Shard Splitting
 
-Each shard's `APPEND_CAP` is fixed and bears no proportional relation to the shard target size. New shards inherit the parent shard's `append_capacity()`. The default is `Config::kAppendCapacityEntries` (16K entries).
+Each shard's `kMemTableCapacityEntries` is fixed and bears no proportional relation to the shard target size. New shards inherit the parent shard's `memtable_capacity()`. The default is `Config::kMemTableCapacityEntries` (32K entries).
 
 Split decisions use `should_split_shard(entry_count, t2_bytes)`: a shard splits when its referenced T2 live bytes reach `Config::kSegmentBytes` (8 MiB, matching the T2 hole-punch segment size regardless of record value size) or when its live entry count reaches `kShardTargetSizeEntries` × `kShardSplitThresholdPercent` (fallback for inline-only or standalone T1 workloads). This guarantees that repacking a single T1 shard moves at most one 8 MiB T2 segment's worth of data.
 

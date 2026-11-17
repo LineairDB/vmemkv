@@ -128,8 +128,8 @@ struct FrequentCheckpointConfig : vmemkv::Config<> {
   static constexpr size_t kMaxBytesSinceCheckpoint = 64ULL << 10;  // 64 KiB.
 };
 
-static_assert(FrequentCheckpointConfig::kAppendCapacityEntries ==
-              (size_t{1} << FrequentCheckpointConfig::kAppendCapacityLog2));
+static_assert(FrequentCheckpointConfig::kMemTableCapacityEntries ==
+              (size_t{1} << FrequentCheckpointConfig::kMemTableCapacityLog2));
 
 using VMemKV_FrequentCheckpoint = vmemkv::StoreAdapter<vmemkv::VMemKVImpl<FrequentCheckpointConfig>>;
 

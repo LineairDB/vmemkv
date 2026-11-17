@@ -744,8 +744,8 @@ static void register_benchmark_context() {
   benchmark::AddCustomContext("ycsb_window_seconds", std::to_string(get_ycsb_duration_seconds()));
   benchmark::AddCustomContext("warmup_policy",
                               "no warmup discard; corpus pre-populated on the same host, LTM cells cgroup-isolated");
-  benchmark::AddCustomContext("t1_append_capacity_log2", std::to_string(vmemkv::Config<>::kAppendCapacityLog2));
-  benchmark::AddCustomContext("t1_append_capacity_entries", std::to_string(vmemkv::Config<>::kAppendCapacityEntries));
+  benchmark::AddCustomContext("t1_append_capacity_log2", std::to_string(vmemkv::Config<>::kMemTableCapacityLog2));
+  benchmark::AddCustomContext("t1_append_capacity_entries", std::to_string(vmemkv::Config<>::kMemTableCapacityEntries));
   benchmark::AddCustomContext("t1_shard_target_size_entries",
                               std::to_string(vmemkv::Config<>::kShardTargetSizeEntries));
   benchmark::AddCustomContext("t1_shard_split_threshold_percent",
@@ -2884,7 +2884,7 @@ auto scan_windows(Store &store, const std::vector<std::size_t> &starts) -> ScanP
   uint64_t value_bytes = 0;
   uint64_t base_records = 0;
   uint64_t tail_records = 0;
-  const uint64_t base_boundary = store.impl().t2().get_memory()->base_boundary.load(std::memory_order_acquire);
+  const uint64_t read_only_offset = store.impl().t2().get_memory()->read_only_offset.load(std::memory_order_acquire);
   ScanPhaseResult result;
   result.window_milliseconds.reserve(starts.size());
   result.window_major_faults.reserve(starts.size());
@@ -2920,7 +2920,7 @@ auto scan_windows(Store &store, const std::vector<std::size_t> &starts) -> ScanP
         return;
       }
       const uint64_t off = payload & vmemkv::t2_detail::kPayloadOffsetMask;
-      if (off < base_boundary) {
+      if (off < read_only_offset) {
         ++base_records;
       } else {
         ++tail_records;
@@ -2998,7 +2998,7 @@ auto scan_layout(Store &store, const std::vector<std::size_t> &starts) -> ScanLa
   layout.window_offsets.reserve(starts.size());
   layout.window_backward.reserve(starts.size());
   const uint64_t page_size = static_cast<uint64_t>(::sysconf(_SC_PAGESIZE));
-  const uint64_t base_boundary = store.impl().t2().get_memory()->base_boundary.load(std::memory_order_acquire);
+  const uint64_t read_only_offset = store.impl().t2().get_memory()->read_only_offset.load(std::memory_order_acquire);
   for (const std::size_t start : starts) {
     uint64_t previous = 0;
     bool have_previous = false;
@@ -3015,7 +3015,7 @@ auto scan_layout(Store &store, const std::vector<std::size_t> &starts) -> ScanLa
       }
       const uint64_t offset = payload & vmemkv::t2_detail::kPayloadOffsetMask;
       ++layout.t2_records;
-      if (offset < base_boundary) {
+      if (offset < read_only_offset) {
         ++layout.base_records;
       } else {
         ++layout.tail_records;
@@ -3073,7 +3073,7 @@ auto scan_layout(Store &store, const std::vector<std::size_t> &starts) -> ScanLa
 
   const uint64_t before_offset_inversions = offset_inversions(*store);
   const MemPressureSnapshot mem_init = take_mem_snapshot();
-  const std::size_t append_entries_before_first_scan = store->impl().t1().append_size();
+  const std::size_t append_entries_before_first_scan = store->impl().t1().memtable_size();
   const uint64_t dirty_shards_before_first_scan = store->get_statistics().t2_dirty_shard_count;
   const size_t pending_segments_before_first_scan = store->impl().pending_segment_count();
   const bool compaction_running_before_first_scan = store->impl().compaction_running();
@@ -3082,7 +3082,7 @@ auto scan_layout(Store &store, const std::vector<std::size_t> &starts) -> ScanLa
   const ScanPhaseResult scan_before = scan_windows(*store, scan_starts);
   const MemPressureSnapshot mem_post_scan1 = take_mem_snapshot();
 
-  const uint64_t t2_bytes_before = store->impl().t2().bytes_used();
+  const uint64_t t2_bytes_before = store->impl().t2().tail_offset();
   const std::string large_value(args.val_size, 'a');
   const std::string inline_value(8, 'a');
   std::mt19937_64 update_rng(bench_help::kBenchmarkSeed + 1);
@@ -3098,11 +3098,11 @@ auto scan_layout(Store &store, const std::vector<std::size_t> &starts) -> ScanLa
     }
   }
   const auto update_end = std::chrono::steady_clock::now();
-  const std::size_t append_entries_after_updates = store->impl().t1().append_size();
+  const std::size_t append_entries_after_updates = store->impl().t1().memtable_size();
   const uint64_t dirty_shards_after_updates = store->get_statistics().t2_dirty_shard_count;
   const size_t pending_segments_after_updates = store->impl().pending_segment_count();
   const bool compaction_running_after_updates = store->impl().compaction_running();
-  const uint64_t t2_bytes_after_updates = store->impl().t2().bytes_used();
+  const uint64_t t2_bytes_after_updates = store->impl().t2().tail_offset();
   const MemPressureSnapshot mem_post_update = take_mem_snapshot();
 
   const auto compaction_start = std::chrono::steady_clock::now();
@@ -3116,13 +3116,13 @@ auto scan_layout(Store &store, const std::vector<std::size_t> &starts) -> ScanLa
   const auto after_compaction = store->get_statistics();
   const auto pending_segments_after_compaction = store->impl().pending_segment_count();
   const bool compaction_running_after_compaction = store->impl().compaction_running();
-  const std::size_t append_entries_after_compaction = store->impl().t1().append_size();
+  const std::size_t append_entries_after_compaction = store->impl().t1().memtable_size();
   const MemPressureSnapshot mem_post_drain = take_mem_snapshot();
 
   const auto checkpoint_start = std::chrono::steady_clock::now();
   store->checkpoint();
   const auto checkpoint_end = std::chrono::steady_clock::now();
-  const std::size_t append_entries_after_checkpoint = store->impl().t1().append_size();
+  const std::size_t append_entries_after_checkpoint = store->impl().t1().memtable_size();
   const auto after_checkpoint = store->get_statistics();
   const MemPressureSnapshot mem_post_ckpt = take_mem_snapshot();
   const uint64_t after_offset_inversions = offset_inversions(*store);
@@ -3226,7 +3226,7 @@ auto scan_layout(Store &store, const std::vector<std::size_t> &starts) -> ScanLa
       << ",\"scan_tail_records_layout_before\":" << layout_before.tail_records
       << ",\"scan_tail_records_layout_after\":" << layout_after.tail_records
       << ",\"t2_bytes_before\":" << t2_bytes_before << ",\"t2_bytes_after_updates\":" << t2_bytes_after_updates
-      << ",\"t2_bytes_after_compaction\":" << store->impl().t2().bytes_used()
+      << ",\"t2_bytes_after_compaction\":" << store->impl().t2().tail_offset()
       << ",\"offset_inversions_before\":" << before_offset_inversions
       << ",\"offset_inversions_after\":" << after_offset_inversions << ",\"scan_starts\":[";
   for (size_t i = 0; i < scan_starts.size(); ++i) {
@@ -3549,8 +3549,8 @@ static inline void atomic_update_max(std::atomic<uint64_t> &dst, uint64_t val) {
     const uint64_t punch_backlog = store->impl().punch_backlog_segments();
     const uint64_t pending_segs = store->impl().pending_segment_count();
     const auto *mem = store->impl().t2().get_memory();
-    const uint64_t t2_used = mem != nullptr ? mem->bytes_used.load(std::memory_order_acquire) : 0;
-    const uint64_t t2_base = mem != nullptr ? mem->base_boundary.load(std::memory_order_acquire) : 0;
+    const uint64_t t2_used = mem != nullptr ? mem->tail_offset.load(std::memory_order_acquire) : 0;
+    const uint64_t t2_base = mem != nullptr ? mem->read_only_offset.load(std::memory_order_acquire) : 0;
 
     auto delta = [](const std::atomic<uint64_t> &a, uint64_t &prev) -> uint64_t {
       const uint64_t cur = a.load(std::memory_order_relaxed);

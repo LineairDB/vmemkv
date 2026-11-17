@@ -109,12 +109,12 @@ auto punch_evacuated_segments(CompactionState &state,
     return 0;
   }
   const vmemkv::T2Memory *mem = tier2.get_memory();
-  const uint64_t base = mem->base_boundary.load(std::memory_order_acquire);
+  const uint64_t read_only_offset = mem->read_only_offset.load(std::memory_order_acquire);
   const uint64_t covered_through = own.last_checkpoint_count();
   const std::vector<typename T2Ownership<ConfigT>::PunchCandidate> candidates = own.take_punch_candidates();
-  // Deferred, not dropped: below-base cohorts wait for checkpoint coverage, and
+  // Deferred, not dropped: above-read-only cohorts wait for checkpoint coverage, and
   // epoch-covered ones wait for the segment to empty. A live reading here means
-  // a concurrent append landed after evacuation (below-base bytes never gain
+  // a concurrent append landed after evacuation (immutable-region bytes never gain
   // live records); dropping the candidacy is safe because emptying re-queues it
   // through the zero-crossing path.
   std::vector<typename T2Ownership<ConfigT>::PunchCandidate> deferred;
@@ -122,7 +122,7 @@ auto punch_evacuated_segments(CompactionState &state,
   for (size_t idx = 0; idx < candidates.size(); ++idx) {
     const auto &candidate = candidates[idx];
     const uint64_t seg = candidate.segment;
-    if (candidate.evacuated_epoch + 1 >= covered_through || (seg + 1) * ConfigT::kSegmentBytes > base) {
+    if (candidate.evacuated_epoch + 1 >= covered_through || (seg + 1) * ConfigT::kSegmentBytes > read_only_offset) {
       deferred.push_back(candidate);
       continue;
     }
@@ -232,13 +232,13 @@ auto relocate_one(T1 &tier1,
   const bool measure = probe != nullptr && segment_probe_enabled();
   const uint64_t old_off = target_payload & t2_detail::kPayloadOffsetMask;
 
-  // Reuse the base-region read path (mmap for small/resident records, bounded pread() for
-  // non-resident multi-page records below base_boundary) with no stripe lock held across I/O;
-  // records still in the mutable tail fall back to T2FlatFile::at().
+  // Reuse the immutable-region read path (mmap for small/resident records, bounded pread() for
+  // non-resident multi-page records below read_only_offset) with no stripe lock held across I/O;
+  // records still in the mutable region fall back to T2FlatFile::at().
   thread_local static std::vector<std::byte> tl_compact_cold_buf;
   const auto read_start = measure ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
   const std::optional<T2RecordView> preloaded =
-      try_read_base_record<ConfigT>(mem, target_payload, BaseReader::kGet, &tl_compact_cold_buf);
+      try_read_immutable_record<ConfigT>(mem, target_payload, ImmutableReader::kGet, &tl_compact_cold_buf);
   const auto read_end = measure ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
   const auto validate_start = measure ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -337,7 +337,7 @@ inline void prefetch_payload_batch(std::span<const uint64_t> batch,
     if (off >= limit) {
       continue;
     }
-    const uint64_t hint = t2_detail::payload_hint_bytes(payload, t2_detail::kBaseSizeHintMargin);
+    const uint64_t hint = t2_detail::payload_hint_bytes(payload, t2_detail::kImmutableSizeHintMargin);
     const uint64_t raw_end = off + std::min<uint64_t>(hint, limit - off);
     const uint64_t pg_start = off & ~page_mask;
     const uint64_t pg_end = std::min<uint64_t>((raw_end + page_mask) & ~page_mask, mem->capacity);
@@ -432,9 +432,9 @@ void repack_dirty_shard(CompactionState &state,
                         const vmemkv::T2Memory *mem,
                         CompactionProgress &progress,
                         bool check_page_locality = true) {
-  const uint64_t base = mem->base_boundary.load(std::memory_order_acquire);
-  const uint64_t used = mem->bytes_used.load(std::memory_order_acquire);
-  if (!check_page_locality && !entries_overlap_garbage_segment(entries, own, base, used)) {
+  const uint64_t read_only = mem->read_only_offset.load(std::memory_order_acquire);
+  const uint64_t tail = mem->tail_offset.load(std::memory_order_acquire);
+  if (!check_page_locality && !entries_overlap_garbage_segment(entries, own, read_only, tail)) {
     return;
   }
 
@@ -459,7 +459,7 @@ void repack_dirty_shard(CompactionState &state,
   //      (segment defragmentation), relocate the entries overlapping garbage segments in key
   //      order without rewriting healthy segments.
   const bool repack_entire_shard = check_page_locality && payloads_broken_page_locality(payloads);
-  if (!repack_entire_shard && !payloads_overlap_garbage_segment(payloads, own, base, used)) {
+  if (!repack_entire_shard && !payloads_overlap_garbage_segment(payloads, own, read_only, tail)) {
     return;
   }
 
@@ -473,14 +473,14 @@ void repack_dirty_shard(CompactionState &state,
   if (!repack_entire_shard) {
     filtered_targets.reserve(count);
     for (uint64_t payload : payloads) {
-      if (own.payload_overlaps_garbage_segment(payload, base, used)) {
+      if (own.payload_overlaps_garbage_segment(payload, read_only, tail)) {
         filtered_targets.push_back(payload);
       }
     }
     targets = filtered_targets;
   }
   if (!targets.empty()) {
-    relocate_targets_pipelined<ConfigT>(state, targets, tier1, tier2, own, lock_stripe, mem, used, progress, measure);
+    relocate_targets_pipelined<ConfigT>(state, targets, tier1, tier2, own, lock_stripe, mem, tail, progress, measure);
   }
 }
 
@@ -504,7 +504,7 @@ auto compact_cycle(CompactionState &state,
   const auto punch_end = measure ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
   const vmemkv::T2Memory *mem = tier2.get_memory();
-  const uint64_t sync_begin = mem != nullptr ? mem->bytes_used.load(std::memory_order_acquire) : 0;
+  const uint64_t sync_begin = mem != nullptr ? mem->tail_offset.load(std::memory_order_acquire) : 0;
   CompactionProgress progress;
 
   using EntrySnapshot = typename T1::EntrySnapshot;
@@ -518,9 +518,9 @@ auto compact_cycle(CompactionState &state,
   const auto dirty_end = measure ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
   if (progress.moved_bytes < ConfigT::kCompactionMaxMoveBytesPerCycle) {
-    const uint64_t base = mem->base_boundary.load(std::memory_order_acquire);
-    const uint64_t used = mem->bytes_used.load(std::memory_order_acquire);
-    if (own.has_garbage_segment(base, used)) {
+    const uint64_t read_only = mem->read_only_offset.load(std::memory_order_acquire);
+    const uint64_t tail = mem->tail_offset.load(std::memory_order_acquire);
+    if (own.has_garbage_segment(read_only, tail)) {
       const bool completed_all_shards =
           tier1.for_each_shard_for_compaction([&](std::span<const EntrySnapshot> entries) -> bool {
             repack_dirty_shard<ConfigT>(state,
@@ -535,7 +535,7 @@ auto compact_cycle(CompactionState &state,
             return progress.moved_bytes < ConfigT::kCompactionMaxMoveBytesPerCycle;
           });
       if (completed_all_shards) {
-        own.clear_garbage_segments(base, used);
+        own.clear_garbage_segments(read_only, tail);
       }
     }
   }
@@ -543,7 +543,7 @@ auto compact_cycle(CompactionState &state,
   // timers, keeping dirty page-cache buildup bounded and naturally pacing compaction to
   // storage write bandwidth. Crash durability stays governed by the WAL and checkpoint msync().
   if (progress.did_relocate && mem != nullptr && mem->reads.pread_fd >= 0) {
-    const uint64_t sync_end = mem->bytes_used.load(std::memory_order_acquire);
+    const uint64_t sync_end = mem->tail_offset.load(std::memory_order_acquire);
     if (sync_end > sync_begin) {
       (void)::sync_file_range(mem->reads.pread_fd,
                               static_cast<off_t>(sync_begin),

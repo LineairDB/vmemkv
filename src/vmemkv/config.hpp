@@ -1,7 +1,7 @@
 // config.hpp - VMemKV configuration facets and read-policy tags.
 //
 // `vmemkv::Config<ReadPolicies...>` is the source of truth for T1/T2 settings
-// and base-region read-policy selection.
+// and immutable-region read-policy selection.
 //
 #pragma once
 
@@ -15,13 +15,13 @@ namespace vmemkv {
 inline constexpr uint64_t STORE_NOT_FOUND = ~0ULL;  // Tombstone payload; never a valid offset.
 
 // Bloom filtering and T1 inline-value storage are enabled in every configuration.
-// Read-path policies for the base/tail split (docs/specification/low_level_design.md
+// Read-path policies for the immutable/mutable split (docs/specification/low_level_design.md
 // 7.5). Default: quadfecta -- size- and reader-dependent choice among the four
 // T2ReadHandles (random_mmap, sequential_mmap, normal_mmap, pread_fd).
-// ReadPolicyRandomOnly: every base-region read goes through the primary mapping.
-// ReadPolicySeqOnly: every base-region read goes through the MADV_SEQUENTIAL mapping.
-// ReadPolicyNormalOnly: every base-region read goes through the plain mapping.
-// ReadPolicyPreadOnly: every base-region read goes through pread (no mmap readahead).
+// ReadPolicyRandomOnly: every immutable-region read goes through the primary mapping.
+// ReadPolicySeqOnly: every immutable-region read goes through the MADV_SEQUENTIAL mapping.
+// ReadPolicyNormalOnly: every immutable-region read goes through the plain mapping.
+// ReadPolicyPreadOnly: every immutable-region read goes through pread (no mmap readahead).
 struct ReadPolicyRandomOnly {};
 struct ReadPolicySeqOnly {};
 struct ReadPolicyNormalOnly {};
@@ -31,11 +31,11 @@ struct ReadPolicyPreadOnly {};
 // Single-responsibility value groups. Config<...> below aggregates them.
 // Flat names re-exported for ConfigT::X uses.
 struct T1Config {
-  // Append-region capacity (ablation knob). Power of two for cache-friendly masking.
-  // Empty append regions skip probing AppendIndex (tail_ == 0 check), so unused shards do not
+  // Per-shard MemTable capacity (ablation knob). Power of two for cache-friendly masking.
+  // Empty MemTables skip probing MemTableIndex (tail_ == 0 check), so unused shards do not
   // fault index pages while active hot shards retain burst headroom during checkpoint pauses.
-  static constexpr size_t kAppendCapacityLog2 = 15;
-  static constexpr size_t kAppendCapacityEntries = size_t{1} << kAppendCapacityLog2;
+  static constexpr size_t kMemTableCapacityLog2 = 15;
+  static constexpr size_t kMemTableCapacityEntries = size_t{1} << kMemTableCapacityLog2;
 
   // Fallback per-shard live-entry target for ShardedT1Index (inline-only or standalone T1):
   // T2-backed shards split once their referenced T2 bytes reach Config::kSegmentBytes (8 MiB),
@@ -63,7 +63,7 @@ struct T2Config {
 
 struct WalConfig {
   // Checkpoint trigger: past this many WAL bytes since the last checkpoint, a checkpoint fires
-  // regardless of append-region occupancy, bounding replay time.
+  // regardless of MemTable occupancy, bounding replay time.
   // See docs/specification/low_level_design.md 4.4.
   static constexpr size_t kMaxBytesSinceCheckpoint = 64ULL << 20;  // 64 MiB.
 };
@@ -96,8 +96,8 @@ struct Config : T1Config,
 
   static constexpr size_t kBitsPerByte = 8;
 
-  static_assert(kAppendCapacityLog2 > 0 && kAppendCapacityLog2 < (sizeof(size_t) * kBitsPerByte),
-                "kAppendCapacityLog2 must be in (0, bitwidth(size_t))");
+  static_assert(kMemTableCapacityLog2 > 0 && kMemTableCapacityLog2 < (sizeof(size_t) * kBitsPerByte),
+                "kMemTableCapacityLog2 must be in (0, bitwidth(size_t))");
   // Number of pinned read-path policies: at most one may be set.
   static constexpr int kActiveReadPolicies =
       static_cast<int>(UseReadPolicyRandomOnly) + static_cast<int>(UseReadPolicySeqOnly) +
