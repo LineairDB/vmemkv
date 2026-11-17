@@ -27,6 +27,7 @@
 #include <vmemkv/core/background_poll.hpp>
 #include <vmemkv/core/env.hpp>
 #include <vmemkv/core/single_flight.hpp>
+#include <vmemkv/impl/read_path.hpp>
 #include <vmemkv/impl/t2_ownership.hpp>
 #include <vmemkv/t1_index/t1_codec.hpp>
 #include <vmemkv/t2_flat_file/t2_flat_file.hpp>
@@ -225,12 +226,23 @@ auto relocate_one(T1 &tier1,
                   T2FlatFile &tier2,
                   T2Ownership<ConfigT> &own,
                   LockStripe &&lock_stripe,
-                  uint64_t old_off,
+                  uint64_t target_payload,
                   const vmemkv::T2Memory *mem,
                   CompactionState *probe = nullptr) -> uint64_t {
   const bool measure = probe != nullptr && segment_probe_enabled();
+  const uint64_t old_off = target_payload & t2_detail::kPayloadOffsetMask;
+
+  // Reuse the base-region read path (mmap for small/resident records, bounded pread() for
+  // non-resident multi-page records below base_boundary) with no stripe lock held across I/O;
+  // records still in the mutable tail fall back to T2FlatFile::at().
+  thread_local static std::vector<std::byte> tl_compact_cold_buf;
+  const auto read_start = measure ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+  const std::optional<T2RecordView> preloaded =
+      try_read_base_record<ConfigT>(mem, target_payload, BaseReader::kGet, &tl_compact_cold_buf);
+  const auto read_end = measure ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+
   const auto validate_start = measure ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-  const std::span<const std::byte> key = T2FlatFile::at(old_off, mem).key;
+  const std::span<const std::byte> key = preloaded.has_value() ? preloaded->key : T2FlatFile::at(old_off, mem).key;
 
   std::lock_guard<std::mutex> key_lock(lock_stripe(key));
   const auto cur = tier1.get_with_hash(key);
@@ -239,7 +251,8 @@ auto relocate_one(T1 &tier1,
     return 0;
   }
   const auto validate_end = measure ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-  const std::span<const std::byte> value_span = T2FlatFile::at(old_off, mem).value;
+  const std::span<const std::byte> value_span =
+      preloaded.has_value() ? preloaded->value : T2FlatFile::at(old_off, mem).value;
   T2FlatFile::T2MemoryHandle handle = tier2.acquire_write_handle();
   const uint64_t offset = vmemkv::T2FlatFile::append_default(handle, key, value_span);
   const auto movedata_end = measure ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -255,6 +268,7 @@ auto relocate_one(T1 &tier1,
         std::memory_order_relaxed);
     probe->probe_movedata_ns.fetch_add(
         static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(read_end - read_start).count() +
             std::chrono::duration_cast<std::chrono::nanoseconds>(movedata_end - validate_end).count()),
         std::memory_order_relaxed);
     probe->probe_publish_ns.fetch_add(
@@ -391,8 +405,7 @@ void relocate_targets_pipelined(CompactionState &state,
     for (size_t i = batch_start; i < batch_end; ++i) {
       const auto relocation_start =
           measure ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-      const uint64_t off = targets[i] & t2_detail::kPayloadOffsetMask;
-      const uint64_t moved = relocate_one<ConfigT>(tier1, tier2, own, lock_stripe, off, mem, &state);
+      const uint64_t moved = relocate_one<ConfigT>(tier1, tier2, own, lock_stripe, targets[i], mem, &state);
       if (moved != 0) {
         progress.moved_bytes += moved;
         progress.did_relocate = true;
