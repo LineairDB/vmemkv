@@ -55,7 +55,7 @@ class ShardedT1Index {
                           size_t target_shard_size = Config::kShardTargetSizeEntries,
                           size_t worker_threads = default_worker_count())
       : append_cap_(append_cap), target_shard_size_(target_shard_size) {
-    auto *slot = new ShardSlot(std::make_unique<Shard>(append_cap));
+    auto *slot = new ShardSlot(std::make_unique<Shard>(append_cap, &epoch_domain_));
     auto *dir = new Directory();
     dir->shards.push_back(slot);
     directory_.store(dir, std::memory_order_release);
@@ -95,7 +95,7 @@ class ShardedT1Index {
     const Key prefix = t1_detail::prefix_from_bytes(key);
     return with_routing_guard([&]() -> LookupResult {
       ShardSlot *slot = resolve(prefix);
-      return slot->index->get_with_hash(key);
+      return slot->index->get_with_hash(key, kCallerHeldEpoch);
     });
   }
 
@@ -118,7 +118,7 @@ class ShardedT1Index {
           return std::nullopt;
         }
         request_maintenance_if_needed(slot);
-        const PutResult result = slot->index->put(key, value, is_inline, inline_size);
+        const PutResult result = slot->index->put(key, value, is_inline, inline_size, kCallerHeldEpoch);
         if (result == PutResult::AppendRegionFull || slot->superseded.load(std::memory_order_acquire) != nullptr) {
           return std::nullopt;
         }
@@ -187,14 +187,14 @@ class ShardedT1Index {
     return last_split_pause_end_ns_.load(std::memory_order_relaxed);
   }
 
-  // Sums one per-shard counter under a single routing guard (directory_ must not be read
+  // Sums one per-shard value under a single routing guard (directory_ must not be read
   // unguarded).
-  template <typename Total, typename Counter>
-  auto reduce_shards(Counter counter) const -> Total {
+  template <typename Total, typename Fn>
+  auto reduce_shards(Fn &&func) const -> Total {
     return with_routing_guard([&]() -> Total {
       Total total = 0;
       for (ShardSlot *slot : directory_.load(std::memory_order_acquire)->shards) {
-        total += (slot->index.get()->*counter)();
+        total += func(*slot->index);
       }
       return total;
     });
@@ -202,19 +202,21 @@ class ShardedT1Index {
 
   // Sum of every shard's current append occupancy: "anything left to merge" for a T1-only
   // reorganize skip-if-empty check.
-  [[nodiscard]] auto append_size() const -> size_t { return reduce_shards<size_t>(&Shard::append_size); }
+  [[nodiscard]] auto append_size() const -> size_t {
+    return reduce_shards<size_t>([](const Shard &shard) noexcept { return shard.append_size(kCallerHeldEpoch); });
+  }
 
   // Whole-store aggregates of the per-shard RSS/churn counters. Live shards only: a retired
   // shard's peak drops out (monitoring use; not a precise lifetime maximum).
   [[nodiscard]] auto append_region_live_count() const -> int64_t {
-    return reduce_shards<int64_t>(&Shard::append_region_live_count);
+    return reduce_shards<int64_t>([](const Shard &shard) noexcept { return shard.append_region_live_count(); });
   }
 
   // Approximate: sums each *currently live* shard's own peak, so a shard retired by a split after
   // reaching a high peak doesn't contribute it here. Acceptable for its monitoring use (see
   // T1Index::append_region_live_count()'s comment) -- not a precise store-lifetime maximum.
   [[nodiscard]] auto append_region_peak_count() const -> int64_t {
-    return reduce_shards<int64_t>(&Shard::append_region_peak_count);
+    return reduce_shards<int64_t>([](const Shard &shard) noexcept { return shard.append_region_peak_count(); });
   }
 
   // Test/maintenance hook: full Closing -> re-reorganize -> Split on `key`'s shard. No-op when
@@ -286,8 +288,8 @@ class ShardedT1Index {
     uint64_t active_epoch = checkpoint_write_epoch_.load(std::memory_order_acquire);
     if (advance_epoch) {
       active_epoch = checkpoint_write_epoch_.fetch_add(1, std::memory_order_acq_rel);
-      const uint64_t bumped_routing = routing_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
-      routing_epochs_.wait_until_epoch(bumped_routing);
+      const uint64_t bumped_routing = epoch_domain_.epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
+      epoch_domain_.tracker.wait_until_epoch(bumped_routing);
     }
 
     std::vector<ShardSlot *> snapshot;
@@ -323,7 +325,7 @@ class ShardedT1Index {
     new_dir->boundaries.assign(boundaries.begin(), boundaries.end());
     new_dir->shards.reserve(per_shard_entries.size());
     for (const auto &entries : per_shard_entries) {
-      auto shard = std::make_unique<Shard>(append_cap_);
+      auto shard = std::make_unique<Shard>(append_cap_, &epoch_domain_);
       shard->load_sorted_region_from_checkpoint(entries);
       auto *slot = new ShardSlot(std::move(shard));
       slot->approx_t2_bytes.store(sharded_detail::sum_entries_t2_bytes(std::span<const EntrySnapshot>(entries)),
@@ -380,9 +382,9 @@ class ShardedT1Index {
     with_routing_guard([&] {
       Directory *dir = directory_.load(std::memory_order_acquire);
       for (ShardSlot *slot : dir->shards) {
-        if (should_split_shard(slot->index->approx_entry_count(),
+        if (should_split_shard(slot->index->approx_entry_count(kCallerHeldEpoch),
                                slot->approx_t2_bytes.load(std::memory_order_relaxed)) ||
-            slot->index->append_size() > 0) {
+            slot->index->append_size(kCallerHeldEpoch) > 0) {
           queue_.push_if_live(slot);
         }
       }
@@ -769,7 +771,7 @@ class ShardedT1Index {
     if (split != nullptr && split != kClosingSentinel) {
       return std::nullopt;
     }
-    return slot->index->scan(lo_bytes, hi_bytes, callback);
+    return slot->index->scan(lo_bytes, hi_bytes, callback, kCallerHeldEpoch);
   }
 
   template <typename Callback>
@@ -782,7 +784,7 @@ class ShardedT1Index {
                         bool &stopped) const -> size_t {
     size_t total = 0;
     ShardSetView{dir}.for_each_leaf_in_range(lower, upper, [&](ShardSlot *leaf) -> bool {
-      total += leaf->index->scan(lo_bytes, hi_bytes, callback);
+      total += leaf->index->scan(lo_bytes, hi_bytes, callback, kCallerHeldEpoch);
       return !stopped;
     });
     return total;
@@ -852,8 +854,9 @@ class ShardedT1Index {
 
   template <typename Func>
   auto with_routing_guard(Func &&func) const noexcept(noexcept(func())) -> decltype(func()) {
-    typename ThreadReferenceTracker<uint64_t>::Guard handle(routing_epochs_,
-                                                            routing_epoch_.load(std::memory_order_relaxed));
+    assert(!epoch_domain_.tracker.is_held_by_current_thread());
+    typename ThreadReferenceTracker<uint64_t>::Guard handle(epoch_domain_.tracker,
+                                                            epoch_domain_.epoch.load(std::memory_order_relaxed));
     return func();
   }
 
@@ -938,8 +941,8 @@ class ShardedT1Index {
     const std::span<const EntrySnapshot> high_entries(merged_entries.data() + mid, merged_entries.size() - mid);
     const uint64_t low_t2_bytes = sharded_detail::sum_entries_t2_bytes(low_entries);
     const uint64_t high_t2_bytes = sharded_detail::sum_entries_t2_bytes(high_entries);
-    auto low_shard = std::make_unique<Shard>(target->index->append_capacity());
-    auto high_shard = std::make_unique<Shard>(target->index->append_capacity());
+    auto low_shard = std::make_unique<Shard>(target->index->append_capacity(), &epoch_domain_);
+    auto high_shard = std::make_unique<Shard>(target->index->append_capacity(), &epoch_domain_);
     low_shard->load_sorted_region_from_checkpoint(low_entries);
     high_shard->load_sorted_region_from_checkpoint(high_entries);
 
@@ -975,8 +978,8 @@ class ShardedT1Index {
     // `superseded == nullptr` before Closing may still be executing `note_put_applied(target)`
     // inside its routing guard; waiting here guarantees its dirty flag is never missed.
     // Waiting after Split publish avoids deadlocking writers that spin outside routing guards.
-    const uint64_t bumped = routing_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
-    routing_epochs_.wait_until_epoch(bumped);
+    const uint64_t bumped = epoch_domain_.epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
+    epoch_domain_.tracker.wait_until_epoch(bumped);
 
     const bool dirty = was_dirty || target->t2_dirty.load(std::memory_order_acquire);
     if (dirty) {
@@ -1072,7 +1075,7 @@ class ShardedT1Index {
   // re-check: ordered-before-purge gets cleaned; ordered-after sees set superseded and backs
   // out. No post-return queue entry for a splitting shard, ever.
   void request_maintenance_if_needed(ShardSlot *slot) {
-    const size_t size = slot->index->append_size();
+    const size_t size = slot->index->append_size(kCallerHeldEpoch);
     const size_t cap = slot->index->append_capacity();
     const bool over_soft = size >= maintenance_soft_threshold(cap);
     const bool delete_heavy = slot->tombstones_since_maintenance.load(std::memory_order_relaxed) >= target_shard_size_;
@@ -1205,8 +1208,8 @@ class ShardedT1Index {
     return true;
   }
 
-  mutable ThreadReferenceTracker<uint64_t> routing_epochs_;
-  std::atomic<uint64_t> routing_epoch_{1};
+  // Declared before directory_ so epoch_domain_ outlives every Shard torn down after workers join.
+  mutable EpochDomain epoch_domain_;
   std::atomic<uint64_t> total_splits_{0};
   std::atomic<uint64_t> last_split_pause_us_{0};
   std::atomic<uint64_t> last_split_pause_end_ns_{0};

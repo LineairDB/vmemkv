@@ -80,8 +80,12 @@ class T1Index {
   using T1ReadHandle = typename ThreadReferenceTracker<uint64_t>::Guard;
 
   // `append_cap`: lock-free append-region (LSM-style MemTable) capacity, not whole-KVS capacity.
-  // Defaults to Config::kAppendCapacityEntries; sharded T1 passes a per-shard override.
-  explicit T1Index(size_t append_cap = Config::kAppendCapacityEntries) : append_cap_(append_cap) {
+  // Defaults to Config::kAppendCapacityEntries; sharded T1 passes a per-shard override plus its
+  // shared EpochDomain so shards omit per-shard ThreadReferenceTracker storage and nested guards.
+  explicit T1Index(size_t append_cap = Config::kAppendCapacityEntries, EpochDomain *shared_epoch = nullptr)
+      : append_cap_(append_cap),
+        owned_epoch_(shared_epoch == nullptr ? std::make_unique<EpochDomain>() : nullptr),
+        epoch_domain_(shared_epoch != nullptr ? shared_epoch : owned_epoch_.get()) {
     auto *active_region = new AppendRegion(append_cap_);
     note_append_region_created();
     auto *active_index = new AppendIndex(append_cap_);
@@ -127,12 +131,18 @@ class T1Index {
     void operator()(std::span<const EntrySnapshot> /*merged*/) const noexcept {}
   };
 
-  auto get_with_hash(std::span<const std::byte> key) const -> LookupResult {
-    const auto [prefix, hash] = prepare_key_and_hash(key);
-    return with_epoch_guard([&]() -> LookupResult { return lookup_by_prefix_hash(prefix, hash); });
+  auto get_with_hash(std::span<const std::byte> key) const -> LookupResult { return get_with_hash_impl<true>(key); }
+
+  auto get_with_hash(std::span<const std::byte> key, CallerHeldEpochTag /*tag*/) const -> LookupResult {
+    return get_with_hash_impl<false>(key);
   }
 
  private:
+  template <bool AcquireGuard>
+  auto get_with_hash_impl(std::span<const std::byte> key) const -> LookupResult {
+    const auto [prefix, hash] = prepare_key_and_hash(key);
+    return run_in_epoch<AcquireGuard>([&]() -> LookupResult { return lookup_by_prefix_hash(prefix, hash); });
+  }
   // Lookup body for get_with_hash() -- call inside with_epoch_guard(). The (hash, payload)
   // pair is read via load_slot_consistent(): independent loads could feed a torn pair onward.
   auto lookup_by_prefix_hash(const t1_detail::StoreKey &prefix, uint64_t hash) const -> LookupResult {
@@ -168,18 +178,17 @@ class T1Index {
  public:
   auto get(std::span<const std::byte> key) const -> Payload { return get_with_hash(key).payload_bits; }
 
-  [[nodiscard]] auto append_size() const noexcept -> size_t {
-    return with_epoch_guard([&]() noexcept { return append_active_.load(std::memory_order_acquire)->region->size(); });
+  [[nodiscard]] auto append_size() const noexcept -> size_t { return append_size_impl<true>(); }
+  [[nodiscard]] auto append_size(CallerHeldEpochTag /*tag*/) const noexcept -> size_t {
+    return append_size_impl<false>();
   }
 
   // Approximate total entry count (sorted plus active append, including dead entries).
   // Cheap enough to poll: two atomic loads under an epoch guard, no merge. Over-approximates
   // live entries, so it gates expensive work, never correctness.
-  [[nodiscard]] auto approx_entry_count() const noexcept -> size_t {
-    return with_epoch_guard([&]() noexcept {
-      return sorted_region_.load(std::memory_order_acquire)->size +
-             append_active_.load(std::memory_order_acquire)->region->size();
-    });
+  [[nodiscard]] auto approx_entry_count() const noexcept -> size_t { return approx_entry_count_impl<true>(); }
+  [[nodiscard]] auto approx_entry_count(CallerHeldEpochTag /*tag*/) const noexcept -> size_t {
+    return approx_entry_count_impl<false>();
   }
 
   // Fixed for this instance's lifetime.
@@ -195,7 +204,7 @@ class T1Index {
   // the active append and the frozen immutable are empty; callers check has_immutable()).
   // Epoch-guarded; tombstones skipped as a merge would skip them.
   void dump_sorted_region(std::vector<EntrySnapshot> &out) const {
-    with_epoch_guard([&] {
+    run_in_epoch<true>([&] {
       out.clear();
       const SortedRegion *sorted = sorted_region_.load(std::memory_order_acquire);
       Key max_key;
@@ -223,16 +232,45 @@ class T1Index {
            Payload value,
            bool is_inline = false,
            uint8_t inline_size = 0) -> PutResult {
-    const auto [prefix, hash] = prepare_key_and_hash(key);
-    const uint64_t stored_hash = is_inline ? t1_detail::embed_metadata(hash, inline_size) : hash;
-    return put_with_stored_hash(prefix, hash, stored_hash, value);
+    return put_impl<true>(key, value, is_inline, inline_size);
+  }
+
+  // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+  auto put(std::span<const std::byte> key,
+           Payload value,
+           bool is_inline,
+           uint8_t inline_size,
+           CallerHeldEpochTag /*tag*/) -> PutResult {
+    return put_impl<false>(key, value, is_inline, inline_size);
   }
 
  private:
+  template <bool AcquireGuard>
+  [[nodiscard]] auto append_size_impl() const noexcept -> size_t {
+    return run_in_epoch<AcquireGuard>(
+        [&]() noexcept { return append_active_.load(std::memory_order_acquire)->region->size(); });
+  }
+
+  template <bool AcquireGuard>
+  [[nodiscard]] auto approx_entry_count_impl() const noexcept -> size_t {
+    return run_in_epoch<AcquireGuard>([&]() noexcept {
+      return sorted_region_.load(std::memory_order_acquire)->size +
+             append_active_.load(std::memory_order_acquire)->region->size();
+    });
+  }
+
+  template <bool AcquireGuard>
+  auto put_impl(std::span<const std::byte> key, Payload value, bool is_inline, uint8_t inline_size) -> PutResult {
+    const auto [prefix, hash] = prepare_key_and_hash(key);
+    const uint64_t stored_hash = is_inline ? t1_detail::embed_metadata(hash, inline_size) : hash;
+    return put_with_stored_hash<AcquireGuard>(prefix, hash, stored_hash, value);
+  }
+
   // Insert body for put(), after (prefix, clean hash, stored_hash) resolution.
+  template <bool AcquireGuard>
   // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
   auto put_with_stored_hash(const Key &prefix, uint64_t hash, uint64_t stored_hash, Payload value) -> PutResult {
-    return with_epoch_guard([&]() -> PutResult {
+    return run_in_epoch<AcquireGuard>([&]() -> PutResult {
       // Retries: the in-place write can race a displacing concurrent insert (publish_slot()'s
       // on_displaced). same_slot_as() after writing tells real displacement (retire ours, retry)
       // from delete/reinsert; the frozen-region case below falls through to insert-new.
@@ -289,10 +327,26 @@ class T1Index {
   // Range scan over [lo_bytes, hi_bytes): consistent snapshot of both regions, deduped.
   // `Callback`: `(key, payload, hash) -> void | ScanControl`.
   template <typename Callback>
-  // NOLINTNEXTLINE(bugprone-easily-swappable-parameters,readability-function-cognitive-complexity)
   auto scan(std::span<const std::byte> lo_bytes,
             std::span<const std::byte> hi_bytes,
             Callback callback) const -> size_t {
+    return scan_impl<true>(lo_bytes, hi_bytes, std::move(callback));
+  }
+
+  template <typename Callback>
+  auto scan(std::span<const std::byte> lo_bytes,
+            std::span<const std::byte> hi_bytes,
+            Callback callback,
+            CallerHeldEpochTag /*tag*/) const -> size_t {
+    return scan_impl<false>(lo_bytes, hi_bytes, std::move(callback));
+  }
+
+ private:
+  template <bool AcquireGuard, typename Callback>
+  // NOLINTNEXTLINE(bugprone-easily-swappable-parameters,readability-function-cognitive-complexity)
+  auto scan_impl(std::span<const std::byte> lo_bytes,
+                 std::span<const std::byte> hi_bytes,
+                 Callback callback) const -> size_t {
     const t1_detail::StoreKey lower_bound = t1_detail::prefix_from_bytes(lo_bytes);
     const t1_detail::StoreKey upper_bound = t1_detail::prefix_from_bytes(hi_bytes);
     // NOLINTNEXTLINE(readability-function-cognitive-complexity)
@@ -311,7 +365,7 @@ class T1Index {
 
     // Fast path: when active and immutable append regions are disjoint from the range,
     // stream sorted entries directly to callback without candidates buffering, sorting, or dedup.
-    const auto fast_res = with_epoch_guard([&]() -> std::optional<size_t> {
+    const auto fast_res = run_in_epoch<AcquireGuard>([&]() -> std::optional<size_t> {
       const SortedRegion *sorted = sorted_region_.load(std::memory_order_acquire);
       const AppendRegion *active = append_active_.load(std::memory_order_acquire)->region;
       const AppendGeneration *imm_gen = append_immutable_.get();
@@ -347,7 +401,7 @@ class T1Index {
 
     // Step 1: Extract candidate entries under epoch guard (fast, microseconds, in-memory index only).
     // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-    with_epoch_guard([&] {
+    run_in_epoch<AcquireGuard>([&] {
       const SortedRegion *sorted = sorted_region_.load(std::memory_order_acquire);
       const AppendRegion *active = append_active_.load(std::memory_order_acquire)->region;
       const AppendGeneration *imm_gen = append_immutable_.get();
@@ -458,6 +512,7 @@ class T1Index {
     return match_count;
   }
 
+ public:
   // Merges append_active_ into sorted_region_; lock-free readers may run concurrently.
   // - OffsetMapper: `void(span<EntrySnapshot> merged)` once, with the full deduped key-ordered
   //   live set. May rewrite `.payload_bits` in place (e.g. relocate a T2 offset), in any order --
@@ -490,8 +545,8 @@ class T1Index {
 
     // Advance epoch and wait out writers on the old region. After this: no new reserve() on
     // it, and every reserved slot is fully published -- straggler and post-freeze races closed.
-    uint64_t freeze_epoch = reorg_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
-    active_epochs_.wait_until_epoch(freeze_epoch);
+    uint64_t freeze_epoch = epoch_domain_->epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
+    epoch_domain_->tracker.wait_until_epoch(freeze_epoch);
 
     // 3. Rebuild sorted region from sorted_region and append_immutable
     const auto sorted = sorted_region_.load(std::memory_order_acquire);
@@ -582,8 +637,8 @@ class T1Index {
     chk_writer(std::span<const EntrySnapshot>(merged));
 
     // 4. Retire old buffers: advance epoch, wait out readers, then delete.
-    uint64_t target_epoch = reorg_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
-    active_epochs_.wait_until_epoch(target_epoch);
+    uint64_t target_epoch = epoch_domain_->epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
+    epoch_domain_->tracker.wait_until_epoch(target_epoch);
 
     delete old_active_gen->region;
     note_append_region_destroyed();
@@ -965,13 +1020,18 @@ class T1Index {
     return nullptr;
   }
 
-  // Runs `func` epoch-registered: every method dereferencing the guarded regions must go
-  // through this, or reorganize() could free buffers still in use. `func` must never block on
-  // reorganize() completing (deadlock against wait_until_epoch()).
-  template <typename Func>
-  auto with_epoch_guard(Func &&func) const noexcept(noexcept(func())) -> decltype(func()) {
-    T1ReadHandle handle(active_epochs_, reorg_epoch_.load(std::memory_order_relaxed));
-    return func();
+  // Runs `func` in the shard's EpochDomain: standalone callers acquire a guard; sharded callers
+  // pass kCallerHeldEpoch (`AcquireGuard = false`) after already acquiring in ShardedT1Index.
+  template <bool AcquireGuard = true, typename Func>
+  auto run_in_epoch(Func &&func) const noexcept(noexcept(func())) -> decltype(func()) {
+    if constexpr (AcquireGuard) {
+      assert(!epoch_domain_->tracker.is_held_by_current_thread());
+      T1ReadHandle handle(epoch_domain_->tracker, epoch_domain_->epoch.load(std::memory_order_relaxed));
+      return func();
+    } else {
+      assert(epoch_domain_->tracker.is_held_by_current_thread());
+      return func();
+    }
   }
 
   auto resolve(Key key, uint64_t hash) noexcept -> ResolvedSlot {
@@ -1031,8 +1091,9 @@ class T1Index {
 
   // ─── Member Variables ──────────────────────────────────────────────────
   const size_t append_cap_;
+  std::unique_ptr<EpochDomain> owned_epoch_;
+  EpochDomain *const epoch_domain_;
   mutable std::atomic<bool> reorg_in_progress_{false};
-  std::atomic<uint64_t> reorg_epoch_{1};
 
   std::atomic<const SortedRegion *> sorted_region_{nullptr};
   std::atomic<AppendGeneration *> append_active_{nullptr};
@@ -1042,8 +1103,6 @@ class T1Index {
   // Frozen for the merge loop's duration (same region sorted_region_ points at); closes the
   // sorted-region Lost Update counterpart append_immutable_ already guards.
   FreezableRegion<const SortedRegion *> sorted_write_frozen_;
-
-  mutable ThreadReferenceTracker<uint64_t> active_epochs_;
 };
 
 template <typename Config>

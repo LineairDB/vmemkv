@@ -73,6 +73,17 @@ class ThreadReferenceTracker {
   // Clears the current thread's reference.
   void release() const noexcept { slot_for_current_thread().store(T{}, std::memory_order_release); }
 
+  // Diagnostic check used by debug assertions to catch missing or nested epoch guards.
+  [[nodiscard]] auto is_held_by_current_thread() const noexcept -> bool {
+    const size_t thread_id = GlobalThreadId::get();
+    const size_t chunk_index = thread_id / kChunkSize;
+    if (chunk_index >= kMaxChunks) {
+      return false;
+    }
+    const AlignedSlot *chunk = chunks_[chunk_index].load(std::memory_order_acquire);
+    return chunk != nullptr && chunk[thread_id % kChunkSize].value.load(std::memory_order_relaxed) != T{};
+  }
+
   // Spins until no slot still references old_val. SpinBackoff (not bare yield): a real
   // deschedule is the only wait guaranteed to converge on a contended low-core machine.
   void wait_until_retired(T old_val) const noexcept {
@@ -168,5 +179,16 @@ class ThreadReferenceTracker {
   mutable std::array<std::atomic<AlignedSlot *>, kMaxChunks> chunks_{};
   mutable std::atomic<size_t> high_chunk_{0};
 };
+
+// Pairs a monotonic epoch counter with the tracker guarding readers/writers against retirement;
+// shared between ShardedT1Index and its shard T1Index instances.
+struct EpochDomain {
+  mutable ThreadReferenceTracker<uint64_t> tracker;
+  std::atomic<uint64_t> epoch{1};
+};
+
+// Disambiguates T1Index entry points called while the caller already holds the EpochDomain guard.
+struct CallerHeldEpochTag {};
+inline constexpr CallerHeldEpochTag kCallerHeldEpoch{};
 
 }  // namespace vmemkv
