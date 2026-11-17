@@ -244,8 +244,8 @@ class VMemKVImpl {
     stats.checkpoint_count = checkpoint_.stats.checkpoint_count.load(std::memory_order_relaxed);
     vmemkv::snapshot_checkpoint_stats(checkpoint_.stats, stats);
     stats.total_reorganize_wait_duration_us = checkpoint_.stats.total_wait_us.load(std::memory_order_relaxed);
-    stats.append_region_live_count = t1_.memtable_live_count();
-    stats.append_region_peak_count = t1_.memtable_peak_count();
+    stats.memtable_live_count = t1_.memtable_live_count();
+    stats.memtable_peak_count = t1_.memtable_peak_count();
     stats.bulk_load_throttle_events = bulk_load_throttle_.throttle_events();
     stats.compaction_cycle_count = compact_.cycle_count.load(std::memory_order_relaxed);
     stats.t2_dirty_shard_count = t1_.dirty_shard_count();

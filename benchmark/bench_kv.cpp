@@ -744,8 +744,9 @@ static void register_benchmark_context() {
   benchmark::AddCustomContext("ycsb_window_seconds", std::to_string(get_ycsb_duration_seconds()));
   benchmark::AddCustomContext("warmup_policy",
                               "no warmup discard; corpus pre-populated on the same host, LTM cells cgroup-isolated");
-  benchmark::AddCustomContext("t1_append_capacity_log2", std::to_string(vmemkv::Config<>::kMemTableCapacityLog2));
-  benchmark::AddCustomContext("t1_append_capacity_entries", std::to_string(vmemkv::Config<>::kMemTableCapacityEntries));
+  benchmark::AddCustomContext("t1_memtable_capacity_log2", std::to_string(vmemkv::Config<>::kMemTableCapacityLog2));
+  benchmark::AddCustomContext("t1_memtable_capacity_entries",
+                              std::to_string(vmemkv::Config<>::kMemTableCapacityEntries));
   benchmark::AddCustomContext("t1_shard_target_size_entries",
                               std::to_string(vmemkv::Config<>::kShardTargetSizeEntries));
   benchmark::AddCustomContext("t1_shard_split_threshold_percent",
@@ -1260,10 +1261,10 @@ static void record_store_statistics(benchmark::State &state, StoreHolder<StorePt
       benchmark::Counter(static_cast<double>(stats.checkpoint_count), benchmark::Counter::kDefaults);
   state.counters["Reorganize_Wait_Duration_us"] =
       benchmark::Counter(static_cast<double>(stats.total_reorganize_wait_duration_us), benchmark::Counter::kDefaults);
-  state.counters["Append_Region_Live"] =
-      benchmark::Counter(static_cast<double>(stats.append_region_live_count), benchmark::Counter::kDefaults);
-  state.counters["Append_Region_Peak"] =
-      benchmark::Counter(static_cast<double>(stats.append_region_peak_count), benchmark::Counter::kDefaults);
+  state.counters["MemTable_Live"] =
+      benchmark::Counter(static_cast<double>(stats.memtable_live_count), benchmark::Counter::kDefaults);
+  state.counters["MemTable_Peak"] =
+      benchmark::Counter(static_cast<double>(stats.memtable_peak_count), benchmark::Counter::kDefaults);
   state.counters["Compaction_Cycles"] =
       benchmark::Counter(static_cast<double>(stats.compaction_cycle_count), benchmark::Counter::kDefaults);
   state.counters["T2_Dirty_Shards"] =

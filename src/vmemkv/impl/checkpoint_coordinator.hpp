@@ -546,12 +546,9 @@ void reorganize_internal(CheckpointState &state,
       own.note_checkpoint_completed(state.stats.checkpoint_count.load(std::memory_order_relaxed));
       break;
     case MaintenanceMode::T1Only: {
-      // Zero-I/O T1 merge with untouched payloads. checkpoint_all_shards() with no-op writers
-      // gives the same "every shard merged before return" contract.
-      g_checkpoint_debug_phase.store("reorganize: T1Only checkpoint_all_shards", std::memory_order_release);
-      using EntrySnapshot = typename ShardedT1Index<ConfigT>::EntrySnapshot;
-      tier1.checkpoint_all_shards([](std::span<EntrySnapshot> /*merged*/) {},
-                                  [](std::span<const EntrySnapshot> /*merged*/) {});
+      // Zero-I/O T1 merge with untouched payloads; merges only shards with pending MemTables.
+      g_checkpoint_debug_phase.store("reorganize: T1Only", std::memory_order_release);
+      tier1.reorganize();
       g_checkpoint_debug_phase.store("idle", std::memory_order_release);
       break;
     }
@@ -585,7 +582,7 @@ void run_reorganize(CheckpointState &state,
       return;
     }
 
-    if (!force_run && tier1.memtable_size() == 0) {
+    if (!force_run && !tier1.has_pending_memtables()) {
       return;
     }
 

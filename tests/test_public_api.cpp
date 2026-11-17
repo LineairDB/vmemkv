@@ -199,10 +199,14 @@ TEST_CASE("public API: maintenance and statistics") {
   REQUIRE(store.insert("a", "1"));
 
   const auto before = store.get_statistics();
+  CHECK(before.memtable_live_count >= 1);
+  CHECK(before.memtable_peak_count >= before.memtable_live_count);
   store.reorganize();
   store.checkpoint();
   const auto after = store.get_statistics();
   CHECK(after.checkpoint_count == before.checkpoint_count + 1);
+  CHECK(after.memtable_live_count >= 1);
+  CHECK(after.memtable_peak_count >= after.memtable_live_count);
 
   std::string seen;
   CHECK(store.get("a", [&](std::span<const std::byte> value) { seen = span_to_string(value); }));

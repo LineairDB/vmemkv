@@ -200,10 +200,43 @@ class ShardedT1Index {
     });
   }
 
-  // Sum of every shard's current MemTable occupancy: "anything left to merge" for a T1-only
-  // reorganize skip-if-empty check.
+  // Sum of every shard's current MemTable occupancy.
   [[nodiscard]] auto memtable_size() const -> size_t {
     return reduce_shards<size_t>([](const Shard &shard) noexcept { return shard.memtable_size(kCallerHeldEpoch); });
+  }
+
+  // True when any live shard currently has entries buffered in its active MemTable or an
+  // in-flight immutable MemTable.
+  [[nodiscard]] auto has_pending_memtables() const -> bool {
+    return with_routing_guard([&]() -> bool {
+      Directory *dir = directory_.load(std::memory_order_acquire);
+      return std::ranges::any_of(dir->shards, [](const ShardSlot *slot) {
+        return slot->index->memtable_size(kCallerHeldEpoch) > 0 || slot->index->has_immutable();
+      });
+    });
+  }
+
+  // Merges every shard with non-empty or immutable MemTables into its SortedRun once, without
+  // pausing splits or copying clean shards. No T2 or disk involvement.
+  void reorganize() {
+    PinnedShards pinned = pin_shards(/*skip_superseded=*/true, /*only_pending_memtables=*/true);
+    for (ShardSlot *slot : pinned.slots) {
+      bool captured = false;
+      SpinBackoff backoff;
+      while (!captured && slot->superseded.load(std::memory_order_acquire) == nullptr &&
+             (slot->index->memtable_size() > 0 || slot->index->has_immutable())) {
+        slot->index->reorganize([](std::span<EntrySnapshot> /*merged*/) {},
+                                [&](std::span<const EntrySnapshot> merged) {
+                                  record_merged_shard(slot, merged);
+                                  captured = true;
+                                },
+                                /*parallel_sort=*/true);
+        if (!captured) {
+          backoff.wait();
+        }
+      }
+      pinned.release_one();
+    }
   }
 
   // Whole-store aggregates of the per-shard RSS/churn counters. Live shards only: a retired
@@ -291,27 +324,12 @@ class ShardedT1Index {
       epoch_domain_.tracker.wait_until_epoch(bumped_routing);
     }
 
-    std::vector<ShardSlot *> snapshot;
-    std::vector<Key> boundaries;
-    with_routing_guard([&] {
-      Directory *dir = directory_.load(std::memory_order_acquire);
-      boundaries = dir->boundaries;
-      snapshot = dir->shards;
-      for (ShardSlot *slot : snapshot) {
-        slot->outside_refs.fetch_add(1, std::memory_order_relaxed);
-      }
-    });
-    struct RefRelease {
-      std::vector<ShardSlot *> *slots;
-      ~RefRelease() {
-        for (ShardSlot *slot : *slots) {
-          slot->outside_refs.fetch_sub(1, std::memory_order_relaxed);
-        }
-      }
-    } ref_release{&snapshot};
+    PinnedShards pinned = pin_shards(/*skip_superseded=*/false,
+                                     /*only_pending_memtables=*/false,
+                                     /*copy_boundaries=*/true);
 
-    t1_debug::g_checkpoint_total_shards.store(snapshot.size(), std::memory_order_release);
-    CheckpointContext context{*this, snapshot, boundaries, active_epoch};
+    t1_debug::g_checkpoint_total_shards.store(pinned.slots.size(), std::memory_order_release);
+    CheckpointContext context{*this, pinned.slots, pinned.boundaries, active_epoch};
     func(context);
   }
 
@@ -419,53 +437,108 @@ class ShardedT1Index {
 
   template <typename Visitor>
   auto for_each_shard_for_compaction(Visitor &&visitor) -> bool {
-    std::vector<ShardSlot *> snapshot;
-    with_routing_guard([&] {
-      Directory *dir = directory_.load(std::memory_order_acquire);
-      snapshot.reserve(dir->shards.size());
-      for (ShardSlot *slot : dir->shards) {
-        if (slot->superseded.load(std::memory_order_acquire) == nullptr) {
-          slot->outside_refs.fetch_add(1, std::memory_order_relaxed);
-          snapshot.push_back(slot);
-        }
-      }
-    });
-    if (snapshot.empty()) {
+    PinnedShards pinned = pin_shards(/*skip_superseded=*/true);
+    if (pinned.slots.empty()) {
       return true;
     }
-    const size_t start = compaction_cursor_.load(std::memory_order_relaxed) % snapshot.size();
+    const size_t start = compaction_cursor_.load(std::memory_order_relaxed) % pinned.slots.size();
     if (start != 0) {
-      std::rotate(snapshot.begin(), snapshot.begin() + static_cast<std::ptrdiff_t>(start), snapshot.end());
+      std::rotate(pinned.slots.begin(), pinned.slots.begin() + static_cast<std::ptrdiff_t>(start), pinned.slots.end());
     }
 
     std::vector<EntrySnapshot> entries;
     size_t next = 0;
     bool all_visited = true;
-    try {
-      for (; next < snapshot.size(); ++next) {
-        if (visit_dirty_shard(snapshot[next], entries, visitor, /*from_dirty_queue=*/false, &all_visited) ==
-            DirtyShardVisit::kStop) {
-          if (next + 1 < snapshot.size()) {
-            all_visited = false;
-          }
-          ++next;
-          break;
+    struct CursorCommit {
+      std::atomic<size_t> *cursor;
+      size_t start_idx;
+      size_t count;
+      size_t *next_idx;
+      ~CursorCommit() { cursor->store((start_idx + *next_idx) % count, std::memory_order_relaxed); }
+    } cursor_commit{&compaction_cursor_, start, pinned.slots.size(), &next};
+
+    while (next < pinned.slots.size()) {
+      ShardSlot *slot = pinned.slots[next];
+      // Advance before entering visit_dirty_shard(): it releases this slot's pin on every exit path,
+      // leaving ~PinnedShards() responsible only for the remaining unvisited tail.
+      ++next;
+      pinned.mark_consumed();
+      if (visit_dirty_shard(slot, entries, visitor, /*from_dirty_queue=*/false, &all_visited) ==
+          DirtyShardVisit::kStop) {
+        if (next < pinned.slots.size()) {
+          all_visited = false;
         }
+        break;
       }
-    } catch (...) {
-      compaction_cursor_.store((start + next + 1) % snapshot.size(), std::memory_order_relaxed);
-      // The throwing visit already released its own pin; only later slots still hold theirs.
-      release_snapshot_tail(snapshot, next + 1);
-      throw;
     }
-    compaction_cursor_.store((start + next) % snapshot.size(), std::memory_order_relaxed);
-    // The unvisited tail holds snapshot pins until released here.
-    release_snapshot_tail(snapshot, next);
     return all_visited;
   }
 
  private:
   struct ShardSlot;
+
+  // RAII snapshot of directory shards pinned by outside_refs. Callers either rely on
+  // ~PinnedShards(), call release_one() after finishing a shard, or call mark_consumed() when the
+  // consumer (visit_dirty_shard) owns releasing that pin.
+  struct PinnedShards {
+    std::vector<ShardSlot *> slots;
+    std::vector<Key> boundaries;
+    size_t released = 0;
+
+    PinnedShards() = default;
+    PinnedShards(const PinnedShards &) = delete;
+    auto operator=(const PinnedShards &) -> PinnedShards & = delete;
+    PinnedShards(PinnedShards &&other) noexcept
+        : slots(std::move(other.slots)),
+          boundaries(std::move(other.boundaries)),
+          released(std::exchange(other.released, 0)) {
+      other.slots.clear();
+    }
+    auto operator=(PinnedShards &&) -> PinnedShards & = delete;
+
+    ~PinnedShards() {
+      for (size_t i = released; i < slots.size(); ++i) {
+        slots[i]->outside_refs.fetch_sub(1, std::memory_order_release);
+      }
+    }
+
+    void release_one() noexcept {
+      if (released < slots.size()) {
+        slots[released++]->outside_refs.fetch_sub(1, std::memory_order_release);
+      }
+    }
+
+    void mark_consumed() noexcept {
+      if (released < slots.size()) {
+        ++released;
+      }
+    }
+  };
+
+  [[nodiscard]] auto pin_shards(bool skip_superseded,
+                                bool only_pending_memtables = false,
+                                bool copy_boundaries = false) const -> PinnedShards {
+    PinnedShards pinned;
+    with_routing_guard([&] {
+      Directory *dir = directory_.load(std::memory_order_acquire);
+      if (copy_boundaries) {
+        pinned.boundaries = dir->boundaries;
+      }
+      pinned.slots.reserve(dir->shards.size());
+      for (ShardSlot *slot : dir->shards) {
+        if (skip_superseded && slot->superseded.load(std::memory_order_acquire) != nullptr) {
+          continue;
+        }
+        if (only_pending_memtables && slot->index->memtable_size(kCallerHeldEpoch) == 0 &&
+            !slot->index->has_immutable()) {
+          continue;
+        }
+        slot->outside_refs.fetch_add(1, std::memory_order_relaxed);
+        pinned.slots.push_back(slot);
+      }
+    });
+    return pinned;
+  }
 
   // Published once, atomically, on Closing -> Split. Keys < boundary route to `low`.
   struct Split {
@@ -565,30 +638,22 @@ class ShardedT1Index {
     if (slot->index->memtable_size() == 0 && !slot->index->has_immutable()) {
       slot->index->dump_sorted_run(dumped);
       offset_mapper(std::span<EntrySnapshot>(dumped));
-      slot->approx_t2_bytes.store(sharded_detail::sum_entries_t2_bytes(std::span<const EntrySnapshot>(dumped)),
-                                  std::memory_order_relaxed);
+      update_t2_bytes_and_queue_split(slot, dumped);
       per_shard_writer(dumped);
     } else {
       reorganize_until_captured(
           *slot->index,
           offset_mapper,
           [&](std::span<const EntrySnapshot> merged) {
-            slot->approx_t2_bytes.store(sharded_detail::sum_entries_t2_bytes(merged), std::memory_order_relaxed);
+            record_merged_shard(slot, merged);
             per_shard_writer(merged);
           },
           /*parallel_sort=*/true);
-      slot->tombstones_since_maintenance.store(0, std::memory_order_relaxed);
     }
     const auto shard_elapsed = std::chrono::steady_clock::now() - shard_start;
     if (shard_elapsed > std::chrono::seconds(1)) {
       std::cerr << "[checkpoint_all_shards] Shard " << shard_idx << "/" << total_shards << " took "
                 << std::chrono::duration_cast<std::chrono::milliseconds>(shard_elapsed).count() << "ms\n";
-    }
-    // Same re-drive as for_each_dirty_shard: checkpoint merges drain appends without
-    // splitting, so a big shard must re-enter maintenance here. Approximate post-merge
-    // size is enough as a gate; maintenance re-merges and confirms the exact size.
-    if (should_split_shard(slot->index->approx_entry_count(), slot->approx_t2_bytes.load(std::memory_order_relaxed))) {
-      queue_.push_if_live(slot);
     }
   }
 
@@ -608,11 +673,7 @@ class ShardedT1Index {
     auto finish_visit = [&](bool check_split) {
       slot->split_paused.store(false, std::memory_order_release);
       if (check_split) {
-        const uint64_t merged_t2_bytes = sharded_detail::sum_entries_t2_bytes(std::span<const EntrySnapshot>(entries));
-        slot->approx_t2_bytes.store(merged_t2_bytes, std::memory_order_relaxed);
-        if (should_split_shard(entries.size(), merged_t2_bytes)) {
-          queue_.push_if_live(slot);
-        }
+        update_t2_bytes_and_queue_split(slot, std::span<const EntrySnapshot>(entries));
       }
       slot->outside_refs.fetch_sub(1, std::memory_order_release);
       if (from_dirty_queue) {
@@ -655,16 +716,19 @@ class ShardedT1Index {
     return DirtyShardVisit::kContinue;
   }
 
-  // Releases snapshot pins for shards that do not complete a visitor call.
-  static void release_snapshot_tail(const std::vector<ShardSlot *> &snapshot, size_t first) {
-    for (size_t index = first; index < snapshot.size(); ++index) {
-      snapshot[index]->outside_refs.fetch_sub(1, std::memory_order_release);
+  // Updates referenced T2 bytes from a full shard snapshot and enqueues a split when due.
+  void update_t2_bytes_and_queue_split(ShardSlot *slot, std::span<const EntrySnapshot> entries) {
+    const uint64_t t2_bytes = sharded_detail::sum_entries_t2_bytes(entries);
+    slot->approx_t2_bytes.store(t2_bytes, std::memory_order_relaxed);
+    if (should_split_shard(entries.size(), t2_bytes) && entries.front().key < entries.back().key) {
+      queue_.push_if_live(slot);
     }
   }
 
-  // Pure split-size threshold shared by run_maintenance().
-  static auto split_threshold(size_t target_shard_size, uint32_t percent) noexcept -> size_t {
-    return sharded_detail::split_threshold(target_shard_size, percent);
+  // Records post-merge shard state after a real reorganize() (resets tombstone pressure too).
+  void record_merged_shard(ShardSlot *slot, std::span<const EntrySnapshot> merged) {
+    slot->tombstones_since_maintenance.store(0, std::memory_order_relaxed);
+    update_t2_bytes_and_queue_split(slot, merged);
   }
 
   // True when a shard has reached either the entry-count split threshold or one T2 segment worth
@@ -673,7 +737,7 @@ class ShardedT1Index {
     if (entry_count < 2) {
       return false;
     }
-    return entry_count >= split_threshold(target_shard_size_, Config::kShardSplitThresholdPercent) ||
+    return entry_count >= sharded_detail::split_threshold(target_shard_size_, Config::kShardSplitThresholdPercent) ||
            t2_bytes >= Config::kSegmentBytes;
   }
 

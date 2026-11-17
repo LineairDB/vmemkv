@@ -736,3 +736,25 @@ TEST_CASE("ShardedT1Index: shard splits at kSegmentBytes even below entry-count 
     CHECK(idx->get(to_span(ikey(i))) == payload);
   }
 }
+
+TEST_CASE("ShardedT1Index: reorganize drains only shards with pending MemTables") {
+  auto idx = make_index_with_target_size(TinyAppendConfig::kShardTargetSizeEntries, /*worker_threads=*/0);
+  constexpr int kCount = 400;
+  fill_sharded(*idx, kCount);
+  idx->split_shard_containing(to_span(ikey(0)));
+  REQUIRE(idx->shard_count() == 2);
+  CHECK_FALSE(idx->has_pending_memtables());
+
+  // Insert a new key into the upper shard's Active MemTable, leaving the lower shard clean.
+  CHECK(idx->put(to_span(ikey(kCount)), 9999U) == TestIndex::PutResult::Applied);
+  CHECK(idx->has_pending_memtables());
+  CHECK(idx->memtable_size() == 1U);
+
+  idx->reorganize();
+  CHECK_FALSE(idx->has_pending_memtables());
+  CHECK(idx->memtable_size() == 0U);
+  for (int i = 0; i < kCount; ++i) {
+    CHECK(idx->get(to_span(ikey(i))) == static_cast<uint64_t>(i));
+  }
+  CHECK(idx->get(to_span(ikey(kCount))) == 9999U);
+}

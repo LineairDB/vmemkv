@@ -24,7 +24,7 @@ struct VMemKVStatistics {
   uint64_t bulk_load_throttle_events = 0;                  // bulk-load throttle events, count
   uint64_t compaction_cycle_count = 0;                     // dirty-shard repack cycles, count
   uint64_t t2_dirty_shard_count = 0;                       // T1 shards awaiting T2 repack, count
-  int64_t append_region_live_count = 0;                    // T1 append-region live entries, count
-  int64_t append_region_peak_count = 0;                    // T1 append-region peak entries, count
+  int64_t memtable_live_count = 0;                         // T1 live MemTables across active shards, count
+  int64_t memtable_peak_count = 0;                         // T1 peak live MemTables across active shards, count
 };
 }  // namespace vmemkv
