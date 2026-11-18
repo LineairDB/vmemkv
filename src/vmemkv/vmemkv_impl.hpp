@@ -134,7 +134,6 @@ class VMemKVImpl {
   }
 
   using T1IndexT = vmemkv::ShardedT1Index<ConfigT>;
-  using MaintenanceMode = vmemkv::MaintenanceMode;
 
   // T1 payload codec, re-exported as ImplT::X names (tests use ImplT::kBlockAlignment et al.).
   // Canonical values live in t1_codec.hpp's vmemkv::t2_detail namespace.
@@ -172,26 +171,42 @@ class VMemKVImpl {
   VMemKVImpl(VMemKVImpl &&) = delete;
   auto operator=(VMemKVImpl &&) -> VMemKVImpl & = delete;
 
-  // Merges T1 and, for Checkpoint, durabilizes T2 + commits a manifest. Runs under the
-  // running CAS guard; tests call this directly with injected hooks.
-  // Throws std::system_error on I/O failure (msync/open/fstat); logic errors report bool.
+  // Durabilizes T2's mutable region and commits a manifest. Exposed for tests injecting hooks.
+  // Throws std::system_error on I/O failure (msync/open/fstat); std::logic_error during recovery.
   template <typename PreStopHook = NoOpPreStopHook, typename PreFinishHook = NoOpPreFinishHook>
     requires CheckpointHook<PreStopHook> && CheckpointHook<PreFinishHook>
-  void reorganize_internal(MaintenanceMode mode,
-                           PreStopHook pre_stop_hook = PreStopHook{},
-                           PreFinishHook pre_finish_hook = PreFinishHook{}) {
-    checkpoint_detail::reorganize_internal(
-        checkpoint_, t1_, t2_, wal_, t2_own_, t2_path(), recovering_, mode, pre_stop_hook, pre_finish_hook);
+  void checkpoint_internal(PreStopHook pre_stop_hook = PreStopHook{}, PreFinishHook pre_finish_hook = PreFinishHook{}) {
+    if (recovering_) {
+      throw std::logic_error("checkpoint during recovery");
+    }
+    checkpoint_detail::checkpoint_internal(
+        checkpoint_, t1_, t2_, wal_, t2_own_, t2_path(), pre_stop_hook, pre_finish_hook);
   }
 
-  // T1-only in-memory merge, zero I/O. Safe anytime. (The KVStore concept names it
-  // reorganize().)
-  // Throws std::system_error on I/O failure (msync/open/fstat); logic errors report bool.
-  void reorganize() { run_reorganize(MaintenanceMode::T1Only); }
+  // T1-only in-memory merge, zero I/O. Safe anytime. Serialized with checkpoint() via
+  // checkpoint_.running only to keep shard state untouched during a T1 checkpoint dump.
+  void reorganize() {
+    while (t1_.has_pending_memtables()) {
+      checkpoint_detail::wait_until_checkpoint_not_running(checkpoint_);
+      if (!t1_.has_pending_memtables()) {
+        return;
+      }
+      if (auto guard = SingleFlightGuard::try_acquire(checkpoint_.running); guard.holds) {
+        t1_.reorganize();
+        return;
+      }
+    }
+  }
 
   // Durabilizes T2's mutable region in place and commits the T1 checkpoint/manifest.
-  // Throws std::system_error on I/O failure (msync/open/fstat); logic errors report bool.
-  void checkpoint() { run_reorganize(MaintenanceMode::Checkpoint); }
+  // Throws std::system_error on I/O failure (msync/open/fstat); std::logic_error during recovery.
+  void checkpoint() {
+    if (recovering_) {
+      throw std::logic_error("checkpoint during recovery");
+    }
+    checkpoint_detail::run_checkpoint(
+        checkpoint_, t1_, t2_, wal_, t2_own_, t2_path(), NoOpPreStopHook{}, NoOpPreFinishHook{});
+  }
 
   // Drains in-flight background compaction, dirty segments, and dirty shards until clean.
   void drain_compaction() {
@@ -485,11 +500,6 @@ class VMemKVImpl {
     return compaction_detail::compact_cycle<ConfigT>(compact_, t1_, t2_, t2_own_, t2_path(), lock_stripe_fn());
   }
 
-  void run_reorganize(MaintenanceMode mode) {
-    checkpoint_detail::run_reorganize(
-        checkpoint_, t1_, t2_, wal_, t2_own_, t2_path(), recovering_, mode, NoOpPreStopHook{}, NoOpPreFinishHook{});
-  }
-
   auto lock_stripe_fn() {
     return [this](std::span<const std::byte> key) -> std::mutex & { return key_mutex(key); };
   }
@@ -613,16 +623,7 @@ class VMemKVImpl {
       return false;
     }
     try {
-      checkpoint_detail::reorganize_internal(checkpoint_,
-                                             t1_,
-                                             t2_,
-                                             wal_,
-                                             t2_own_,
-                                             t2_path(),
-                                             recovering_,
-                                             MaintenanceMode::Checkpoint,
-                                             NoOpPreStopHook{},
-                                             NoOpPreFinishHook{});
+      checkpoint_internal();
       // NOLINTNEXTLINE(bugprone-empty-catch)
     } catch (...) {
       // Background loop; retry next poll without terminating worker.

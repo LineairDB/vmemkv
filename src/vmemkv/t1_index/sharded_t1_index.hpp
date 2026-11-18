@@ -229,8 +229,7 @@ class ShardedT1Index {
                                 [&](std::span<const EntrySnapshot> merged) {
                                   record_merged_shard(slot, merged);
                                   captured = true;
-                                },
-                                /*parallel_sort=*/true);
+                                });
         if (!captured) {
           backoff.wait();
         }
@@ -641,14 +640,10 @@ class ShardedT1Index {
       update_t2_bytes_and_queue_split(slot, dumped);
       per_shard_writer(dumped);
     } else {
-      reorganize_until_captured(
-          *slot->index,
-          offset_mapper,
-          [&](std::span<const EntrySnapshot> merged) {
-            record_merged_shard(slot, merged);
-            per_shard_writer(merged);
-          },
-          /*parallel_sort=*/true);
+      reorganize_until_captured(*slot->index, offset_mapper, [&](std::span<const EntrySnapshot> merged) {
+        record_merged_shard(slot, merged);
+        per_shard_writer(merged);
+      });
     }
     const auto shard_elapsed = std::chrono::steady_clock::now() - shard_start;
     if (shard_elapsed > std::chrono::seconds(1)) {
@@ -700,8 +695,7 @@ class ShardedT1Index {
         reorganize_until_captured(
             *slot->index,
             [](std::span<EntrySnapshot> /*merged*/) {},
-            [&](std::span<const EntrySnapshot> merged) { entries.assign(merged.begin(), merged.end()); },
-            /*parallel_sort=*/false);
+            [&](std::span<const EntrySnapshot> merged) { entries.assign(merged.begin(), merged.end()); });
         slot->tombstones_since_maintenance.store(0, std::memory_order_relaxed);
       }
       if (!visitor(std::span<const EntrySnapshot>(entries))) {
@@ -925,11 +919,8 @@ class ShardedT1Index {
 
   // Retries reorganize() until `on_merged` fires (see sharded_maintenance.hpp).
   template <typename OffsetMapper, typename OnMerged>
-  static void reorganize_until_captured(Shard &shard,
-                                        OffsetMapper offset_mapper,
-                                        OnMerged on_merged,
-                                        bool parallel_sort) {
-    sharded_detail::reorganize_until_captured(shard, offset_mapper, on_merged, parallel_sort);
+  static void reorganize_until_captured(Shard &shard, OffsetMapper offset_mapper, OnMerged on_merged) {
+    sharded_detail::reorganize_until_captured(shard, offset_mapper, on_merged);
   }
 
   // Post-Closing-CAS split body. Unguarded by design: winning the CAS made `target` this
@@ -962,9 +953,7 @@ class ShardedT1Index {
     reorganize_until_captured(
         *target->index,
         [](std::span<EntrySnapshot> /*merged*/) {},
-        [&](std::span<const EntrySnapshot> merged) { merged_entries.assign(merged.begin(), merged.end()); },
-        /*parallel_sort=*/false);  // Many shards' reorganize() run concurrently; see
-                                   // T1Index::reorganize()'s own doc comment on this parameter.
+        [&](std::span<const EntrySnapshot> merged) { merged_entries.assign(merged.begin(), merged.end()); });
 
     constexpr size_t kMinSplitEntries = 2;
     if (merged_entries.size() < kMinSplitEntries || !(merged_entries.front().key < merged_entries.back().key)) {
@@ -1247,8 +1236,7 @@ class ShardedT1Index {
                             [&](std::span<const EntrySnapshot> merged) {
                               merged_entries.assign(merged.begin(), merged.end());
                               reorganized = true;
-                            },
-                            /*parallel_sort=*/false);
+                            });
     uint64_t merged_t2_bytes = 0;
     if (reorganized) {
       merged_t2_bytes = sharded_detail::sum_entries_t2_bytes(merged_entries);

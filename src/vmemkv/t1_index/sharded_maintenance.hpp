@@ -50,22 +50,16 @@ inline auto maintenance_soft_threshold(size_t memtable_cap) noexcept -> size_t {
 // a silent no-op (reorg_in_progress_ CAS) -- indistinguishable from an empty shard by output
 // alone, hence the retry.
 template <typename Shard, typename OffsetMapper, typename OnMerged>
-inline void reorganize_until_captured(Shard &shard,
-                                      OffsetMapper offset_mapper,
-                                      OnMerged on_merged,
-                                      bool parallel_sort) {
+inline void reorganize_until_captured(Shard &shard, OffsetMapper offset_mapper, OnMerged on_merged) {
   bool captured = false;
   SpinBackoff backoff;
   const auto start = std::chrono::steady_clock::now();
   auto last_warn = start;
   while (!captured) {
-    shard.reorganize(
-        offset_mapper,
-        [&](std::span<const typename Shard::EntrySnapshot> merged) {
-          on_merged(merged);
-          captured = true;
-        },
-        parallel_sort);
+    shard.reorganize(offset_mapper, [&](std::span<const typename Shard::EntrySnapshot> merged) {
+      on_merged(merged);
+      captured = true;
+    });
     if (!captured) {
       backoff.wait();
       const auto now = std::chrono::steady_clock::now();

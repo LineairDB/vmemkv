@@ -34,11 +34,7 @@
 
 namespace vmemkv {
 
-// T1Only: in-memory MemTable compaction, zero I/O. Checkpoint: durabilizes T2's mutable region
-// in place and commits a manifest (docs/specification/low_level_design.md 5.2, 5.5).
-enum class MaintenanceMode : std::uint8_t { T1Only, Checkpoint };
-
-// Cycle accounting and single-flight state for checkpoint/maintenance cycles.
+// Cycle accounting and single-flight state for checkpoint cycles.
 struct CheckpointStats {
   mutable std::atomic<uint64_t> checkpoint_count{0};
   mutable std::atomic<uint64_t> total_wait_us{0};
@@ -513,85 +509,36 @@ void checkpoint_internal(CheckpointState &state,
   phases.old_read_only_offset = checkpoint_target.old_read_only_offset;
   phases.target = checkpoint_target.target;
   publish_cycle_stats(state.stats, wal.last_rotate_leader_wait_us(), phases);
+  // Punch eligibility trails checkpoint coverage: a segment evacuated at count N is punchable only
+  // after a checkpoint completing past N. Recorded here at the single choke point for every cycle.
+  own.note_checkpoint_completed(state.stats.checkpoint_count.load(std::memory_order_relaxed));
 }
 
-// Merges T1 and, for Checkpoint, durabilizes T2 + commits a manifest. Runs under the running
-// CAS guard.
+// Shared wait/CAS/coalesce loop for foreground checkpoint(). Coalesces if another concurrent
+// cycle completed a checkpoint while we waited.
 template <typename ConfigT, typename PreStopHook, typename PreFinishHook>
   requires CheckpointHook<PreStopHook> && CheckpointHook<PreFinishHook>
-void reorganize_internal(CheckpointState &state,
-                         ShardedT1Index<ConfigT> &tier1,
-                         T2FlatFile &tier2,
-                         Wal &wal,
-                         T2Ownership<ConfigT> &own,
-                         const std::filesystem::path &t2_path,
-                         [[maybe_unused]] bool recovering,
-                         MaintenanceMode mode,
-                         PreStopHook pre_stop_hook,
-                         PreFinishHook pre_finish_hook) {
-  // Checkpointing during WAL replay is unsafe (recovery is inside replay()'s callback, and a
-  // cycle expects sole writer status). Recovery only passes T1Only -- throw, don't silently
-  // override, so a future caller bug surfaces.
-  if (recovering && mode != MaintenanceMode::T1Only) {
-    throw std::logic_error("checkpoint during recovery");
-  }
-
-  switch (mode) {
-    case MaintenanceMode::Checkpoint:
-      checkpoint_internal(state, tier1, tier2, wal, own, t2_path, pre_stop_hook, pre_finish_hook);
-      // Punch eligibility trails checkpoint coverage: a segment evacuated at count
-      // N is punchable only after a checkpoint completing past N. Recorded here,
-      // the single choke point for every Checkpoint-mode cycle (foreground,
-      // background worker, and tests), so the ownership gate cannot miss one.
-      own.note_checkpoint_completed(state.stats.checkpoint_count.load(std::memory_order_relaxed));
-      break;
-    case MaintenanceMode::T1Only: {
-      // Zero-I/O T1 merge with untouched payloads; merges only shards with pending MemTables.
-      g_checkpoint_debug_phase.store("reorganize: T1Only", std::memory_order_release);
-      tier1.reorganize();
-      g_checkpoint_debug_phase.store("idle", std::memory_order_release);
-      break;
-    }
-  }
-}
-
-// Shared wait/CAS/run/retry loop for reorganize()/checkpoint(). Checkpoint always forces a
-// completed cycle (it needs a durabilized manifest, not just an empty MemTable); T1Only
-// skips on empty.
-template <typename ConfigT, typename PreStopHook, typename PreFinishHook>
-  requires CheckpointHook<PreStopHook> && CheckpointHook<PreFinishHook>
-void run_reorganize(CheckpointState &state,
+void run_checkpoint(CheckpointState &state,
                     ShardedT1Index<ConfigT> &tier1,
                     T2FlatFile &tier2,
                     Wal &wal,
                     T2Ownership<ConfigT> &own,
                     const std::filesystem::path &t2_path,
-                    bool recovering,
-                    MaintenanceMode mode,
                     PreStopHook pre_stop_hook,
                     PreFinishHook pre_finish_hook) {
-  const bool force_run = (mode == MaintenanceMode::Checkpoint);
   const uint64_t start_chk_count = state.stats.checkpoint_count.load(std::memory_order_acquire);
 
   while (true) {
     wait_until_checkpoint_not_running(state);
 
-    // If another concurrent cycle (e.g. background worker) completed a checkpoint
-    // while we waited, our durability guarantee is satisfied: avoid back-to-back duplicate cycles.
-    if (force_run && state.stats.checkpoint_count.load(std::memory_order_acquire) > start_chk_count) {
-      return;
-    }
-
-    if (!force_run && !tier1.has_pending_memtables()) {
+    if (state.stats.checkpoint_count.load(std::memory_order_acquire) > start_chk_count) {
       return;
     }
 
     if (auto guard = SingleFlightGuard::try_acquire(state.running); guard.holds) {
-      reorganize_internal(state, tier1, tier2, wal, own, t2_path, recovering, mode, pre_stop_hook, pre_finish_hook);
+      checkpoint_internal(state, tier1, tier2, wal, own, t2_path, pre_stop_hook, pre_finish_hook);
       return;
     }
-    // Lost the race to a concurrent cycle. Loop back and wait -- needed for force_run: the
-    // winner's cycle might not be ours (a plain reorganize() beating our checkpoint()).
   }
 }
 

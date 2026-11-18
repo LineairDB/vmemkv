@@ -91,10 +91,6 @@ No dedicated thread per shard (OS threads would explode at large K). Instead, a 
 
 The queue is a set, so its depth caps at K (total shards) and never grows unbounded. FIFO + dedup means a processed shard immediately re-crossing the threshold is simply re-enqueued at the tail — no starvation of specific shards.
 
-### Avoiding Nested Parallelism
-
-Shard `reorganize()` uses sequential sort (`std::execution::seq`). Parallelism comes from many workers processing many small reorganizes concurrently.
-
 ### Pool Size
 
 No configuration knob;

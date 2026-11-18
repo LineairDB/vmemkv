@@ -1,9 +1,9 @@
 cmake_minimum_required(VERSION 3.16)
 project(VMemKV VERSION 0.1.0 DESCRIPTION "Larger-than-memory key-value store on OS virtual memory" LANGUAGES CXX)
 
-# vmemkv delegates paging to the OS virtual-memory subsystem (mmap/fork/mincore).
+# vmemkv delegates paging to the OS virtual-memory subsystem (mmap based).
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  message(FATAL_ERROR "vmemkv supports Linux only (mmap/fork/mincore based).")
+  message(FATAL_ERROR "vmemkv supports Linux only (mmap based).")
 endif()
 
 # Allow older 3rd-party CMake files that use cmake_minimum_required(VERSION 3.0)

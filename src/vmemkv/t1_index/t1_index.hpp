@@ -11,7 +11,6 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
-#include <execution>
 #include <memory>
 #include <memory_resource>
 #include <mutex>
@@ -513,11 +512,8 @@ class T1Index {
   //   safe. Entries it needn't touch (inline, T1-only reorg) must stay untouched.
   // - ChkWriter: once with the finalized entries, for checkpoint serialization without T1Index
   //   knowing about files. No-op default.
-  // `parallel_sort`: true matches single-T1 behavior (one reorganize in flight: fan out). A
-  // caller running many concurrent reorganize() calls (sharded background pool, one per shard)
-  // passes false: N parallel sorts oversubscribe cores (pool size * fan-out).
   template <typename OffsetMapper, typename ChkWriter = NoOpChkWriter>
-  void reorganize(OffsetMapper offset_mapper, ChkWriter chk_writer = ChkWriter{}, bool parallel_sort = true) {
+  void reorganize(OffsetMapper offset_mapper, ChkWriter chk_writer = ChkWriter{}) {
     bool expected = false;
     if (!reorg_in_progress_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
       return;
@@ -559,12 +555,9 @@ class T1Index {
       return t1_detail::entry_less(lhs.key, lhs.hash, rhs.key, rhs.hash);
     };
 
-    // Sort the smaller immutable-MemTable side (parallel unless the caller opts out, see above).
-    if (parallel_sort) {
-      std::sort(std::execution::par, imm_entries.begin(), imm_entries.end(), comp);
-    } else {
-      std::sort(imm_entries.begin(), imm_entries.end(), comp);
-    }
+    // Sort the smaller immutable-MemTable side sequentially so many concurrent shard workers never
+    // oversubscribe cores.
+    std::sort(imm_entries.begin(), imm_entries.end(), comp);
 
     // Merge sorted_run_ with imm_entries in one pass (no redundant O(sorted) copy).
     // Hand-written loop, not std::merge: the sorted side needs live-filtering interleaved.
@@ -753,53 +746,31 @@ class T1Index {
   using MemTableIndex = LockFreeHashTable<Key, MemTableSlot>;
 
   struct ResolvedSlot {
-    MemTableSlot *memtable = nullptr;
-    const SortedSlot *sorted = nullptr;
+    const SlotBase *slot = nullptr;
 
-    [[nodiscard]] auto found() const noexcept -> bool { return memtable != nullptr || sorted != nullptr; }
+    [[nodiscard]] auto found() const noexcept -> bool { return slot != nullptr; }
 
     // Which physical slot, not its contents: lets put()'s retry tell an ordinary delete
     // (same slot) from a concurrent displacement (different slot).
-    [[nodiscard]] auto same_slot_as(const ResolvedSlot &other) const noexcept -> bool {
-      return memtable == other.memtable && sorted == other.sorted;
-    }
+    [[nodiscard]] auto same_slot_as(const ResolvedSlot &other) const noexcept -> bool { return slot == other.slot; }
 
-    [[nodiscard]] auto load() const noexcept -> Payload {
-      if (memtable != nullptr) {
-        return memtable->payload_bits.load(std::memory_order_acquire);
-      }
-      return sorted->payload_bits.load(std::memory_order_acquire);
-    }
+    [[nodiscard]] auto load() const noexcept -> Payload { return slot->payload_bits.load(std::memory_order_acquire); }
 
     // CAS, not a plain store: a store could overwrite a concurrent displacement's tombstone
     // (on_displaced), resurrecting an orphaned slot that walks would carry forward as a
     // permanent duplicate. On failure the caller must not retry blindly (see put()).
     [[nodiscard]] auto try_store(Payload &expected_current, Payload value) const noexcept -> bool {
-      if (memtable != nullptr) {
-        return memtable->payload_bits.compare_exchange_strong(
-            expected_current, value, std::memory_order_release, std::memory_order_acquire);
-      }
-      return sorted->payload_bits.compare_exchange_strong(
+      return slot->payload_bits.compare_exchange_strong(
           expected_current, value, std::memory_order_release, std::memory_order_acquire);
     }
 
-    void store_hash(uint64_t hash) const noexcept {
-      if (memtable != nullptr) {
-        memtable->hash.store(hash, std::memory_order_release);
-      } else {
-        sorted->hash.store(hash, std::memory_order_release);
-      }
-    }
-
-    [[nodiscard]] auto version_ref() const noexcept -> std::atomic<uint64_t> & {
-      return memtable != nullptr ? memtable->version : sorted->version;
-    }
+    void store_hash(uint64_t hash) const noexcept { slot->hash.store(hash, std::memory_order_release); }
 
     // Brackets put()'s in-place update with the seqlock. Safe unconditionally: put() holds the
     // per-key stripe lock, so only readers interleave -- and a version bump on a failed CAS just
     // costs a reader one retry.
-    void begin_write() const noexcept { version_ref().fetch_add(1, std::memory_order_release); }
-    void end_write() const noexcept { version_ref().fetch_add(1, std::memory_order_release); }
+    void begin_write() const noexcept { slot->version.fetch_add(1, std::memory_order_release); }
+    void end_write() const noexcept { slot->version.fetch_add(1, std::memory_order_release); }
   };
 
   // Seqlock reader for raw slot handles (merge loop, collect_live_entries): consistent
@@ -1028,7 +999,7 @@ class T1Index {
   auto resolve(Key key, uint64_t hash) noexcept -> ResolvedSlot {
     MemTableGeneration *active_gen = memtable_active_.load(std::memory_order_acquire);
     if (MemTableSlot *slot = active_gen->region->find_with_index(*active_gen->index, key, hash)) {
-      return ResolvedSlot{slot, nullptr};
+      return ResolvedSlot{slot};
     }
 
     // A frozen-MemTable hit means an in-place update would be a Lost Update this cycle (see
@@ -1048,7 +1019,7 @@ class T1Index {
     } else {
       const auto sorted = sorted_run_.load(std::memory_order_acquire);
       if (const SortedSlot *slot = find_sorted(*sorted, key, hash)) {
-        return ResolvedSlot{nullptr, slot};
+        return ResolvedSlot{slot};
       }
     }
 
