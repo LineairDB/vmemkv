@@ -3,6 +3,7 @@
 
 #include <array>
 #include <atomic>
+#include <cassert>
 #include <chrono>
 #include <cstddef>
 #include <iostream>
@@ -185,10 +186,13 @@ class ThreadReferenceTracker {
 struct EpochDomain {
   mutable ThreadReferenceTracker<uint64_t> tracker;
   std::atomic<uint64_t> epoch{1};
-};
 
-// Disambiguates T1Index entry points called while the caller already holds the EpochDomain guard.
-struct CallerHeldEpochTag {};
-inline constexpr CallerHeldEpochTag kCallerHeldEpoch{};
+  template <typename Func>
+  auto run(Func &&func) const noexcept(noexcept(func())) -> decltype(func()) {
+    assert(!tracker.is_held_by_current_thread());
+    typename ThreadReferenceTracker<uint64_t>::Guard handle(tracker, epoch.load(std::memory_order_relaxed));
+    return func();
+  }
+};
 
 }  // namespace vmemkv

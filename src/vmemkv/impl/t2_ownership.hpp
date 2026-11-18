@@ -67,7 +67,6 @@ inline auto are_t2_payloads_page_local(uint64_t prev_payload, uint64_t curr_payl
 // in-place-update barrier. Atomics: same-segment entries on different stripes update
 // concurrently. A boundary-straddling record credits both segments it touches, so
 // seg_live(seg) == 0 guarantees no live record starts in or overhangs into `seg`.
-template <typename ConfigT>
 class T2Ownership {
  public:
   static constexpr uint64_t kInvalidSegment = std::numeric_limits<uint64_t>::max();
@@ -81,15 +80,21 @@ class T2Ownership {
     uint64_t evacuated_epoch = 0;
   };
 
-  explicit T2Ownership(size_t segment_count = 0)
-      : segment_count_(segment_count),
+  // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+  explicit T2Ownership(size_t segment_count = 0, uint64_t segment_bytes = T2Config::kSegmentBytes)
+      : segment_bytes_(segment_bytes),
+        segment_count_(segment_count),
         seg_live_(segment_count),
         dirty_flag_(segment_count),
         punch_evacuated_epoch_(segment_count, 0),
         punch_(segment_count),
         garbage_(segment_count) {}
 
-  static auto seg_index(uint64_t masked_offset) noexcept -> uint64_t { return masked_offset / ConfigT::kSegmentBytes; }
+  [[nodiscard]] auto segment_bytes() const noexcept -> uint64_t { return segment_bytes_; }
+
+  static auto seg_index(uint64_t masked_offset, uint64_t segment_bytes = T2Config::kSegmentBytes) noexcept -> uint64_t {
+    return masked_offset / segment_bytes;
+  }
 
   // Adjusts accounting for one T1 payload replacement. Callers hold the key's stripe lock
   // (or run single-threaded: WAL replay / checkpoint load), so the old classification can't
@@ -129,8 +134,8 @@ class T2Ownership {
     if (read_only_offset == 0) {
       return 0;
     }
-    const uint64_t frozen_segs = (read_only_offset + ConfigT::kSegmentBytes - 1) / ConfigT::kSegmentBytes;
-    const uint64_t current_seg = tail_offset / ConfigT::kSegmentBytes;
+    const uint64_t frozen_segs = (read_only_offset + segment_bytes_ - 1) / segment_bytes_;
+    const uint64_t current_seg = tail_offset / segment_bytes_;
     return std::min<uint64_t>({frozen_segs, current_seg, static_cast<uint64_t>(segment_count_)});
   }
 
@@ -200,7 +205,7 @@ class T2Ownership {
 
   // Queues every fully-frozen segment with no live record during checkpoint adoption.
   void queue_empty_segments(uint64_t frozen_boundary) const {
-    const uint64_t frozen_segments = frozen_boundary / ConfigT::kSegmentBytes;
+    const uint64_t frozen_segments = frozen_boundary / segment_bytes_;
     for (uint64_t seg = 0; seg < std::min<uint64_t>(frozen_segments, seg_live_.size()); ++seg) {
       if (seg_live_[seg].load(std::memory_order_relaxed) == 0) {
         queue_punch_candidate(seg);
@@ -319,7 +324,7 @@ class T2Ownership {
     if (previous == hint) {
       dirty_flag_[seg].store(false, std::memory_order_relaxed);
       queue_punch_candidate(seg);
-    } else if (allow_mark_dirty && (previous - hint) * 2 < ConfigT::kSegmentBytes) {
+    } else if (allow_mark_dirty && (previous - hint) * 2 < segment_bytes_) {
       mark_segment_dirty(seg);
     }
   }
@@ -374,10 +379,10 @@ class T2Ownership {
     uint64_t last;
   };
 
-  [[nodiscard]] static auto payload_segment_span(uint64_t payload_bits) noexcept -> SegmentSpan {
+  [[nodiscard]] auto payload_segment_span(uint64_t payload_bits) const noexcept -> SegmentSpan {
     const uint64_t off = t2_detail::decode_offset(payload_bits);
     const uint64_t hint = hint_bytes(payload_bits);
-    return {hint, seg_index(off), seg_index(off + hint - 1)};
+    return {hint, seg_index(off, segment_bytes_), seg_index(off + hint - 1, segment_bytes_)};
   }
 
   [[nodiscard]] auto segment_has_garbage_flags(uint64_t seg) const noexcept -> bool {
@@ -402,6 +407,7 @@ class T2Ownership {
     }
   }
 
+  uint64_t segment_bytes_{T2Config::kSegmentBytes};
   size_t segment_count_{0};
   std::vector<std::atomic<uint64_t>> seg_live_;
   std::atomic<uint64_t> watermark_{0};

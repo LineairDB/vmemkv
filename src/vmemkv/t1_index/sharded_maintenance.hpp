@@ -1,17 +1,11 @@
 // sharded_maintenance.hpp - Maintenance helpers for ShardedT1Index.
-// Routing stays in sharded_t1_index.hpp; this header holds the pure maintenance
-// thresholds plus the reorganize-until-captured retry used by checkpoint_all_shards(),
-// continue_split(), and run_maintenance(). See docs/specification/t1_sharding_design.md.
+// Routing stays in sharded_t1_index.hpp; this header holds the pure maintenance thresholds.
+// See docs/specification/t1_sharding_design.md.
 #pragma once
 
-#include <algorithm>
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <iostream>
-#include <span>
 #include <vmemkv/config.hpp>
-#include <vmemkv/core/spin_backoff.hpp>
 #include <vmemkv/t1_index/t1_codec.hpp>
 
 namespace vmemkv::sharded_detail {
@@ -44,32 +38,6 @@ inline auto sum_entries_t2_bytes(const EntryRange &entries) noexcept -> uint64_t
 inline auto maintenance_soft_threshold(size_t memtable_cap) noexcept -> size_t {
   constexpr size_t kSoftThresholdPercent = 50;
   return (memtable_cap * kSoftThresholdPercent) / kPercentScale;
-}
-
-// Retries reorganize() until `on_merged` fires. A racing concurrent reorganize() makes a call
-// a silent no-op (reorg_in_progress_ CAS) -- indistinguishable from an empty shard by output
-// alone, hence the retry.
-template <typename Shard, typename OffsetMapper, typename OnMerged>
-inline void reorganize_until_captured(Shard &shard, OffsetMapper offset_mapper, OnMerged on_merged) {
-  bool captured = false;
-  SpinBackoff backoff;
-  const auto start = std::chrono::steady_clock::now();
-  auto last_warn = start;
-  while (!captured) {
-    shard.reorganize(offset_mapper, [&](std::span<const typename Shard::EntrySnapshot> merged) {
-      on_merged(merged);
-      captured = true;
-    });
-    if (!captured) {
-      backoff.wait();
-      const auto now = std::chrono::steady_clock::now();
-      if (now - last_warn >= std::chrono::seconds(2)) {
-        last_warn = now;
-        const auto total_sec = std::chrono::duration_cast<std::chrono::seconds>(now - start).count();
-        std::cerr << "[reorganize_until_captured] RETRYING for " << total_sec << "s (failed to win reorg lock)\n";
-      }
-    }
-  }
 }
 
 }  // namespace vmemkv::sharded_detail

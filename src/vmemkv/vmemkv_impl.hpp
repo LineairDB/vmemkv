@@ -99,41 +99,32 @@ namespace vmemkv {
 // * reorganize: T1-only merge, zero I/O.
 // * checkpoint: in-place msync + manifest commit.
 //
-template <typename ConfigT = vmemkv::Config<>>
 class VMemKVImpl {
  public:
   static constexpr bool kIsEnabled = true;
-  using ConfigType = ConfigT;
 
-  static auto name() -> std::string {
-    std::vector<std::string> parts;
-    if constexpr (ConfigT::UseBloomFilter) {
-      parts.emplace_back("Bloom");
-    }
-    if constexpr (ConfigT::UseT1InlineValue) {
-      parts.emplace_back("T1InlineValue");
-    }
-    if constexpr (ConfigT::UseReadPolicyRandomOnly) {
-      parts.emplace_back("ReadRandom");
-    }
-    if constexpr (ConfigT::UseReadPolicySeqOnly) {
-      parts.emplace_back("ReadSeq");
-    }
-    if constexpr (ConfigT::UseReadPolicyNormalOnly) {
-      parts.emplace_back("ReadNormal");
-    }
-    if constexpr (ConfigT::UseReadPolicyPreadOnly) {
-      parts.emplace_back("ReadPread");
-    }
-
-    std::string result = "VMemKV";
-    for (const auto &part : parts) {
-      result += "/" + part;
+  static auto name(ReadPolicy policy = ReadPolicy::Adaptive) -> std::string {
+    std::string result = "VMemKV/Bloom/T1InlineValue";
+    switch (policy) {
+      case ReadPolicy::RandomOnly:
+        result += "/ReadRandom";
+        break;
+      case ReadPolicy::SeqOnly:
+        result += "/ReadSeq";
+        break;
+      case ReadPolicy::NormalOnly:
+        result += "/ReadNormal";
+        break;
+      case ReadPolicy::PreadOnly:
+        result += "/ReadPread";
+        break;
+      case ReadPolicy::Adaptive:
+        break;
     }
     return result;
   }
 
-  using T1IndexT = vmemkv::ShardedT1Index<ConfigT>;
+  using T1IndexT = vmemkv::ShardedT1Index;
 
   // T1 payload codec, re-exported as ImplT::X names (tests use ImplT::kBlockAlignment et al.).
   // Canonical values live in t1_codec.hpp's vmemkv::t2_detail namespace.
@@ -151,11 +142,16 @@ class VMemKVImpl {
   //    replay put()s like live traffic and needs drainable MemTables).
   // 3. recover_from_wal, then clear recovering_.
   // 4. spawn_background_workers, last: workers must never observe recovering_ state.
-  VMemKVImpl(const std::filesystem::path &t2_path, uint64_t t2_bytes_capacity)
-      : t1_(ConfigT::kMemTableCapacityEntries, ConfigT::kShardTargetSizeEntries, /*worker_threads=*/0),
+  VMemKVImpl(const std::filesystem::path &t2_path, uint64_t t2_bytes_capacity, StoreOptions options = {})
+      : options_(options),
+        t1_(options_.memtable_capacity_entries,
+            options_.shard_target_size_entries,
+            /*worker_threads=*/0,
+            options_.shard_split_threshold_percent,
+            options_.segment_bytes),
         t2_(t2_path, t2_bytes_capacity, adopted_t2_bytes_used(t2_path)),
         wal_(vmemkv::derive_wal_path(t2_path)),
-        t2_own_((t2_bytes_capacity + ConfigT::kSegmentBytes - 1) / ConfigT::kSegmentBytes) {
+        t2_own_((t2_bytes_capacity + options_.segment_bytes - 1) / options_.segment_bytes, options_.segment_bytes) {
     vmemkv::validate_swap_for_ltm();
     recovering_ = true;
     load_checkpoint_if_present(t2_path);
@@ -180,7 +176,7 @@ class VMemKVImpl {
       throw std::logic_error("checkpoint during recovery");
     }
     checkpoint_detail::checkpoint_internal(
-        checkpoint_, t1_, t2_, wal_, t2_own_, t2_path(), pre_stop_hook, pre_finish_hook);
+        checkpoint_, t1_, t2_, wal_, t2_own_, t2_path(), options_, pre_stop_hook, pre_finish_hook);
   }
 
   // T1-only in-memory merge, zero I/O. Safe anytime. Serialized with checkpoint() via
@@ -205,7 +201,7 @@ class VMemKVImpl {
       throw std::logic_error("checkpoint during recovery");
     }
     checkpoint_detail::run_checkpoint(
-        checkpoint_, t1_, t2_, wal_, t2_own_, t2_path(), NoOpPreStopHook{}, NoOpPreFinishHook{});
+        checkpoint_, t1_, t2_, wal_, t2_own_, t2_path(), options_, NoOpPreStopHook{}, NoOpPreFinishHook{});
   }
 
   // Drains in-flight background compaction, dirty segments, and dirty shards until clean.
@@ -267,6 +263,14 @@ class VMemKVImpl {
     return stats;
   }
 
+ private:
+  struct KeyStripeFn {
+    const VMemKVImpl *self;
+    auto operator()(std::span<const std::byte> key) const noexcept -> std::mutex & { return self->key_mutex(key); }
+  };
+  [[nodiscard]] auto lock_stripe_fn() const noexcept -> KeyStripeFn { return {this}; }
+
+ public:
   // ─── Low-level byte-span APIs (called by StoreAdapter) ───────────────────────
 
   // Inserts a new key-value pair. Ordering: T2 write strictly precedes the T1 write (no
@@ -284,7 +288,7 @@ class VMemKVImpl {
           if (old.payload_bits != vmemkv::STORE_NOT_FOUND) {
             return {};
           }
-          vmemkv::write_entry_lockfree<ConfigT>(t1_, t2_, t2_own_, full_key, value, old);
+          vmemkv::write_entry_lockfree(t1_, t2_, t2_own_, full_key, value, old);
           return {true, wal_.reserve_insert(full_key, value)};
         });
   }
@@ -301,7 +305,7 @@ class VMemKVImpl {
       return false;
     }
 
-    if (vmemkv::try_read_inline_value<ConfigT>(
+    if (vmemkv::try_read_inline_value(
             res.payload_bits, res.raw_hash, [&](std::span<const std::byte> value) { callback(value); })) {
       return true;
     }
@@ -315,8 +319,8 @@ class VMemKVImpl {
     // Ownership: tl_get_buf/tl_scan_* live here (get/scan callback buffers); read_path.hpp
     // owns tl_pread_scratch. No sharing across units.
     thread_local static std::vector<std::byte> tl_get_buf;
-    if (const auto imm_record =
-            vmemkv::try_read_immutable_record<ConfigT>(mem, res.payload_bits, ImmutableReader::kGet, &tl_get_buf);
+    if (const auto imm_record = vmemkv::try_read_immutable_record(
+            mem, res.payload_bits, ImmutableReader::kGet, &tl_get_buf, options_.read_policy);
         imm_record.has_value()) {
       if (vmemkv::bytes_equal(imm_record->key, full_key)) {
         callback(imm_record->value);
@@ -360,18 +364,18 @@ class VMemKVImpl {
             return {};
           }
           if (t1_detail::is_inline(quick.raw_hash)) {
-            vmemkv::write_entry_lockfree<ConfigT>(t1_, t2_, t2_own_, full_key, value, quick);
+            vmemkv::write_entry_lockfree(t1_, t2_, t2_own_, full_key, value, quick);
             return {true, wal_.reserve_update(full_key, value)};
           }
-          const vmemkv::InPlaceUpdateResult result =
-              vmemkv::try_in_place_update<ConfigT>(t2_, t2_own_, wal_, full_key, value, quick.payload_bits);
+          const vmemkv::InPlaceUpdateResult result = vmemkv::try_in_place_update(
+              t2_, t2_own_, wal_, full_key, value, quick.payload_bits, options_.read_policy);
           if (result.outcome == vmemkv::InPlaceOutcome::Aborted) {
             return {};
           }
           if (result.outcome == vmemkv::InPlaceOutcome::Applied) {
             return {true, result.pending};
           }
-          vmemkv::write_entry_lockfree<ConfigT>(t1_, t2_, t2_own_, full_key, value, quick);
+          vmemkv::write_entry_lockfree(t1_, t2_, t2_own_, full_key, value, quick);
           return {true, wal_.reserve_update(full_key, value)};
         });
   }
@@ -405,7 +409,7 @@ class VMemKVImpl {
     for (std::size_t index = 0; index < count; ++index) {
       const std::string key = make_key(index);
       const std::string value = make_value(index);
-      vmemkv::write_entry_lockfree<ConfigT>(
+      vmemkv::write_entry_lockfree(
           t1_,
           t2_,
           t2_own_,
@@ -429,79 +433,75 @@ class VMemKVImpl {
     // full-key containment, skipping the per-entry recheck when it does.
     const bool bounds_clean = vmemkv::scan_bounds_clean(lower_bound, upper_bound);
 
-    t1_.scan(
-        lower_bound,
-        upper_bound,
-        // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-        [&](std::span<const std::byte> index_key, uint64_t payload, uint64_t hash) -> ScanControl {
-          if (payload == vmemkv::STORE_NOT_FOUND) {
-            return ScanControl::Continue;
-          }
+    t1_.scan(lower_bound,
+             upper_bound,
+             // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+             [&](std::span<const std::byte> index_key, uint64_t payload, uint64_t hash) -> ScanControl {
+               if (payload == vmemkv::STORE_NOT_FOUND) {
+                 return ScanControl::Continue;
+               }
 
-          ScanControl inline_control = ScanControl::Continue;
-          if (vmemkv::try_read_inline_value<ConfigT>(payload, hash, [&](std::span<const std::byte> value) {
-                const size_t key_len = vmemkv::inline_key_len(index_key);
-                if (!bounds_clean) {
-                  const std::span<const std::byte> key_view(index_key.data(), key_len);
-                  if (!vmemkv::bytes_in_range(key_view, lower_bound, upper_bound)) {
-                    return;
-                  }
-                }
-                inline_control = scan_detail::invoke_callback(
-                    callback, std::span<const std::byte>(index_key.data(), key_len), value);
-                ++total_count;
-              })) {
-            return inline_control;
-          }
+               ScanControl inline_control = ScanControl::Continue;
+               if (vmemkv::try_read_inline_value(payload, hash, [&](std::span<const std::byte> value) {
+                     const size_t key_len = vmemkv::inline_key_len(index_key);
+                     if (!bounds_clean) {
+                       const std::span<const std::byte> key_view(index_key.data(), key_len);
+                       if (!vmemkv::bytes_in_range(key_view, lower_bound, upper_bound)) {
+                         return;
+                       }
+                     }
+                     inline_control = scan_detail::invoke_callback(
+                         callback, std::span<const std::byte>(index_key.data(), key_len), value);
+                     ++total_count;
+                   })) {
+                 return inline_control;
+               }
 
-          const T2Memory *mem = t2_.get_memory();
+               const T2Memory *mem = t2_.get_memory();
 
-          // Immutable-region fast path, no seqlock (immutable bytes: live spans straight in).
-          if (const auto imm_record =
-                  vmemkv::try_read_immutable_record<ConfigT>(mem, payload, vmemkv::ImmutableReader::kScan, nullptr);
-              imm_record.has_value()) {
-            if (!vmemkv::bytes_in_range(imm_record->key, lower_bound, upper_bound)) {
-              return ScanControl::Continue;
-            }
-            ++total_count;
-            return scan_detail::invoke_callback(callback, imm_record->key, imm_record->value);
-          }
+               // Immutable-region fast path, no seqlock (immutable bytes: live spans straight in).
+               if (const auto imm_record = vmemkv::try_read_immutable_record(
+                       mem, payload, vmemkv::ImmutableReader::kScan, nullptr, options_.read_policy);
+                   imm_record.has_value()) {
+                 if (!vmemkv::bytes_in_range(imm_record->key, lower_bound, upper_bound)) {
+                   return ScanControl::Continue;
+                 }
+                 ++total_count;
+                 return scan_detail::invoke_callback(callback, imm_record->key, imm_record->value);
+               }
 
-          // t2_.at() inside read_t2_record_seqlock() (as AtFunc), matching get_impl().
-          //
-          // Torn-read fix: copy into an owned buffer and return, never callback from inside
-          // (see get_impl()). thread_local/static: concurrent-safe, no per-call reallocation.
-          // Ownership: see tl_get_buf above; read_path.hpp owns tl_pread_scratch.
-          thread_local static std::vector<std::byte> tl_scan_key_buf;
-          thread_local static std::vector<std::byte> tl_scan_value_buf;
-          const bool in_range = vmemkv::read_t2_record_seqlock(
-              [&]() -> T2RecordView { return T2FlatFile::at(payload & kOffsetMask, mem); },
-              [&](const T2RecordView &record) -> bool {
-                if (!vmemkv::bytes_in_range(record.key, lower_bound, upper_bound)) {
-                  return false;
-                }
-                tl_scan_key_buf.assign(record.key.begin(), record.key.end());
-                tl_scan_value_buf.assign(record.value.begin(), record.value.end());
-                return true;
-              });
-          if (in_range) {
-            ++total_count;
-            return scan_detail::invoke_callback(
-                callback, std::span<const std::byte>(tl_scan_key_buf), std::span<const std::byte>(tl_scan_value_buf));
-          }
-          return ScanControl::Continue;
-        });
+               // t2_.at() inside read_t2_record_seqlock() (as AtFunc), matching get_impl().
+               //
+               // Torn-read fix: copy into an owned buffer and return, never callback from inside
+               // (see get_impl()). thread_local/static: concurrent-safe, no per-call reallocation.
+               // Ownership: see tl_get_buf above; read_path.hpp owns tl_pread_scratch.
+               thread_local static std::vector<std::byte> tl_scan_key_buf;
+               thread_local static std::vector<std::byte> tl_scan_value_buf;
+               const bool in_range = vmemkv::read_t2_record_seqlock(
+                   [&]() -> T2RecordView { return T2FlatFile::at(payload & kOffsetMask, mem); },
+                   [&](const T2RecordView &record) -> bool {
+                     if (!vmemkv::bytes_in_range(record.key, lower_bound, upper_bound)) {
+                       return false;
+                     }
+                     tl_scan_key_buf.assign(record.key.begin(), record.key.end());
+                     tl_scan_value_buf.assign(record.value.begin(), record.value.end());
+                     return true;
+                   });
+               if (in_range) {
+                 ++total_count;
+                 return scan_detail::invoke_callback(callback,
+                                                     std::span<const std::byte>(tl_scan_key_buf),
+                                                     std::span<const std::byte>(tl_scan_value_buf));
+               }
+               return ScanControl::Continue;
+             });
 
     return total_count;
   }
 
  private:
   auto run_compaction_cycle() -> bool {
-    return compaction_detail::compact_cycle<ConfigT>(compact_, t1_, t2_, t2_own_, t2_path(), lock_stripe_fn());
-  }
-
-  auto lock_stripe_fn() {
-    return [this](std::span<const std::byte> key) -> std::mutex & { return key_mutex(key); };
+    return compaction_detail::compact_cycle(compact_, t1_, t2_, t2_own_, t2_path(), lock_stripe_fn(), options_);
   }
 
   auto t2_path() const -> std::filesystem::path { return t2_.path(); }
@@ -575,9 +575,9 @@ class VMemKVImpl {
       t1_.mark_t2_shard_state(shard_index, !shard_local[shard_index]);
     }
     const uint64_t used = manifest->t2_bytes_used;
-    const uint64_t used_segs = (used + ConfigT::kSegmentBytes - 1) / ConfigT::kSegmentBytes;
+    const uint64_t used_segs = (used + options_.segment_bytes - 1) / options_.segment_bytes;
     for (uint64_t seg = 0; seg < used_segs; ++seg) {
-      const uint64_t seg_used = std::min(ConfigT::kSegmentBytes, used - seg * ConfigT::kSegmentBytes);
+      const uint64_t seg_used = std::min(options_.segment_bytes, used - seg * options_.segment_bytes);
       if (t2_own_.seg_live(seg) * 2 < seg_used && t2_own_.seg_live(seg) > 0) {
         t2_own_.mark_segment_dirty(seg);
       }
@@ -598,7 +598,7 @@ class VMemKVImpl {
         case vmemkv::WalRecordType::Insert:
         case vmemkv::WalRecordType::Update:
           // put() overwrites in place: Insert and Update replay identically, last-writer-wins.
-          vmemkv::write_entry_lockfree<ConfigT>(t1_, t2_, t2_own_, key, value, std::nullopt);
+          vmemkv::write_entry_lockfree(t1_, t2_, t2_own_, key, value, std::nullopt);
           break;
         case vmemkv::WalRecordType::Delete: {
           const auto old = t1_.get_with_hash(key);
@@ -615,7 +615,7 @@ class VMemKVImpl {
   // source of truth, so T1Index can never accept a payload wider than these buffers.
   static_assert(t1_detail::kInlineValueByteCount == sizeof(uint64_t));
   auto maybe_run_auto_checkpoint() -> bool {
-    if (checkpoint_detail::auto_reorg_suppressed() || !checkpoint_detail::checkpoint_due<ConfigT>(wal_, t2_own_)) {
+    if (checkpoint_detail::auto_reorg_suppressed() || !checkpoint_detail::checkpoint_due(wal_, t2_own_, options_)) {
       return false;
     }
     auto guard = SingleFlightGuard::try_acquire(checkpoint_.running);
@@ -666,8 +666,8 @@ class VMemKVImpl {
         return true;
       }
       maybe_run_auto_compaction(next_compact_at, observed_chk_count);
-      return has_garbage_segments() ||
-             (!checkpoint_detail::auto_reorg_suppressed() && checkpoint_detail::checkpoint_due<ConfigT>(wal_, t2_own_));
+      return has_garbage_segments() || (!checkpoint_detail::auto_reorg_suppressed() &&
+                                        checkpoint_detail::checkpoint_due(wal_, t2_own_, options_));
     });
   }
 
@@ -683,13 +683,14 @@ class VMemKVImpl {
     return write_stripes_[hash & (kKeyStripeCount - 1)];
   }
 
+  StoreOptions options_;
   T1IndexT t1_;
   vmemkv::T2FlatFile t2_;
   vmemkv::Wal wal_;
   // Paces bulk_load_impl() against cgroup memory pressure (count survives here for stats).
   vmemkv::CgroupMemoryThrottle bulk_load_throttle_;
   // T2 checkpoint fuzzy watermark and in-place-update barrier.
-  T2Ownership<ConfigT> t2_own_;
+  T2Ownership t2_own_;
   // Dirty-shard repack state and delayed segment-punch request.
   mutable CompactionState compact_;
   // Checkpoint single-flight state and phase stats.
@@ -702,6 +703,18 @@ class VMemKVImpl {
   std::jthread t2_worker_;
 };
 
-using vmemkv = VMemKVImpl<vmemkv::Config<>>;
+// Bridges compile-time Config<...> structs (used by variants.hpp and unit tests) onto
+// non-template VMemKVImpl + StoreOptions.
+template <typename ConfigT = vmemkv::Config<>>
+class ConfiguredVMemKV : public VMemKVImpl {
+ public:
+  using ConfigType = ConfigT;
+  static auto name() -> std::string { return VMemKVImpl::name(make_store_options<ConfigT>().read_policy); }
+
+  ConfiguredVMemKV(const std::filesystem::path &t2_path, uint64_t t2_bytes_capacity)
+      : VMemKVImpl(t2_path, t2_bytes_capacity, make_store_options<ConfigT>()) {}
+};
+
+using vmemkv = VMemKVImpl;
 
 }  // namespace vmemkv

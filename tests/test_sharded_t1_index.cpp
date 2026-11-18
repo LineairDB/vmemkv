@@ -30,9 +30,11 @@ using vmemkv_test::to_span;
 // backpressure (see test_t1_index.cpp).
 using TinyAppendConfig = vmemkv_test::TinyAppendConfig<10>;
 
-using TestIndex = vmemkv::ShardedT1Index<TinyAppendConfig>;
+using TestIndex = vmemkv::ShardedT1Index;
 
-auto make_index() -> std::unique_ptr<TestIndex> { return std::make_unique<TestIndex>(); }
+auto make_index() -> std::unique_ptr<TestIndex> {
+  return std::make_unique<TestIndex>(TinyAppendConfig::kMemTableCapacityEntries);
+}
 
 auto make_index_with_target_size(size_t target_shard_size, size_t worker_threads = 2) -> std::unique_ptr<TestIndex> {
   return std::make_unique<TestIndex>(TinyAppendConfig::kMemTableCapacityEntries, target_shard_size, worker_threads);

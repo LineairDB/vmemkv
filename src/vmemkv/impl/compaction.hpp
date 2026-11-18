@@ -29,6 +29,7 @@
 #include <vmemkv/core/single_flight.hpp>
 #include <vmemkv/impl/read_path.hpp>
 #include <vmemkv/impl/t2_ownership.hpp>
+#include <vmemkv/t1_index/sharded_t1_index.hpp>
 #include <vmemkv/t1_index/t1_codec.hpp>
 #include <vmemkv/t2_flat_file/t2_flat_file.hpp>
 
@@ -100,29 +101,29 @@ inline auto punch_supported(CompactionState &state, const std::filesystem::path 
 // post-relocation pointers while its msync covers the relocated bytes. Until then
 // the pre-relocation copies stay readable through the checkpointed T1, which is
 // what makes relocation records unnecessary in the WAL.
-template <typename ConfigT>
-auto punch_evacuated_segments(CompactionState &state,
-                              const T2Ownership<ConfigT> &own,
-                              const T2FlatFile &tier2,
-                              const std::filesystem::path &t2_path) -> uint64_t {
+inline auto punch_evacuated_segments(CompactionState &state,
+                                     const T2Ownership &own,
+                                     const T2FlatFile &tier2,
+                                     const std::filesystem::path &t2_path) -> uint64_t {
   if (!punch_supported(state, t2_path)) {
     return 0;
   }
+  const uint64_t segment_bytes = own.segment_bytes();
   const vmemkv::T2Memory *mem = tier2.get_memory();
   const uint64_t read_only_offset = mem->read_only_offset.load(std::memory_order_acquire);
   const uint64_t covered_through = own.last_checkpoint_count();
-  const std::vector<typename T2Ownership<ConfigT>::PunchCandidate> candidates = own.take_punch_candidates();
+  const std::vector<T2Ownership::PunchCandidate> candidates = own.take_punch_candidates();
   // Deferred, not dropped: above-read-only cohorts wait for checkpoint coverage, and
   // epoch-covered ones wait for the segment to empty. A live reading here means
   // a concurrent append landed after evacuation (immutable-region bytes never gain
   // live records); dropping the candidacy is safe because emptying re-queues it
   // through the zero-crossing path.
-  std::vector<typename T2Ownership<ConfigT>::PunchCandidate> deferred;
+  std::vector<T2Ownership::PunchCandidate> deferred;
   uint64_t punched = 0;
   for (size_t idx = 0; idx < candidates.size(); ++idx) {
     const auto &candidate = candidates[idx];
     const uint64_t seg = candidate.segment;
-    if (candidate.evacuated_epoch + 1 >= covered_through || (seg + 1) * ConfigT::kSegmentBytes > read_only_offset) {
+    if (candidate.evacuated_epoch + 1 >= covered_through || (seg + 1) * segment_bytes > read_only_offset) {
       deferred.push_back(candidate);
       continue;
     }
@@ -130,13 +131,13 @@ auto punch_evacuated_segments(CompactionState &state,
       own.retire_punch_candidates(1);
       continue;
     }
-    switch (tier2.punch_if_occupied(seg * ConfigT::kSegmentBytes, ConfigT::kSegmentBytes)) {
+    switch (tier2.punch_if_occupied(seg * segment_bytes, segment_bytes)) {
       case vmemkv::T2FlatFile::PunchOutcome::Punched:
         ++punched;
         own.retire_punch_candidates(1);
         if (segment_probe_enabled()) {
           state.probe_punched_segments.fetch_add(1, std::memory_order_relaxed);
-          state.probe_punched_bytes.fetch_add(ConfigT::kSegmentBytes, std::memory_order_relaxed);
+          state.probe_punched_bytes.fetch_add(segment_bytes, std::memory_order_relaxed);
         }
         break;
       case vmemkv::T2FlatFile::PunchOutcome::AlreadyHollow:
@@ -223,13 +224,14 @@ auto shard_pages_local(std::span<const EntrySnapshot> entries, const vmemkv::T2M
 // and publish (T1 put) phase timings. No WAL record: the same version is rewritten
 // elsewhere, and the punch gate keeps the pre-relocation copies readable through
 // the checkpointed T1 until checkpoint coverage.
-template <typename ConfigT, typename T1, typename LockStripe>
-auto relocate_one(T1 &tier1,
+template <typename LockStripe>
+auto relocate_one(ShardedT1Index &tier1,
                   T2FlatFile &tier2,
-                  T2Ownership<ConfigT> &own,
+                  T2Ownership &own,
                   LockStripe &&lock_stripe,
                   uint64_t target_payload,
                   const vmemkv::T2Memory *mem,
+                  ReadPolicy read_policy = ReadPolicy::Adaptive,
                   CompactionState *probe = nullptr) -> uint64_t {
   const bool measure = probe != nullptr && segment_probe_enabled();
   const uint64_t old_off = t2_detail::decode_offset(target_payload);
@@ -240,7 +242,7 @@ auto relocate_one(T1 &tier1,
   thread_local static std::vector<std::byte> tl_compact_cold_buf;
   const auto read_start = measure ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
   const std::optional<T2RecordView> preloaded =
-      try_read_immutable_record<ConfigT>(mem, target_payload, ImmutableReader::kGet, &tl_compact_cold_buf);
+      try_read_immutable_record(mem, target_payload, ImmutableReader::kGet, &tl_compact_cold_buf, read_policy);
   const auto read_end = measure ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
   const auto validate_start = measure ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -285,24 +287,22 @@ struct CompactionProgress {
   bool did_relocate = false;
 };
 
-template <typename ConfigT, typename EntrySnapshot>
-auto entries_overlap_garbage_segment(std::span<const EntrySnapshot> entries,
-                                     const T2Ownership<ConfigT> &own,
-                                     // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-                                     uint64_t base,
-                                     uint64_t used) -> bool {
-  return std::ranges::any_of(entries, [&](const EntrySnapshot &entry) {
+inline auto entries_overlap_garbage_segment(std::span<const T1Index::EntrySnapshot> entries,
+                                            const T2Ownership &own,
+                                            // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+                                            uint64_t base,
+                                            uint64_t used) -> bool {
+  return std::ranges::any_of(entries, [&](const T1Index::EntrySnapshot &entry) {
     return entry.payload_bits != vmemkv::STORE_NOT_FOUND && !t1_detail::is_inline(entry.hash) &&
            own.payload_overlaps_garbage_segment(entry.payload_bits, base, used);
   });
 }
 
-template <typename ConfigT>
-auto payloads_overlap_garbage_segment(std::span<const uint64_t> payloads,
-                                      const T2Ownership<ConfigT> &own,
-                                      // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-                                      uint64_t base,
-                                      uint64_t used) -> bool {
+inline auto payloads_overlap_garbage_segment(std::span<const uint64_t> payloads,
+                                             const T2Ownership &own,
+                                             // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+                                             uint64_t base,
+                                             uint64_t used) -> bool {
   return std::ranges::any_of(
       payloads, [&](uint64_t payload) { return own.payload_overlaps_garbage_segment(payload, base, used); });
 }
@@ -380,15 +380,16 @@ inline void prefetch_target_chunk(CompactionState &state,
   }
 }
 
-template <typename ConfigT, typename T1, typename LockStripe>
+template <typename LockStripe>
 void relocate_targets_pipelined(CompactionState &state,
                                 std::span<const uint64_t> targets,
-                                T1 &tier1,
+                                ShardedT1Index &tier1,
                                 T2FlatFile &tier2,
-                                T2Ownership<ConfigT> &own,
+                                T2Ownership &own,
                                 LockStripe &&lock_stripe,
                                 const vmemkv::T2Memory *mem,
                                 uint64_t upper_bound,
+                                ReadPolicy read_policy,
                                 CompactionProgress &progress,
                                 bool measure) {
   prefetch_target_chunk(state, targets, 0, mem, upper_bound, measure);
@@ -398,7 +399,7 @@ void relocate_targets_pipelined(CompactionState &state,
     for (size_t i = batch_start; i < batch_end; ++i) {
       const auto relocation_start =
           measure ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-      const uint64_t moved = relocate_one<ConfigT>(tier1, tier2, own, lock_stripe, targets[i], mem, &state);
+      const uint64_t moved = relocate_one(tier1, tier2, own, lock_stripe, targets[i], mem, read_policy, &state);
       if (moved != 0) {
         progress.moved_bytes += moved;
         progress.did_relocate = true;
@@ -415,14 +416,15 @@ void relocate_targets_pipelined(CompactionState &state,
   }
 }
 
-template <typename ConfigT, typename T1, typename LockStripe, typename EntrySnapshot>
+template <typename LockStripe>
 void repack_dirty_shard(CompactionState &state,
-                        std::span<const EntrySnapshot> entries,
-                        T1 &tier1,
+                        std::span<const T1Index::EntrySnapshot> entries,
+                        ShardedT1Index &tier1,
                         T2FlatFile &tier2,
-                        T2Ownership<ConfigT> &own,
+                        T2Ownership &own,
                         LockStripe &&lock_stripe,
                         const vmemkv::T2Memory *mem,
+                        ReadPolicy read_policy,
                         CompactionProgress &progress,
                         bool check_page_locality = true) {
   const uint64_t read_only = mem->read_only_offset.load(std::memory_order_acquire);
@@ -473,19 +475,21 @@ void repack_dirty_shard(CompactionState &state,
     targets = filtered_targets;
   }
   if (!targets.empty()) {
-    relocate_targets_pipelined<ConfigT>(state, targets, tier1, tier2, own, lock_stripe, mem, tail, progress, measure);
+    relocate_targets_pipelined(
+        state, targets, tier1, tier2, own, lock_stripe, mem, tail, read_policy, progress, measure);
   }
 }
 
 // Runs one compaction cycle: punches evacuated segments and repacks shards that either
 // have broken 4KiB page locality or overlap frozen garbage segments.
-template <typename ConfigT, typename T1, typename LockStripe>
+template <typename LockStripe>
 auto compact_cycle(CompactionState &state,
-                   T1 &tier1,
+                   ShardedT1Index &tier1,
                    T2FlatFile &tier2,
-                   T2Ownership<ConfigT> &own,
+                   T2Ownership &own,
                    const std::filesystem::path &t2_path,
-                   LockStripe &&lock_stripe) -> bool {
+                   LockStripe &&lock_stripe,
+                   const StoreOptions &options = {}) -> bool {
   auto running_guard = SingleFlightGuard::try_acquire(state.running);
   if (!running_guard.holds) {
     return false;
@@ -493,39 +497,40 @@ auto compact_cycle(CompactionState &state,
 
   const bool measure = segment_probe_enabled();
   const auto cycle_start = measure ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-  uint64_t punched = punch_evacuated_segments<ConfigT>(state, own, tier2, t2_path);
+  uint64_t punched = punch_evacuated_segments(state, own, tier2, t2_path);
   const auto punch_end = measure ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
   const vmemkv::T2Memory *mem = tier2.get_memory();
   const uint64_t sync_begin = mem != nullptr ? mem->tail_offset.load(std::memory_order_acquire) : 0;
   CompactionProgress progress;
 
-  using EntrySnapshot = typename T1::EntrySnapshot;
+  using EntrySnapshot = T1Index::EntrySnapshot;
   const bool had_dirty_shard = tier1.has_dirty_shard();
   if (had_dirty_shard) {
     tier1.for_each_dirty_shard([&](std::span<const EntrySnapshot> entries) -> bool {
-      repack_dirty_shard<ConfigT>(state, entries, tier1, tier2, own, lock_stripe, mem, progress);
-      return progress.moved_bytes < ConfigT::kCompactionMaxMoveBytesPerCycle;
+      repack_dirty_shard(state, entries, tier1, tier2, own, lock_stripe, mem, options.read_policy, progress);
+      return progress.moved_bytes < options.compaction_max_move_bytes_per_cycle;
     });
   }
   const auto dirty_end = measure ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
-  if (progress.moved_bytes < ConfigT::kCompactionMaxMoveBytesPerCycle) {
+  if (progress.moved_bytes < options.compaction_max_move_bytes_per_cycle) {
     const uint64_t read_only = mem->read_only_offset.load(std::memory_order_acquire);
     const uint64_t tail = mem->tail_offset.load(std::memory_order_acquire);
     if (own.has_garbage_segment(read_only, tail)) {
       const bool completed_all_shards =
           tier1.for_each_shard_for_compaction([&](std::span<const EntrySnapshot> entries) -> bool {
-            repack_dirty_shard<ConfigT>(state,
-                                        entries,
-                                        tier1,
-                                        tier2,
-                                        own,
-                                        lock_stripe,
-                                        mem,
-                                        progress,
-                                        /*check_page_locality=*/false);
-            return progress.moved_bytes < ConfigT::kCompactionMaxMoveBytesPerCycle;
+            repack_dirty_shard(state,
+                               entries,
+                               tier1,
+                               tier2,
+                               own,
+                               lock_stripe,
+                               mem,
+                               options.read_policy,
+                               progress,
+                               /*check_page_locality=*/false);
+            return progress.moved_bytes < options.compaction_max_move_bytes_per_cycle;
           });
       if (completed_all_shards) {
         own.clear_garbage_segments(read_only, tail);

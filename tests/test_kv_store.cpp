@@ -37,8 +37,6 @@ static_assert(vmemkv::KVStore<vmemkv::variants::VMemKV_RocksDBBlobDB>);
 static_assert(vmemkv::KVStore<vmemkv::variants::VMemKV_LMDB>);
 static_assert(vmemkv::KVStore<vmemkv::variants::VMemKV_ReadNormal>);
 static_assert(vmemkv::KVStore<vmemkv::variants::VMemKV_ReadPread>);
-static_assert(vmemkv::Config<>::UseBloomFilter);
-static_assert(vmemkv::Config<>::UseT1InlineValue);
 
 #include "test_kv_store_fixture.hpp"
 
@@ -407,24 +405,28 @@ TEST_CASE_TEMPLATE("long keys sharing a 16-byte prefix: CRUD", Store, STORE_TYPE
 // Offset64 must disambiguate matching prefixes by hash(full_key).
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 TEST_CASE("Offset64 + hash-index disambiguates long keys sharing a prefix") {
-  using OffsetAppendMapIndex = vmemkv::T1Index<vmemkv::Config<>>;
+  using OffsetAppendMapIndex = vmemkv::T1Index;
   // Heap-allocate: Hash index embeds a large bucket array unsuited to the stack.
-  auto idx = std::make_unique<OffsetAppendMapIndex>();
+  vmemkv::EpochDomain epoch_domain;
+  auto idx = std::make_unique<OffsetAppendMapIndex>(epoch_domain);
 
   const std::string prefix = "0123456789abcdef";
   const std::string key_one = prefix + "-alpha";
   const std::string key_two = prefix + "-bravo";
 
-  CHECK(idx->put(vmemkv_test::to_span(key_one), 1) == OffsetAppendMapIndex::PutResult::Applied);
-  CHECK(idx->put(vmemkv_test::to_span(key_two), 2) == OffsetAppendMapIndex::PutResult::Applied);
-  CHECK(idx->get(vmemkv_test::to_span(key_one)) == 1U);
-  CHECK(idx->get(vmemkv_test::to_span(key_two)) == 2U);
-  CHECK(idx->put(vmemkv_test::to_span(key_one), 9) == OffsetAppendMapIndex::PutResult::Applied);
-  CHECK(idx->get(vmemkv_test::to_span(key_one)) == 9U);
+  CHECK(epoch_domain.run([&] { return idx->put(vmemkv_test::to_span(key_one), 1); }) ==
+        OffsetAppendMapIndex::PutResult::Applied);
+  CHECK(epoch_domain.run([&] { return idx->put(vmemkv_test::to_span(key_two), 2); }) ==
+        OffsetAppendMapIndex::PutResult::Applied);
+  CHECK(epoch_domain.run([&] { return idx->get(vmemkv_test::to_span(key_one)); }) == 1U);
+  CHECK(epoch_domain.run([&] { return idx->get(vmemkv_test::to_span(key_two)); }) == 2U);
+  CHECK(epoch_domain.run([&] { return idx->put(vmemkv_test::to_span(key_one), 9); }) ==
+        OffsetAppendMapIndex::PutResult::Applied);
+  CHECK(epoch_domain.run([&] { return idx->get(vmemkv_test::to_span(key_one)); }) == 9U);
 
   idx->reorganize([](auto) {});
-  CHECK(idx->get(vmemkv_test::to_span(key_one)) == 9U);
-  CHECK(idx->get(vmemkv_test::to_span(key_two)) == 2U);
+  CHECK(epoch_domain.run([&] { return idx->get(vmemkv_test::to_span(key_one)); }) == 9U);
+  CHECK(epoch_domain.run([&] { return idx->get(vmemkv_test::to_span(key_two)); }) == 2U);
 }
 
 // Large byte values are only tested for stores backed by Tier 2.

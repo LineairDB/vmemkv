@@ -78,18 +78,18 @@ inline auto auto_reorg_suppressed() noexcept -> bool {
   return !getenv_view("VMEMKV_SUPPRESS_AUTO_REORG").empty();
 }
 
-inline auto wal_over_threshold(const Wal &wal) -> bool {
-  return wal.size_bytes() >= WalConfig::kMaxBytesSinceCheckpoint;
+inline auto wal_over_threshold(const Wal &wal, size_t max_bytes = WalConfig::kMaxBytesSinceCheckpoint) -> bool {
+  return wal.size_bytes() >= max_bytes;
 }
 
-template <typename ConfigT>
-inline auto punch_backlog_over_cap(const T2Ownership<ConfigT> &own) -> bool {
-  return own.punch_backlog_segments() >= ConfigT::kPunchBacklogCheckpointCapSegments;
+inline auto punch_backlog_over_cap(const T2Ownership &own,
+                                   uint64_t cap = T2Config::kPunchBacklogCheckpointCapSegments) -> bool {
+  return own.punch_backlog_segments() >= cap;
 }
 
-template <typename ConfigT>
-inline auto checkpoint_due(const Wal &wal, const T2Ownership<ConfigT> &own) -> bool {
-  return wal_over_threshold(wal) || punch_backlog_over_cap<ConfigT>(own);
+inline auto checkpoint_due(const Wal &wal, const T2Ownership &own, const StoreOptions &options = {}) -> bool {
+  return wal_over_threshold(wal, options.wal_max_bytes_since_checkpoint) ||
+         punch_backlog_over_cap(own, options.punch_backlog_checkpoint_cap_segments);
 }
 
 // Bounded poll, not atomic::wait(): no timed overload to bound a missed wakeup. Callers only
@@ -136,16 +136,17 @@ auto capture_checkpoint_target(T2FlatFile &tier2,
 
 // msync()'s addr must be page-aligned; old_read_only_offset is only block-aligned. Rounding
 // down re-syncs a small already-durable overlap -- harmless, msync() is idempotent.
-// Synchronizes in chunks (ConfigT::kMsyncChunkBytes) and yields between chunks to avoid
+// Synchronizes in chunks (`chunk_bytes`) and yields between chunks to avoid
 // monopolizing kernel writeback and stalling concurrent foreground operations.
-template <typename ConfigT = Config<>>
-inline void msync_target_range(const T2Memory *mem, uint64_t old_read_only_offset, uint64_t target) {
+inline void msync_target_range(const T2Memory *mem,
+                               uint64_t old_read_only_offset,
+                               uint64_t target,
+                               uint64_t chunk_bytes = T2Config::kMsyncChunkBytes) {
   if (target <= old_read_only_offset) {
     return;
   }
   const uint64_t page_size = t2_detail::os_page_size();
   const uint64_t aligned_start = old_read_only_offset - (old_read_only_offset % page_size);
-  const uint64_t chunk_bytes = ConfigT::kMsyncChunkBytes;
   for (uint64_t cur = aligned_start; cur < target;) {
     const uint64_t cur_len = std::min(chunk_bytes, target - cur);
     const int msync_rc = ::msync(mem->reads.random_mmap + cur, cur_len, MS_SYNC);
@@ -324,16 +325,17 @@ void emit_shard_group(const ShardChunkGroup &group,
 
 // Publishes only dirty/coalesced T1 chunks to `<t2_path>.t1chk/` and commits the atomic
 // manifest; rolls back newly written chunk files on error without mutating committed state.
-template <typename ConfigT>
-auto publish_t1_checkpoint_and_manifest(CheckpointState &state,
-                                        ShardedT1Index<ConfigT> &tier1,
-                                        const std::filesystem::path &t2_path,
-                                        uint64_t checkpoint_lsn,
-                                        uint64_t target,
-                                        std::chrono::nanoseconds &t1_write_phase) -> std::chrono::nanoseconds {
-  using EntrySnapshot = typename ShardedT1Index<ConfigT>::EntrySnapshot;
+inline auto publish_t1_checkpoint_and_manifest(CheckpointState &state,
+                                               ShardedT1Index &tier1,
+                                               const std::filesystem::path &t2_path,
+                                               uint64_t checkpoint_lsn,
+                                               uint64_t target,
+                                               std::chrono::nanoseconds &t1_write_phase,
+                                               uint64_t default_t1_chunk_split_bytes = T1Config::kT1ChunkSplitBytes)
+    -> std::chrono::nanoseconds {
+  using EntrySnapshot = ShardedT1Index::EntrySnapshot;
   const uint64_t split_bytes =
-      state.t1_chunk_split_bytes > 0 ? state.t1_chunk_split_bytes : ConfigT::kT1ChunkSplitBytes;
+      state.t1_chunk_split_bytes > 0 ? state.t1_chunk_split_bytes : default_t1_chunk_split_bytes;
   const std::filesystem::path t1_dir = vmemkv::derive_t1_chk_path(t2_path);
   std::filesystem::create_directories(t1_dir);
 
@@ -431,8 +433,7 @@ inline void publish_cycle_stats(CheckpointStats &stats,
 // Claims the target range before msync() reads it, then drains in-flight in-place writes
 // against the old fuzzy watermark. Without the claim, a racing update could be msync()'d mid-write
 // (torn on disk) or land after read_only_offset publishes past it.
-template <typename ConfigT>
-auto claim_and_drain_watermark(T2Ownership<ConfigT> &own, uint64_t target) -> std::chrono::nanoseconds {
+inline auto claim_and_drain_watermark(T2Ownership &own, uint64_t target) -> std::chrono::nanoseconds {
   own.claim_watermark(target);
   const auto barrier_start = std::chrono::steady_clock::now();
   own.drain_in_place(target);
@@ -451,14 +452,15 @@ inline auto publish_boundary_and_rotate(T2FlatFile &tier2, Wal &wal, uint64_t ta
 
 // Durabilizes T2's live mutable region grown since the last cycle, advances read_only_offset in
 // place, and persists a manifest-committed checkpoint.
-template <typename ConfigT, typename PreStopHook, typename PreFinishHook>
+template <typename PreStopHook, typename PreFinishHook>
   requires CheckpointHook<PreStopHook> && CheckpointHook<PreFinishHook>
 void checkpoint_internal(CheckpointState &state,
-                         ShardedT1Index<ConfigT> &tier1,
+                         ShardedT1Index &tier1,
                          T2FlatFile &tier2,
                          Wal &wal,
-                         T2Ownership<ConfigT> &own,
+                         T2Ownership &own,
                          const std::filesystem::path &t2_path,
+                         const StoreOptions &options,
                          PreStopHook pre_stop_hook,
                          PreFinishHook pre_finish_hook) {
   const auto fn_start = std::chrono::steady_clock::now();
@@ -478,14 +480,15 @@ void checkpoint_internal(CheckpointState &state,
     const vmemkv::T2Memory *mem = tier2.get_memory();
     const auto msync_start = std::chrono::steady_clock::now();
     g_checkpoint_debug_phase.store("checkpoint: msync_target_range", std::memory_order_release);
-    msync_target_range<ConfigT>(mem, checkpoint_target.old_read_only_offset, checkpoint_target.target);
+    msync_target_range(
+        mem, checkpoint_target.old_read_only_offset, checkpoint_target.target, options.msync_chunk_bytes);
     msync_phase = std::chrono::steady_clock::now() - msync_start;
 
     pre_finish_hook();
 
     g_checkpoint_debug_phase.store("checkpoint: publish_t1_checkpoint", std::memory_order_release);
     t1_phase = publish_t1_checkpoint_and_manifest(
-        state, tier1, t2_path, checkpoint_lsn, checkpoint_target.target, t1_write_phase);
+        state, tier1, t2_path, checkpoint_lsn, checkpoint_target.target, t1_write_phase, options.t1_chunk_split_bytes);
   } catch (...) {
     // Nothing durable happened yet (read_only_offset hasn't advanced) -- un-claim so in-place
     // updates aren't blocked forever for an unpublished cycle.
@@ -516,14 +519,15 @@ void checkpoint_internal(CheckpointState &state,
 
 // Shared wait/CAS/coalesce loop for foreground checkpoint(). Coalesces if another concurrent
 // cycle completed a checkpoint while we waited.
-template <typename ConfigT, typename PreStopHook, typename PreFinishHook>
+template <typename PreStopHook, typename PreFinishHook>
   requires CheckpointHook<PreStopHook> && CheckpointHook<PreFinishHook>
 void run_checkpoint(CheckpointState &state,
-                    ShardedT1Index<ConfigT> &tier1,
+                    ShardedT1Index &tier1,
                     T2FlatFile &tier2,
                     Wal &wal,
-                    T2Ownership<ConfigT> &own,
+                    T2Ownership &own,
                     const std::filesystem::path &t2_path,
+                    const StoreOptions &options,
                     PreStopHook pre_stop_hook,
                     PreFinishHook pre_finish_hook) {
   const uint64_t start_chk_count = state.stats.checkpoint_count.load(std::memory_order_acquire);
@@ -536,7 +540,7 @@ void run_checkpoint(CheckpointState &state,
     }
 
     if (auto guard = SingleFlightGuard::try_acquire(state.running); guard.holds) {
-      checkpoint_internal(state, tier1, tier2, wal, own, t2_path, pre_stop_hook, pre_finish_hook);
+      checkpoint_internal(state, tier1, tier2, wal, own, t2_path, options, pre_stop_hook, pre_finish_hook);
       return;
     }
   }

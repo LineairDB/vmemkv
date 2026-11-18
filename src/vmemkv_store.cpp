@@ -1,11 +1,11 @@
-// Public facade over StoreAdapter<VMemKVImpl<...>>; no logic here.
+// Public facade over StoreAdapter<VMemKVImpl>; no logic here.
 #include <vmemkv/api/store_adapter.hpp>
 #include <vmemkv/stats.hpp>
 #include <vmemkv/vmemkv.hpp>
 #include <vmemkv/vmemkv_impl.hpp>
 namespace vmemkv {
 struct VMemKVStore::Impl {
-  StoreAdapter<VMemKVImpl<>> inner;
+  StoreAdapter<VMemKVImpl> inner;
   Impl(const std::filesystem::path &path, uint64_t capacity) : inner(path, capacity) {}
 };
 VMemKVStore::VMemKVStore(const std::filesystem::path &path, uint64_t capacity)

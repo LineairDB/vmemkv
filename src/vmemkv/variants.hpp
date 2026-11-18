@@ -4,9 +4,9 @@
 #include <vmemkv/config.hpp>
 #include <vmemkv/vmemkv_impl.hpp>
 namespace vmemkv::variants {
-using VMemKV_Default = StoreAdapter<VMemKVImpl<>>;
-using VMemKV_ReadRandom = StoreAdapter<VMemKVImpl<Config<ReadPolicyRandomOnly>>>;
-using VMemKV_ReadSeq = StoreAdapter<VMemKVImpl<Config<ReadPolicySeqOnly>>>;
-using VMemKV_ReadNormal = StoreAdapter<VMemKVImpl<Config<ReadPolicyNormalOnly>>>;
-using VMemKV_ReadPread = StoreAdapter<VMemKVImpl<Config<ReadPolicyPreadOnly>>>;
+using VMemKV_Default = StoreAdapter<VMemKVImpl>;
+using VMemKV_ReadRandom = StoreAdapter<ConfiguredVMemKV<Config<ReadPolicyRandomOnly>>>;
+using VMemKV_ReadSeq = StoreAdapter<ConfiguredVMemKV<Config<ReadPolicySeqOnly>>>;
+using VMemKV_ReadNormal = StoreAdapter<ConfiguredVMemKV<Config<ReadPolicyNormalOnly>>>;
+using VMemKV_ReadPread = StoreAdapter<ConfiguredVMemKV<Config<ReadPolicyPreadOnly>>>;
 }  // namespace vmemkv::variants

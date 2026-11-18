@@ -34,28 +34,32 @@ inline std::atomic<size_t> g_checkpoint_current_shard{0};
 inline std::atomic<size_t> g_checkpoint_total_shards{0};
 }  // namespace t1_debug
 
-template <typename Config = vmemkv::Config<>>
 class ShardedT1Index {
  public:
   using Key = t1_detail::StoreKey;
   using Payload = uint64_t;
-  using Shard = T1Index<Config>;
-  using PutResult = typename Shard::PutResult;
-  using LookupResult = typename Shard::LookupResult;
-  using EntrySnapshot = typename Shard::EntrySnapshot;
+  using Shard = T1Index;
+  using PutResult = Shard::PutResult;
+  using LookupResult = Shard::LookupResult;
+  using EntrySnapshot = Shard::EntrySnapshot;
 
   // `target_shard_size`: the one knob callers tune -- a shard's background maintenance splits
-  // it past Config::kShardSplitThresholdPercent% of this target
+  // it past `shard_split_threshold_percent`% of this target
   // (see docs/specification/t1_sharding_design.md).
   // `worker_threads`: background maintenance pool size; defaults to a quarter of hardware
   // concurrency (cores stay reserved for foreground traffic). 0 defers startup (see
   // start_workers()) for callers needing single-threaded setup first (e.g. checkpoint load).
   // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-  explicit ShardedT1Index(size_t memtable_cap = Config::kMemTableCapacityEntries,
-                          size_t target_shard_size = Config::kShardTargetSizeEntries,
-                          size_t worker_threads = default_worker_count())
-      : memtable_cap_(memtable_cap), target_shard_size_(target_shard_size) {
-    auto *slot = new ShardSlot(std::make_unique<Shard>(memtable_cap, &epoch_domain_));
+  explicit ShardedT1Index(size_t memtable_cap = T1Config::kMemTableCapacityEntries,
+                          size_t target_shard_size = T1Config::kShardTargetSizeEntries,
+                          size_t worker_threads = default_worker_count(),
+                          uint32_t shard_split_threshold_percent = T1Config::kShardSplitThresholdPercent,
+                          uint64_t segment_bytes = T2Config::kSegmentBytes)
+      : memtable_cap_(memtable_cap),
+        target_shard_size_(target_shard_size),
+        split_threshold_percent_(shard_split_threshold_percent),
+        segment_bytes_(segment_bytes) {
+    auto *slot = new ShardSlot(std::make_unique<Shard>(epoch_domain_, memtable_cap));
     auto *dir = new Directory();
     dir->shards.push_back(slot);
     directory_.store(dir, std::memory_order_release);
@@ -67,7 +71,7 @@ class ShardedT1Index {
   void start_workers(size_t count = default_worker_count()) {
     workers_.reserve(workers_.size() + count);
     for (size_t i = 0; i < count; ++i) {
-      workers_.emplace_back([this](std::stop_token stop_token) { worker_loop(stop_token); });
+      workers_.emplace_back([this](const std::stop_token &stop_token) { worker_loop(stop_token); });
     }
   }
 
@@ -95,7 +99,7 @@ class ShardedT1Index {
     const Key prefix = t1_detail::prefix_from_bytes(key);
     return with_routing_guard([&]() -> LookupResult {
       ShardSlot *slot = resolve(prefix);
-      return slot->index->get_with_hash(key, kCallerHeldEpoch);
+      return slot->index->get_with_hash(key);
     });
   }
 
@@ -118,7 +122,7 @@ class ShardedT1Index {
           return std::nullopt;
         }
         request_maintenance_if_needed(slot);
-        const PutResult result = slot->index->put(key, value, is_inline, inline_size, kCallerHeldEpoch);
+        const PutResult result = slot->index->put(key, value, is_inline, inline_size);
         if (result == PutResult::MemTableFull || slot->superseded.load(std::memory_order_acquire) != nullptr) {
           return std::nullopt;
         }
@@ -202,7 +206,7 @@ class ShardedT1Index {
 
   // Sum of every shard's current MemTable occupancy.
   [[nodiscard]] auto memtable_size() const -> size_t {
-    return reduce_shards<size_t>([](const Shard &shard) noexcept { return shard.memtable_size(kCallerHeldEpoch); });
+    return reduce_shards<size_t>([](const Shard &shard) noexcept { return shard.memtable_size(); });
   }
 
   // True when any live shard currently has entries buffered in its active MemTable or an
@@ -211,7 +215,7 @@ class ShardedT1Index {
     return with_routing_guard([&]() -> bool {
       Directory *dir = directory_.load(std::memory_order_acquire);
       return std::ranges::any_of(dir->shards, [](const ShardSlot *slot) {
-        return slot->index->memtable_size(kCallerHeldEpoch) > 0 || slot->index->has_immutable();
+        return slot->index->memtable_size() > 0 || slot->index->has_immutable();
       });
     });
   }
@@ -221,18 +225,9 @@ class ShardedT1Index {
   void reorganize() {
     PinnedShards pinned = pin_shards(/*skip_superseded=*/true, /*only_pending_memtables=*/true);
     for (ShardSlot *slot : pinned.slots) {
-      bool captured = false;
-      SpinBackoff backoff;
-      while (!captured && slot->superseded.load(std::memory_order_acquire) == nullptr &&
-             (slot->index->memtable_size() > 0 || slot->index->has_immutable())) {
-        slot->index->reorganize([](std::span<EntrySnapshot> /*merged*/) {},
-                                [&](std::span<const EntrySnapshot> merged) {
-                                  record_merged_shard(slot, merged);
-                                  captured = true;
-                                });
-        if (!captured) {
-          backoff.wait();
-        }
+      if (slot->superseded.load(std::memory_order_acquire) == nullptr) {
+        slot->index->reorganize_if_pending(
+            [&](std::span<const EntrySnapshot> merged) { record_merged_shard(slot, merged); });
       }
       pinned.release_one();
     }
@@ -286,9 +281,8 @@ class ShardedT1Index {
   //
   // Splits pause for the whole call (directory stays stable); in-flight splits still complete,
   // so touched shards are held by outside_refs, not one long guard. Only the directory snapshot
-  // is taken guarded. Non-splitting maintenance still runs concurrently: reorg_in_progress_
-  // single-flights it against this loop's own reorganize(), and the loser skips its callback --
-  // hence reorganize_until_captured() retries until the callback fires.
+  // is taken guarded. Non-splitting maintenance still runs concurrently: reorganize() blocks on
+  // reorg_in_progress_ against any in-flight maintenance merge and always runs its callback.
   template <typename OffsetMapper, typename PerShardWriter>
   auto checkpoint_all_shards(OffsetMapper offset_mapper, PerShardWriter per_shard_writer) -> std::vector<Key> {
     std::vector<Key> out_boundaries;
@@ -341,7 +335,7 @@ class ShardedT1Index {
     new_dir->boundaries.assign(boundaries.begin(), boundaries.end());
     new_dir->shards.reserve(per_shard_entries.size());
     for (const auto &entries : per_shard_entries) {
-      auto shard = std::make_unique<Shard>(memtable_cap_, &epoch_domain_);
+      auto shard = std::make_unique<Shard>(epoch_domain_, memtable_cap_);
       shard->load_sorted_run_from_checkpoint(entries);
       auto *slot = new ShardSlot(std::move(shard));
       slot->approx_t2_bytes.store(sharded_detail::sum_entries_t2_bytes(std::span<const EntrySnapshot>(entries)),
@@ -398,9 +392,9 @@ class ShardedT1Index {
     with_routing_guard([&] {
       Directory *dir = directory_.load(std::memory_order_acquire);
       for (ShardSlot *slot : dir->shards) {
-        if (should_split_shard(slot->index->approx_entry_count(kCallerHeldEpoch),
+        if (should_split_shard(slot->index->approx_entry_count(),
                                slot->approx_t2_bytes.load(std::memory_order_relaxed)) ||
-            slot->index->memtable_size(kCallerHeldEpoch) > 0) {
+            slot->index->memtable_size() > 0) {
           queue_.push_if_live(slot);
         }
       }
@@ -528,8 +522,7 @@ class ShardedT1Index {
         if (skip_superseded && slot->superseded.load(std::memory_order_acquire) != nullptr) {
           continue;
         }
-        if (only_pending_memtables && slot->index->memtable_size(kCallerHeldEpoch) == 0 &&
-            !slot->index->has_immutable()) {
+        if (only_pending_memtables && slot->index->memtable_size() == 0 && !slot->index->has_immutable()) {
           continue;
         }
         slot->outside_refs.fetch_add(1, std::memory_order_relaxed);
@@ -634,13 +627,15 @@ class ShardedT1Index {
     // the same reason a merge snapshot does: they are WAL-covered past this cycle's
     // checkpoint_lsn and converge via replay. Tombstone pressure is not reset here --
     // only a real merge carries tombstones away.
-    if (slot->index->memtable_size() == 0 && !slot->index->has_immutable()) {
+    const bool empty_memtables =
+        with_routing_guard([&] { return slot->index->memtable_size() == 0 && !slot->index->has_immutable(); });
+    if (empty_memtables) {
       slot->index->dump_sorted_run(dumped);
       offset_mapper(std::span<EntrySnapshot>(dumped));
       update_t2_bytes_and_queue_split(slot, dumped);
       per_shard_writer(dumped);
     } else {
-      reorganize_until_captured(*slot->index, offset_mapper, [&](std::span<const EntrySnapshot> merged) {
+      slot->index->reorganize(offset_mapper, [&](std::span<const EntrySnapshot> merged) {
         record_merged_shard(slot, merged);
         per_shard_writer(merged);
       });
@@ -689,11 +684,12 @@ class ShardedT1Index {
       finish_visit(check_split);
     };
     try {
-      if (slot->index->memtable_size() == 0 && !slot->index->has_immutable()) {
+      const bool empty_memtables =
+          with_routing_guard([&] { return slot->index->memtable_size() == 0 && !slot->index->has_immutable(); });
+      if (empty_memtables) {
         slot->index->dump_sorted_run(entries);
       } else {
-        reorganize_until_captured(
-            *slot->index,
+        slot->index->reorganize(
             [](std::span<EntrySnapshot> /*merged*/) {},
             [&](std::span<const EntrySnapshot> merged) { entries.assign(merged.begin(), merged.end()); });
         slot->tombstones_since_maintenance.store(0, std::memory_order_relaxed);
@@ -731,8 +727,8 @@ class ShardedT1Index {
     if (entry_count < 2) {
       return false;
     }
-    return entry_count >= sharded_detail::split_threshold(target_shard_size_, Config::kShardSplitThresholdPercent) ||
-           t2_bytes >= Config::kSegmentBytes;
+    return entry_count >= sharded_detail::split_threshold(target_shard_size_, split_threshold_percent_) ||
+           t2_bytes >= segment_bytes_;
   }
 
   // Queue ownership shared by maintenance and dirty-shard compaction queues.
@@ -828,7 +824,7 @@ class ShardedT1Index {
     if (split != nullptr && split != kClosingSentinel) {
       return std::nullopt;
     }
-    return slot->index->scan(lo_bytes, hi_bytes, callback, kCallerHeldEpoch);
+    return slot->index->scan(lo_bytes, hi_bytes, callback);
   }
 
   template <typename Callback>
@@ -841,7 +837,7 @@ class ShardedT1Index {
                         bool &stopped) const -> size_t {
     size_t total = 0;
     ShardSetView{dir}.for_each_leaf_in_range(lower, upper, [&](ShardSlot *leaf) -> bool {
-      total += leaf->index->scan(lo_bytes, hi_bytes, callback, kCallerHeldEpoch);
+      total += leaf->index->scan(lo_bytes, hi_bytes, callback);
       return !stopped;
     });
     return total;
@@ -911,16 +907,7 @@ class ShardedT1Index {
 
   template <typename Func>
   auto with_routing_guard(Func &&func) const noexcept(noexcept(func())) -> decltype(func()) {
-    assert(!epoch_domain_.tracker.is_held_by_current_thread());
-    typename ThreadReferenceTracker<uint64_t>::Guard handle(epoch_domain_.tracker,
-                                                            epoch_domain_.epoch.load(std::memory_order_relaxed));
-    return func();
-  }
-
-  // Retries reorganize() until `on_merged` fires (see sharded_maintenance.hpp).
-  template <typename OffsetMapper, typename OnMerged>
-  static void reorganize_until_captured(Shard &shard, OffsetMapper offset_mapper, OnMerged on_merged) {
-    sharded_detail::reorganize_until_captured(shard, offset_mapper, on_merged);
+    return epoch_domain_.run(std::forward<Func>(func));
   }
 
   // Post-Closing-CAS split body. Unguarded by design: winning the CAS made `target` this
@@ -945,13 +932,11 @@ class ShardedT1Index {
     // just before Closing can still land after this snapshot -- closed by put()'s own
     // superseded re-check forwarding to the live shard (see put()).
     //
-    // Retried: a duplicate queued run_maintenance() for this shard can be mid-reorganize() now,
-    // making this call a no-op via the reorg_in_progress_ CAS. Without retry, lost races would
-    // abort every split attempt under write pressure (resetting superseded to null makes them
-    // look like "too small"), growing the shard without bound.
+    // reorganize() blocks until any duplicate queued run_maintenance() finishes its merge;
+    // skipping would abort the split under write pressure (resetting superseded makes shards
+    // look too small and grow without bound).
     std::vector<EntrySnapshot> merged_entries;
-    reorganize_until_captured(
-        *target->index,
+    target->index->reorganize(
         [](std::span<EntrySnapshot> /*merged*/) {},
         [&](std::span<const EntrySnapshot> merged) { merged_entries.assign(merged.begin(), merged.end()); });
 
@@ -993,8 +978,8 @@ class ShardedT1Index {
     const std::span<const EntrySnapshot> high_entries(merged_entries.data() + mid, merged_entries.size() - mid);
     const uint64_t low_t2_bytes = sharded_detail::sum_entries_t2_bytes(low_entries);
     const uint64_t high_t2_bytes = sharded_detail::sum_entries_t2_bytes(high_entries);
-    auto low_shard = std::make_unique<Shard>(target->index->memtable_capacity(), &epoch_domain_);
-    auto high_shard = std::make_unique<Shard>(target->index->memtable_capacity(), &epoch_domain_);
+    auto low_shard = std::make_unique<Shard>(epoch_domain_, target->index->memtable_capacity());
+    auto high_shard = std::make_unique<Shard>(epoch_domain_, target->index->memtable_capacity());
     low_shard->load_sorted_run_from_checkpoint(low_entries);
     high_shard->load_sorted_run_from_checkpoint(high_entries);
 
@@ -1108,7 +1093,7 @@ class ShardedT1Index {
       const uint64_t rec_bytes = sharded_detail::payload_t2_bytes(value, is_inline);
       if (rec_bytes > 0) {
         const uint64_t prev_bytes = slot->approx_t2_bytes.fetch_add(rec_bytes, std::memory_order_relaxed);
-        if (prev_bytes + rec_bytes >= Config::kSegmentBytes) {
+        if (prev_bytes + rec_bytes >= segment_bytes_) {
           request_maintenance_if_needed(slot);
         }
       }
@@ -1127,12 +1112,12 @@ class ShardedT1Index {
   // re-check: ordered-before-purge gets cleaned; ordered-after sees set superseded and backs
   // out. No post-return queue entry for a splitting shard, ever.
   void request_maintenance_if_needed(ShardSlot *slot) {
-    const size_t size = slot->index->memtable_size(kCallerHeldEpoch);
+    const size_t size = slot->index->memtable_size();
     const size_t cap = slot->index->memtable_capacity();
     const bool over_soft = size >= maintenance_soft_threshold(cap);
     const bool delete_heavy = slot->tombstones_since_maintenance.load(std::memory_order_relaxed) >= target_shard_size_;
     const bool over_t2_bytes =
-        size > 0 && slot->approx_t2_bytes.load(std::memory_order_relaxed) >= Config::kSegmentBytes;
+        size > 0 && slot->approx_t2_bytes.load(std::memory_order_relaxed) >= segment_bytes_;
     if (!over_soft && !delete_heavy && !over_t2_bytes) {
       return;
     }
@@ -1224,19 +1209,18 @@ class ShardedT1Index {
     // compaction worker (the pause holder) busy -- waiting would deadlock bulk loads.
     const bool pause_active =
         splits_paused_.load(std::memory_order_acquire) != 0 || slot->split_paused.load(std::memory_order_acquire);
-    if (pause_active && slot->index->memtable_size() < maintenance_soft_threshold(slot->index->memtable_capacity())) {
+    const bool below_soft = pause_active && with_routing_guard([&] { return slot->index->memtable_size(); }) <
+                                                maintenance_soft_threshold(slot->index->memtable_capacity());
+    if (below_soft) {
       slot->outside_refs.fetch_sub(1, std::memory_order_relaxed);
       queue_.push_if_live(slot);
       return false;
     }
 
     std::vector<EntrySnapshot> merged_entries;
-    bool reorganized = false;
-    slot->index->reorganize([](std::span<EntrySnapshot> /*merged*/) {},
-                            [&](std::span<const EntrySnapshot> merged) {
-                              merged_entries.assign(merged.begin(), merged.end());
-                              reorganized = true;
-                            });
+    const bool reorganized = slot->index->try_reorganize(
+        [](std::span<EntrySnapshot> /*merged*/) {},
+        [&](std::span<const EntrySnapshot> merged) { merged_entries.assign(merged.begin(), merged.end()); });
     uint64_t merged_t2_bytes = 0;
     if (reorganized) {
       merged_t2_bytes = sharded_detail::sum_entries_t2_bytes(merged_entries);
@@ -1267,6 +1251,8 @@ class ShardedT1Index {
   std::atomic<Directory *> directory_{nullptr};
   size_t memtable_cap_;
   size_t target_shard_size_;
+  uint32_t split_threshold_percent_;
+  uint64_t segment_bytes_;
   ShardQueue<&ShardSlot::maintenance_pending> queue_;
   ShardQueue<&ShardSlot::t2_dirty> dirty_queue_;
   std::atomic<size_t> active_dirty_visits_{0};
@@ -1279,9 +1265,8 @@ class ShardedT1Index {
   std::atomic<uint64_t> checkpoint_write_epoch_{1};
 };
 
-template <typename Config>
-typename ShardedT1Index<Config>::Split *const ShardedT1Index<Config>::kClosingSentinel =
+inline ShardedT1Index::Split *const ShardedT1Index::kClosingSentinel =
     // NOLINTNEXTLINE(performance-no-int-to-ptr)
-    reinterpret_cast<typename ShardedT1Index<Config>::Split *>(static_cast<uintptr_t>(1));
+    reinterpret_cast<ShardedT1Index::Split *>(static_cast<uintptr_t>(1));
 
 }  // namespace vmemkv

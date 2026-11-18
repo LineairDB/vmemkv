@@ -7,7 +7,7 @@ Eliminates the O(corpus) cost of `reorganize()`/`checkpoint()` (see [`t1_index_s
 T1 becomes two layers:
 
 - **Directory**: an array sorted by boundary keys, mapping each interval to one shard.
-- **Shard**: K instances of `T1Index<Config>`. Each shard holds only data in its own key range, an independent In-Memory Sorted Run + MemTable pair sharing a single store-wide `EpochDomain`.
+- **Shard**: K instances of `T1Index`. Each shard holds only data in its own key range, an independent In-Memory Sorted Run + MemTable pair sharing a single store-wide `EpochDomain`.
 
 The key space is range-partitioned (not hashed): shards stay disjoint and ordered at all times, so cross-shard Scan needs no k-way merge — concatenating each intersecting shard's `scan()` results in shard order already yields a fully sorted result.
 
@@ -15,7 +15,7 @@ The initial state is K=1 (identical behavior to the existing single T1Index), sp
 
 ## Directory Concurrency
 
-The directory applies one level up the RCU-style pattern T1Index itself already uses (`MemTableGeneration`/`SortedRun` atomic pointer swaps + unified store-wide `EpochDomain`). The directory is an immutable object, atomically swapped for a new instance only on split/merge. Readers enter `EpochDomain` once at operation start, load the directory, and hold that single epoch guard through the resolved shard lookup (`kCallerHeldEpoch`).
+The directory applies one level up the RCU-style pattern T1Index itself already uses (`MemTableGeneration`/`SortedRun` atomic pointer swaps + unified store-wide `EpochDomain`). The directory is an immutable object, atomically swapped for a new instance only on split/merge. Readers enter `EpochDomain` once at operation start, load the directory, and hold that single epoch guard through the resolved shard lookup.
 
 ## Splitting
 

@@ -26,27 +26,27 @@
 
 namespace {
 
-using Store = vmemkv::StoreAdapter<vmemkv::VMemKVImpl<vmemkv::Config<>>>;
+using Store = vmemkv::StoreAdapter<vmemkv::VMemKVImpl>;
 constexpr size_t kTestCapacityBytes = 256ULL * 1024 * 1024;
 
 struct TinyShardConfig : vmemkv::Config<> {
   static constexpr size_t kMemTableCapacityEntries = 128;
   static constexpr size_t kShardTargetSizeEntries = 64;
 };
-using TinyShardStore = vmemkv::StoreAdapter<vmemkv::VMemKVImpl<TinyShardConfig>>;
+using TinyShardStore = vmemkv::StoreAdapter<vmemkv::ConfiguredVMemKV<TinyShardConfig>>;
 
 struct TinySegmentConfig : vmemkv::Config<> {
   static constexpr uint64_t kSegmentBytes = 64ULL << 10;
   static constexpr size_t kShardTargetSizeEntries = 256;
 };
-using TinySegmentStore = vmemkv::StoreAdapter<vmemkv::VMemKVImpl<TinySegmentConfig>>;
+using TinySegmentStore = vmemkv::StoreAdapter<vmemkv::ConfiguredVMemKV<TinySegmentConfig>>;
 
 struct TinyConvergenceConfig : vmemkv::Config<> {
   static constexpr uint64_t kSegmentBytes = 64ULL << 10;
   static constexpr uint64_t kPunchBacklogCheckpointCapSegments = 4;
   static constexpr size_t kMaxBytesSinceCheckpoint = 128ULL << 10;
 };
-using TinyConvergenceStore = vmemkv::StoreAdapter<vmemkv::VMemKVImpl<TinyConvergenceConfig>>;
+using TinyConvergenceStore = vmemkv::StoreAdapter<vmemkv::ConfiguredVMemKV<TinyConvergenceConfig>>;
 
 struct AutoCompactFixture {
   AutoCompactFixture() {
@@ -325,7 +325,8 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "T2 segment evacuation includes current ve
   constexpr size_t kUpdatedKey = 100;
   constexpr size_t kDeletedKey = 101;
   constexpr size_t kInlineKey = 102;
-  const uint64_t source_segment = vmemkv::T2Ownership<TinySegmentConfig>::seg_index(old_offsets[kUpdatedKey]);
+  const uint64_t source_segment =
+      vmemkv::T2Ownership::seg_index(old_offsets[kUpdatedKey], TinySegmentConfig::kSegmentBytes);
   auto is_deleted_key = [&](size_t i) -> bool {
     if (i == kDeletedKey) {
       return true;
@@ -333,7 +334,8 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "T2 segment evacuation includes current ve
     if (i == kUpdatedKey || i == kInlineKey) {
       return false;
     }
-    return i >= 150 && vmemkv::T2Ownership<TinySegmentConfig>::seg_index(old_offsets[i]) == source_segment;
+    return i >= 150 &&
+           vmemkv::T2Ownership::seg_index(old_offsets[i], TinySegmentConfig::kSegmentBytes) == source_segment;
   };
   REQUIRE(store->update(make_key(kUpdatedKey), pattern_value(kValBytes, kKeys + kUpdatedKey)));
   REQUIRE(store->update(make_key(kUpdatedKey), pattern_value(2 * kValBytes, 2 * kKeys + kUpdatedKey)));
@@ -357,7 +359,7 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "T2 segment evacuation includes current ve
 
   for (size_t i = 0; i < kKeys; ++i) {
     if (is_deleted_key(i) || i == kInlineKey ||
-        vmemkv::T2Ownership<TinySegmentConfig>::seg_index(old_offsets[i]) != source_segment) {
+        vmemkv::T2Ownership::seg_index(old_offsets[i], TinySegmentConfig::kSegmentBytes) != source_segment) {
       continue;
     }
     const auto lookup = store->impl().t1().get_with_hash(vmemkv_test::to_span(make_key(i)));
@@ -428,8 +430,8 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "overwrite and delete segment evacuation r
 }
 
 TEST_CASE("punch backlog cap triggers checkpoint coverage") {
-  vmemkv::T2Ownership<TinyConvergenceConfig> own(16);
   constexpr uint64_t kSegBytes = TinyConvergenceConfig::kSegmentBytes;
+  vmemkv::T2Ownership own(16, kSegBytes);
   const auto payload_at = [](uint64_t seg) {
     return vmemkv::t2_detail::encode_offset_payload(seg * kSegBytes + 4096, /*block_count=*/1);
   };
@@ -439,17 +441,19 @@ TEST_CASE("punch backlog cap triggers checkpoint coverage") {
     own.note_replace(payload_at(seg), kPlainHash, false, 0);
   }
   CHECK(own.punch_backlog_segments() == TinyConvergenceConfig::kPunchBacklogCheckpointCapSegments);
-  CHECK(vmemkv::checkpoint_detail::punch_backlog_over_cap<TinyConvergenceConfig>(own));
+  CHECK(vmemkv::checkpoint_detail::punch_backlog_over_cap(own,
+                                                          TinyConvergenceConfig::kPunchBacklogCheckpointCapSegments));
   // Below cap: fewer segments do not trigger the cap.
-  vmemkv::T2Ownership<TinyConvergenceConfig> own_small(16);
+  vmemkv::T2Ownership own_small(16, kSegBytes);
   own_small.note_replace(vmemkv::STORE_NOT_FOUND, kPlainHash, true, payload_at(0));
   own_small.note_replace(payload_at(0), kPlainHash, false, 0);
   CHECK(own_small.punch_backlog_segments() == 1);
-  CHECK_FALSE(vmemkv::checkpoint_detail::punch_backlog_over_cap<TinyConvergenceConfig>(own_small));
+  CHECK_FALSE(vmemkv::checkpoint_detail::punch_backlog_over_cap(
+      own_small, TinyConvergenceConfig::kPunchBacklogCheckpointCapSegments));
 }
 
 TEST_CASE("T2 garbage-segment selection ignores an unfrozen tail") {
-  vmemkv::T2Ownership<TinySegmentConfig> own(2);
+  vmemkv::T2Ownership own(2, TinySegmentConfig::kSegmentBytes);
   const uint64_t payload = vmemkv::t2_detail::encode_offset_payload(/*offset=*/4096, /*block_count=*/1);
   own.note_replace(vmemkv::STORE_NOT_FOUND, /*old_hash=*/0, /*new_is_offset=*/true, payload);
   own.mark_segment_dirty(0);

@@ -131,7 +131,7 @@ struct FrequentCheckpointConfig : vmemkv::Config<> {
 static_assert(FrequentCheckpointConfig::kMemTableCapacityEntries ==
               (size_t{1} << FrequentCheckpointConfig::kMemTableCapacityLog2));
 
-using VMemKV_FrequentCheckpoint = vmemkv::StoreAdapter<vmemkv::VMemKVImpl<FrequentCheckpointConfig>>;
+using VMemKV_FrequentCheckpoint = vmemkv::StoreAdapter<vmemkv::ConfiguredVMemKV<FrequentCheckpointConfig>>;
 
 template <typename StoreHandle>
 static void insert_sequential_u64_values(StoreHandle &store, int key_count) {

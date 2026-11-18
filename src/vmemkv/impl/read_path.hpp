@@ -27,6 +27,7 @@
 #include <optional>
 #include <span>
 #include <vector>
+#include <vmemkv/config.hpp>
 #include <vmemkv/core/bytes.hpp>
 #include <vmemkv/core/spin_backoff.hpp>
 #include <vmemkv/impl/hooks.hpp>
@@ -81,20 +82,22 @@ enum class ImmutableReader : uint8_t {
 // Pinned policies ignore the reader and size. The default (adaptive) policy picks per
 // record; null means "no direct mapping: take the residency-check path instead"
 // (large, non-resident get only).
-template <typename ConfigT>
-inline auto mapping_for(const T2Memory *mem, ImmutableReader reader, bool is_small) noexcept -> std::byte * {
-  if constexpr (ConfigT::UseReadPolicyRandomOnly) {
-    return mem->reads.random_mmap;
-  }
-  if constexpr (ConfigT::UseReadPolicySeqOnly) {
-    return mem->reads.sequential_mmap != nullptr ? mem->reads.sequential_mmap : mem->reads.random_mmap;
-  }
-  if constexpr (ConfigT::UseReadPolicyNormalOnly) {
-    return mem->reads.normal_mmap != nullptr ? mem->reads.normal_mmap : mem->reads.random_mmap;
-  }
-  if constexpr (ConfigT::UseReadPolicyPreadOnly) {
-    // Handled by try_read_immutable_record()'s pread branch below, never by mapping selection.
-    return nullptr;
+inline auto mapping_for(const T2Memory *mem,
+                        ImmutableReader reader,
+                        bool is_small,
+                        ReadPolicy policy = ReadPolicy::Adaptive) noexcept -> std::byte * {
+  switch (policy) {
+    case ReadPolicy::RandomOnly:
+      return mem->reads.random_mmap;
+    case ReadPolicy::SeqOnly:
+      return mem->reads.sequential_mmap != nullptr ? mem->reads.sequential_mmap : mem->reads.random_mmap;
+    case ReadPolicy::NormalOnly:
+      return mem->reads.normal_mmap != nullptr ? mem->reads.normal_mmap : mem->reads.random_mmap;
+    case ReadPolicy::PreadOnly:
+      // Handled by try_read_immutable_record()'s pread branch below, never by mapping selection.
+      return nullptr;
+    case ReadPolicy::Adaptive:
+      break;
   }
   if (reader == ImmutableReader::kScan) {
     return is_small ? mem->reads.sequential_mmap : mem->reads.normal_mmap;
@@ -176,11 +179,11 @@ inline auto read_pread_pinned(const T2Memory *mem,
 // Single entry point for every T2 immutable-region read. Returns std::nullopt when this fast
 // path isn't available (offset still in the mutable region, mapping/fd missing, pread failed,
 // or bounds check failed) -- callers fall back to T2FlatFile::at() + seqlock.
-template <typename ConfigT>
 inline auto try_read_immutable_record(const T2Memory *mem,
                                       uint64_t payload_bits,
                                       ImmutableReader reader,
-                                      std::vector<std::byte> *cold_buf) -> std::optional<T2RecordView> {
+                                      std::vector<std::byte> *cold_buf,
+                                      ReadPolicy policy = ReadPolicy::Adaptive) -> std::optional<T2RecordView> {
   const uint64_t offset = t2_detail::decode_offset(payload_bits);
   const uint64_t read_only_offset = mem->read_only_offset.load(std::memory_order_acquire);
   if (offset >= read_only_offset) {
@@ -190,11 +193,11 @@ inline auto try_read_immutable_record(const T2Memory *mem,
   const uint64_t size_hint = immutable_size_hint(payload_bits);
   const bool is_small = size_hint <= t2_detail::os_page_size();
 
-  if constexpr (ConfigT::UseReadPolicyPreadOnly) {
+  if (policy == ReadPolicy::PreadOnly) {
     return read_pread_pinned(mem, offset, read_only_offset, size_hint);
   }
 
-  if (std::byte *mapping = mapping_for<ConfigT>(mem, reader, is_small); mapping != nullptr) {
+  if (std::byte *mapping = mapping_for(mem, reader, is_small, policy); mapping != nullptr) {
     return read_immutable_record_via(mapping, offset, read_only_offset);
   }
   if (reader == ImmutableReader::kGet) {
@@ -222,19 +225,16 @@ inline void copy_inline_value(uint64_t payload_bits, size_t size, std::byte *out
 }
 
 // Decodes a T1-inlined (payload_bits, raw_hash) and invokes callback(value), returning true.
-// Stack-backed: the span lives only inside the callback. False when inlining is off or the
-// entry isn't inline.
-template <typename ConfigT, typename Callback>
+// Stack-backed: the span lives only inside the callback.
+template <typename Callback>
 // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 inline auto try_read_inline_value(uint64_t payload_bits, uint64_t raw_hash, Callback &&callback) -> bool {
-  if constexpr (ConfigT::UseT1InlineValue) {
-    if (t1_detail::is_inline(raw_hash)) {
-      const size_t size = t1_detail::decode_size(raw_hash);
-      std::array<std::byte, t1_detail::kInlineValueByteCount> stack_value;
-      copy_inline_value(payload_bits, size, stack_value.data());
-      std::forward<Callback>(callback)(std::span<const std::byte>(stack_value.data(), size));
-      return true;
-    }
+  if (t1_detail::is_inline(raw_hash)) {
+    const size_t size = t1_detail::decode_size(raw_hash);
+    std::array<std::byte, t1_detail::kInlineValueByteCount> stack_value;
+    copy_inline_value(payload_bits, size, stack_value.data());
+    std::forward<Callback>(callback)(std::span<const std::byte>(stack_value.data(), size));
+    return true;
   }
   return false;
 }

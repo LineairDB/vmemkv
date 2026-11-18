@@ -12,9 +12,6 @@ namespace vmemkv {
 
 inline constexpr uint64_t kDefaultAlignmentBytes = 8;
 
-struct EmptyOption {};
-static_assert(sizeof(EmptyOption) <= 1, "EmptyOption must be a zero-sized or minimal size empty helper");
-
 constexpr auto align_up(uint64_t size, uint64_t alignment = kDefaultAlignmentBytes) noexcept -> uint64_t {
   return (size + alignment - 1) & ~(alignment - 1);
 }

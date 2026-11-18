@@ -296,7 +296,7 @@ namespace {
 // 256-entry append region: shrinks append-region capacity to force frequent reorganizes.
 using TinyAppendConfig = vmemkv_test::TinyAppendConfig<8>;
 
-using VMemKV_TinyAppend = vmemkv::StoreAdapter<vmemkv::VMemKVImpl<TinyAppendConfig>>;
+using VMemKV_TinyAppend = vmemkv::StoreAdapter<vmemkv::ConfiguredVMemKV<TinyAppendConfig>>;
 }  // namespace
 
 // Livelock guard: during recovery no reorg worker exists yet, so replay into a full append
@@ -368,7 +368,7 @@ TEST_CASE("checkpoint with concurrent appends recovers all keys") {
   constexpr int kLateKeys = 100;
   const std::string big_value(1024, 'v');
   const std::string late_value(1024, 'w');
-  using ImplT = vmemkv::VMemKVImpl<vmemkv::Config<>>;
+  using ImplT = vmemkv::VMemKVImpl;
   {
     auto store = std::make_unique<vmemkv::variants::VMemKV_Default>(path, kStoreCapacityBytes);
     for (int i = 0; i < kBaseKeys; ++i) {

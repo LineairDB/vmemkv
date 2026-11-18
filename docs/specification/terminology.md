@@ -14,7 +14,7 @@ Declarative glossary unifying VMemKV concepts with **FASTER** and **LSM-tree** t
 | **Tombstone** | `STORE_NOT_FOUND` (`~0ULL`) | LSM Tombstone | Sentinel payload marking a logically deleted key. |
 | **Value Record** | `ValueRecordHeader` + payload | HybridLog / vLog Record | Variable-length T2 record with `alloc_len` headroom and seqlock. |
 | **Embedded Size Hint** | `t2_detail::payload_hint_bytes`, `encode_offset_payload` | Novel (T1-encoded length) | 16B-granular T2 record size in T1 for sizing `pread()` and segments. |
-| **Adaptive Covering** | `UseT1InlineValue` | Inline K-V Payload | Stores `<=8B` values (`<=16B` non-zero-end keys) directly in T1. |
+| **Adaptive Covering** | `try_make_inline_payload`, `try_read_inline_value` | Inline K-V Payload | Stores `<=8B` values (`<=16B` non-zero-end keys) directly in T1. |
 
 ### Tier 1 (Aligned with LSM-tree)
 

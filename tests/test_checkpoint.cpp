@@ -19,7 +19,7 @@
 
 namespace {
 
-using CheckpointEntrySnapshot = vmemkv::T1Index<vmemkv::Config<>>::EntrySnapshot;
+using CheckpointEntrySnapshot = vmemkv::T1Index::EntrySnapshot;
 
 auto make_chk_prefix(std::string_view text) -> vmemkv::T1ChkKeyPrefix {
   vmemkv::T1ChkKeyPrefix key{};
@@ -223,7 +223,7 @@ namespace {
 struct TinyShardConfig : vmemkv_test::TinyAppendConfig<10> {
   static constexpr size_t kShardTargetSizeEntries = 50;  // Forces splits well before kKeyCount below.
 };
-using VMemKV_TinyShard = vmemkv::StoreAdapter<vmemkv::VMemKVImpl<TinyShardConfig>>;
+using VMemKV_TinyShard = vmemkv::StoreAdapter<vmemkv::ConfiguredVMemKV<TinyShardConfig>>;
 }  // namespace
 
 // ─── Checkpoint / Reload integration tests ──────────────────────────────────────────────────

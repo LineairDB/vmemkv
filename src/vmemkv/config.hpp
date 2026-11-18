@@ -70,7 +70,7 @@ struct WalConfig {
 
 // Read-path policy facet (see the tags above for the policy meanings).
 template <bool RandomOnly, bool SeqOnly, bool NormalOnly, bool PreadOnly>
-struct ReadPolicy {
+struct ReadPolicyFlags {
   static constexpr bool kRandomOnly = RandomOnly;
   static constexpr bool kSeqOnly = SeqOnly;
   static constexpr bool kNormalOnly = NormalOnly;
@@ -83,12 +83,10 @@ template <typename... ReadPolicies>
 struct Config : T1Config,
                 T2Config,
                 WalConfig,
-                ReadPolicy<(std::is_same_v<ReadPolicyRandomOnly, ReadPolicies> || ...),
-                           (std::is_same_v<ReadPolicySeqOnly, ReadPolicies> || ...),
-                           (std::is_same_v<ReadPolicyNormalOnly, ReadPolicies> || ...),
-                           (std::is_same_v<ReadPolicyPreadOnly, ReadPolicies> || ...)> {
-  static constexpr bool UseBloomFilter = true;
-  static constexpr bool UseT1InlineValue = true;
+                ReadPolicyFlags<(std::is_same_v<ReadPolicyRandomOnly, ReadPolicies> || ...),
+                                (std::is_same_v<ReadPolicySeqOnly, ReadPolicies> || ...),
+                                (std::is_same_v<ReadPolicyNormalOnly, ReadPolicies> || ...),
+                                (std::is_same_v<ReadPolicyPreadOnly, ReadPolicies> || ...)> {
   static constexpr bool UseReadPolicyRandomOnly = (std::is_same_v<ReadPolicyRandomOnly, ReadPolicies> || ...);
   static constexpr bool UseReadPolicySeqOnly = (std::is_same_v<ReadPolicySeqOnly, ReadPolicies> || ...);
   static constexpr bool UseReadPolicyNormalOnly = (std::is_same_v<ReadPolicyNormalOnly, ReadPolicies> || ...);
@@ -104,6 +102,54 @@ struct Config : T1Config,
       static_cast<int>(UseReadPolicyNormalOnly) + static_cast<int>(UseReadPolicyPreadOnly);
   static_assert(kActiveReadPolicies <= 1, "ReadPolicy* tags are mutually exclusive");
 };
+
+// Runtime T2 read policy and engine tuning passed into non-template VMemKVImpl components.
+enum class ReadPolicy : std::uint8_t {
+  Adaptive,
+  RandomOnly,
+  SeqOnly,
+  NormalOnly,
+  PreadOnly,
+};
+
+struct StoreOptions {
+  size_t memtable_capacity_entries = T1Config::kMemTableCapacityEntries;
+  size_t shard_target_size_entries = T1Config::kShardTargetSizeEntries;
+  uint32_t shard_split_threshold_percent = T1Config::kShardSplitThresholdPercent;
+  uint64_t t1_chunk_split_bytes = T1Config::kT1ChunkSplitBytes;
+  uint64_t segment_bytes = T2Config::kSegmentBytes;
+  uint64_t compaction_max_move_bytes_per_cycle = T2Config::kCompactionMaxMoveBytesPerCycle;
+  uint64_t punch_backlog_checkpoint_cap_segments = T2Config::kPunchBacklogCheckpointCapSegments;
+  uint64_t msync_chunk_bytes = T2Config::kMsyncChunkBytes;
+  size_t wal_max_bytes_since_checkpoint = WalConfig::kMaxBytesSinceCheckpoint;
+  ReadPolicy read_policy = ReadPolicy::Adaptive;
+};
+
+template <typename ConfigT>
+constexpr auto make_store_options() noexcept -> StoreOptions {
+  ReadPolicy policy = ReadPolicy::Adaptive;
+  if constexpr (ConfigT::UseReadPolicyRandomOnly) {
+    policy = ReadPolicy::RandomOnly;
+  } else if constexpr (ConfigT::UseReadPolicySeqOnly) {
+    policy = ReadPolicy::SeqOnly;
+  } else if constexpr (ConfigT::UseReadPolicyNormalOnly) {
+    policy = ReadPolicy::NormalOnly;
+  } else if constexpr (ConfigT::UseReadPolicyPreadOnly) {
+    policy = ReadPolicy::PreadOnly;
+  }
+  return StoreOptions{
+      .memtable_capacity_entries = ConfigT::kMemTableCapacityEntries,
+      .shard_target_size_entries = ConfigT::kShardTargetSizeEntries,
+      .shard_split_threshold_percent = ConfigT::kShardSplitThresholdPercent,
+      .t1_chunk_split_bytes = ConfigT::kT1ChunkSplitBytes,
+      .segment_bytes = ConfigT::kSegmentBytes,
+      .compaction_max_move_bytes_per_cycle = ConfigT::kCompactionMaxMoveBytesPerCycle,
+      .punch_backlog_checkpoint_cap_segments = ConfigT::kPunchBacklogCheckpointCapSegments,
+      .msync_chunk_bytes = ConfigT::kMsyncChunkBytes,
+      .wal_max_bytes_since_checkpoint = ConfigT::kMaxBytesSinceCheckpoint,
+      .read_policy = policy,
+  };
+}
 
 // X-macro: the checkpoint phase-breakdown fields of VMemKVStatistics below, and the
 // matching atomics CheckpointCoordinator publishes them from. One list drives field

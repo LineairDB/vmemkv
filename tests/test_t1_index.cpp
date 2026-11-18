@@ -22,13 +22,57 @@ namespace {
 
 using vmemkv_test::to_span;
 
+// Standalone test harness owning the EpochDomain that ShardedT1Index provides in production.
+class StandaloneT1Index {
+ public:
+  using Inner = vmemkv::T1Index;
+  using Key = Inner::Key;
+  using Payload = Inner::Payload;
+  using LookupResult = Inner::LookupResult;
+  using PutResult = Inner::PutResult;
+  using EntrySnapshot = Inner::EntrySnapshot;
+
+  explicit StandaloneT1Index(size_t memtable_cap = vmemkv::T1Config::kMemTableCapacityEntries)
+      : index_(epoch_domain_, memtable_cap) {}
+
+  auto get(std::span<const std::byte> key) const -> Payload {
+    return epoch_domain_.run([&] { return index_.get(key); });
+  }
+  auto get_with_hash(std::span<const std::byte> key) const -> LookupResult {
+    return epoch_domain_.run([&] { return index_.get_with_hash(key); });
+  }
+  auto put(std::span<const std::byte> key,
+           Payload value,
+           bool is_inline = false,
+           uint8_t inline_size = 0) -> PutResult {
+    return epoch_domain_.run([&] { return index_.put(key, value, is_inline, inline_size); });
+  }
+  [[nodiscard]] auto memtable_size() const -> size_t {
+    return epoch_domain_.run([&] { return index_.memtable_size(); });
+  }
+  [[nodiscard]] auto memtable_capacity() const noexcept -> size_t { return index_.memtable_capacity(); }
+  template <typename OffsetMapper, typename ChkWriter = Inner::NoOpChkWriter>
+  void reorganize(OffsetMapper offset_mapper, ChkWriter chk_writer = ChkWriter{}) {
+    index_.reorganize(std::move(offset_mapper), std::move(chk_writer));
+  }
+  void load_sorted_run_from_checkpoint(std::span<const EntrySnapshot> entries) {
+    index_.load_sorted_run_from_checkpoint(entries);
+  }
+
+ private:
+  vmemkv::EpochDomain epoch_domain_;
+  Inner index_;
+};
+
 // 256-entry append region: reorganize() triggers without thousands of puts per run.
 using TinyAppendConfig = vmemkv_test::TinyAppendConfig<8>;
 
-using TestIndex = vmemkv::T1Index<TinyAppendConfig>;
+using TestIndex = StandaloneT1Index;
 
 // Heap-allocate: the append-region hash index embeds a large bucket array unsuited to the stack.
-auto make_index() -> std::unique_ptr<TestIndex> { return std::make_unique<TestIndex>(); }
+auto make_index() -> std::unique_ptr<TestIndex> {
+  return std::make_unique<TestIndex>(TinyAppendConfig::kMemTableCapacityEntries);
+}
 
 // Builds an EntrySnapshot the way put()/reorganize() would (load_sorted_run_from_checkpoint
 // bypasses put()'s own hashing).
@@ -232,12 +276,12 @@ struct TinyInlineConfig : vmemkv::Config<> {
   static constexpr size_t kMemTableCapacityLog2 = 8;
   static constexpr size_t kMemTableCapacityEntries = size_t{1} << kMemTableCapacityLog2;
 };
-using InlineTestIndex = vmemkv::T1Index<TinyInlineConfig>;
+using InlineTestIndex = StandaloneT1Index;
 
 TEST_CASE(
     "T1Index: inline-to-non-inline transition racing an in-flight reorganize does not create a "
     "duplicate entry") {
-  auto idx = std::make_unique<InlineTestIndex>();
+  auto idx = std::make_unique<InlineTestIndex>(TinyInlineConfig::kMemTableCapacityEntries);
 
   // "k" starts inline; its stored hash carries the inline metadata bits.
   REQUIRE(idx->put(to_span("k"), 111, /*is_inline=*/true, /*inline_size=*/8) == InlineTestIndex::PutResult::Applied);

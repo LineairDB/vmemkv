@@ -524,7 +524,7 @@ Adaptive covering, Bloom filter, Group Commit, `MADV_RANDOM`, immutable-region r
 
 The optimization dynamically switching T2 offsets and inline 64-bit values per entry. Values of 8 bytes (64 bits) or less bypass Tier 2 writes, storing the value directly in the T1 index's payload area.
 
-This optimization is enabled by every `vmemkv::Config` configuration.
+Always on; no disable path exists.
 
 #### 7.2.1 Metadata and Hash Encoding
 T1's index slots lack spare bit area, so the 64-bit hash field's (`hash`) top 4 bits are reused as metadata, holding flags and size info.
@@ -548,7 +548,7 @@ T1's index slots lack spare bit area, so the 64-bit hash field's (`hash`) top 4 
 
 Grants a Bloom filter over the whole `sorted_run`, speeding negative lookups.
 
-The Bloom filter is enabled by every `vmemkv::Config` configuration.
+Always on; no disable path exists.
 
 ### 7.4 Tier 2 madvise(MADV_RANDOM) Optimization
 

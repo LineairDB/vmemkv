@@ -16,10 +16,11 @@
 #include <span>
 #include <vector>
 #include <vmemkv/api/utils.hpp>
+#include <vmemkv/config.hpp>
 #include <vmemkv/core/bytes.hpp>
 #include <vmemkv/impl/read_path.hpp>
 #include <vmemkv/impl/t2_ownership.hpp>
-#include <vmemkv/t1_index/t1_index.hpp>
+#include <vmemkv/t1_index/sharded_t1_index.hpp>
 #include <vmemkv/t2_flat_file/t2_flat_file.hpp>
 #include <vmemkv/wal/wal.hpp>
 
@@ -106,24 +107,21 @@ struct InPlaceUpdateResult {
 // T1 inlining for a (key, value) pair. Keys only (T1 stores just a 16-byte prefix), and
 // never keys ending in 0x00: with no T2 record, scan_impl() recovers the length via
 // inline_key_len()'s trailing-zero trim, unambiguous only when trailing zeros are padding.
-template <typename ConfigT>
-auto try_make_inline_payload(std::span<const std::byte> full_key,
-                             std::span<const std::byte> value,
-                             uint8_t &out_size) noexcept -> std::optional<uint64_t> {
-  if constexpr (ConfigT::UseT1InlineValue) {
-    if (full_key.size() <= t1_detail::kPrefixBytes && (full_key.empty() || full_key.back() != std::byte{0})) {
-      if (!value.empty() && value.size() <= t1_detail::kInlineValueByteCount) {
-        uint64_t payload = 0;
-        std::memcpy(&payload, value.data(), value.size());
-        // A full-width all-1-bits value equals the STORE_NOT_FOUND sentinel: inlining it would
-        // read as permanently absent. Only possible at full width (shorter values leave upper
-        // bytes zeroed). Falls through to the T2 path, whose offset payload can't collide.
-        if (payload == vmemkv::STORE_NOT_FOUND) {
-          return std::nullopt;
-        }
-        out_size = static_cast<uint8_t>(value.size());
-        return payload;
+inline auto try_make_inline_payload(std::span<const std::byte> full_key,
+                                    std::span<const std::byte> value,
+                                    uint8_t &out_size) noexcept -> std::optional<uint64_t> {
+  if (full_key.size() <= t1_detail::kPrefixBytes && (full_key.empty() || full_key.back() != std::byte{0})) {
+    if (!value.empty() && value.size() <= t1_detail::kInlineValueByteCount) {
+      uint64_t payload = 0;
+      std::memcpy(&payload, value.data(), value.size());
+      // A full-width all-1-bits value equals the STORE_NOT_FOUND sentinel: inlining it would
+      // read as permanently absent. Only possible at full width (shorter values leave upper
+      // bytes zeroed). Falls through to the T2 path, whose offset payload can't collide.
+      if (payload == vmemkv::STORE_NOT_FOUND) {
+        return std::nullopt;
       }
+      out_size = static_cast<uint8_t>(value.size());
+      return payload;
     }
   }
   return std::nullopt;
@@ -131,24 +129,23 @@ auto try_make_inline_payload(std::span<const std::byte> full_key,
 
 // Appends a (key, value) pair to T2 and publishes it in T1 (ShardedT1Index::put() drains
 // full append regions internally). The WAL reservation stays the caller's job, after apply.
-template <typename ConfigT, typename T1>
-void write_entry_lockfree(T1 &tier1,
-                          T2FlatFile &tier2,
-                          T2Ownership<ConfigT> &own,
-                          std::span<const std::byte> full_key,
-                          std::span<const std::byte> value,
-                          std::optional<typename T1::LookupResult> prev) {
+inline void write_entry_lockfree(ShardedT1Index &tier1,
+                                 T2FlatFile &tier2,
+                                 T2Ownership &own,
+                                 std::span<const std::byte> full_key,
+                                 std::span<const std::byte> value,
+                                 std::optional<ShardedT1Index::LookupResult> prev) {
   auto publish = [&](uint64_t new_payload, bool new_is_offset, bool new_is_inline, uint8_t inline_size) {
-    typename T1::LookupResult old = prev.has_value() ? *prev : tier1.get_with_hash(full_key);
+    ShardedT1Index::LookupResult old = prev.has_value() ? *prev : tier1.get_with_hash(full_key);
     const bool is_new_key = (old.payload_bits == vmemkv::STORE_NOT_FOUND);
     [[maybe_unused]] const auto res =
         tier1.put(full_key, new_payload, new_is_inline, inline_size, /*mark_t2_dirty=*/is_new_key);
-    assert(res == T1::PutResult::Applied);
+    assert(res == ShardedT1Index::PutResult::Applied);
     own.note_replace(old.payload_bits, old.raw_hash, new_is_offset, new_payload);
   };
 
   uint8_t inline_size = 0;
-  if (const auto inline_payload = try_make_inline_payload<ConfigT>(full_key, value, inline_size)) {
+  if (const auto inline_payload = try_make_inline_payload(full_key, value, inline_size)) {
     publish(*inline_payload, /*new_is_offset=*/false, /*new_is_inline=*/true, inline_size);
     return;
   }
@@ -163,13 +160,13 @@ void write_entry_lockfree(T1 &tier1,
 
 // update_impl()'s in-place decision for a resolved non-inline entry (`payload_bits`): applies it
 // or conclusively falls through to write_entry_lockfree().
-template <typename ConfigT>
-auto try_in_place_update(T2FlatFile &tier2,
-                         T2Ownership<ConfigT> &own,
-                         Wal &wal,
-                         std::span<const std::byte> full_key,
-                         std::span<const std::byte> value,
-                         uint64_t payload_bits) -> InPlaceUpdateResult {
+inline auto try_in_place_update(T2FlatFile &tier2,
+                                T2Ownership &own,
+                                Wal &wal,
+                                std::span<const std::byte> full_key,
+                                std::span<const std::byte> value,
+                                uint64_t payload_bits,
+                                ReadPolicy read_policy = ReadPolicy::Adaptive) -> InPlaceUpdateResult {
   assert(payload_bits != vmemkv::STORE_NOT_FOUND);
   const T2Memory *mem = tier2.get_memory();
   const uint64_t offset = t2_detail::decode_offset(payload_bits);
@@ -187,7 +184,7 @@ auto try_in_place_update(T2FlatFile &tier2,
     }
     thread_local static std::vector<std::byte> tl_imm_buf;
     if (const auto imm_record =
-            vmemkv::try_read_immutable_record<ConfigT>(mem, payload_bits, ImmutableReader::kGet, &tl_imm_buf);
+            vmemkv::try_read_immutable_record(mem, payload_bits, ImmutableReader::kGet, &tl_imm_buf, read_policy);
         imm_record.has_value()) {
       if (!vmemkv::bytes_equal(imm_record->key, full_key)) {
         return {InPlaceOutcome::Aborted};
