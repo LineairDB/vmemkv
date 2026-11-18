@@ -78,6 +78,24 @@ inline auto range_disjoint(const StoreKey &region_min,
   return !(region_min < upper) || region_max < lower;
 }
 
+// Logical entry identity: key prefix plus clean hash (ignoring transient inline metadata bits).
+inline auto entry_identity_equal(const StoreKey &a_key,
+                                 uint64_t a_hash,
+                                 const StoreKey &b_key,
+                                 uint64_t b_hash) noexcept -> bool {
+  return a_key == b_key && (a_hash & kCleanHashMask) == (b_hash & kCleanHashMask);
+}
+
+inline auto entry_less(const StoreKey &a_key,
+                       uint64_t a_hash,
+                       const StoreKey &b_key,
+                       uint64_t b_hash) noexcept -> bool {
+  if (a_key != b_key) {
+    return a_key < b_key;
+  }
+  return (a_hash & kCleanHashMask) < (b_hash & kCleanHashMask);
+}
+
 }  // namespace t1_detail
 
 namespace vmemkv::t2_detail {

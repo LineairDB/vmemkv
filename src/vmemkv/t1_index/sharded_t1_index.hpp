@@ -1,6 +1,5 @@
 // sharded_t1_index.hpp -- Range-sharded routing over K T1Index instances.
 // See docs/specification/t1_sharding_design.md for the full design. T1Index is the per-shard leaf.
-// Maintenance helpers live in sharded_maintenance.hpp.
 #pragma once
 
 #include <algorithm>
@@ -24,10 +23,40 @@
 #include <vmemkv/core/single_flight.hpp>
 #include <vmemkv/core/spin_backoff.hpp>
 #include <vmemkv/scan_control.hpp>
-#include <vmemkv/t1_index/sharded_maintenance.hpp>
 #include <vmemkv/t1_index/t1_index.hpp>
 
 namespace vmemkv {
+
+namespace sharded_detail {
+
+inline constexpr size_t kPercentScale = 100;
+
+inline auto split_threshold(size_t target_shard_size, uint32_t percent) noexcept -> size_t {
+  return (target_shard_size * percent) / kPercentScale;
+}
+
+inline auto payload_t2_bytes(uint64_t payload_bits, bool is_inline) noexcept -> uint64_t {
+  if (payload_bits == STORE_NOT_FOUND || is_inline) {
+    return 0;
+  }
+  return vmemkv::t2_detail::payload_hint_bytes(payload_bits);
+}
+
+template <typename EntryRange>
+inline auto sum_entries_t2_bytes(const EntryRange &entries) noexcept -> uint64_t {
+  uint64_t total = 0;
+  for (const auto &entry : entries) {
+    total += payload_t2_bytes(entry.payload_bits, t1_detail::is_inline(entry.hash));
+  }
+  return total;
+}
+
+inline auto maintenance_soft_threshold(size_t memtable_cap) noexcept -> size_t {
+  constexpr size_t kSoftThresholdPercent = 50;
+  return (memtable_cap * kSoftThresholdPercent) / kPercentScale;
+}
+
+}  // namespace sharded_detail
 
 namespace t1_debug {
 inline std::atomic<size_t> g_checkpoint_current_shard{0};
@@ -273,18 +302,16 @@ class ShardedT1Index {
     }
   }
 
-  // Captures every shard's live entries (merging first, unless append is empty -- then the
-  // sorted region serializes as-is, byte-identical to a merge at O(sorted) cost) and invokes
-  // offset_mapper then per_shard_writer per shard, ascending -- mirroring reorganize()'s
-  // contract once per shard, so a stateful offset_mapper works unmodified. Returns boundary
-  // keys for load_from_checkpoint().
+  // Captures every shard's live entries (merging when MemTables are non-empty) and invokes
+  // `per_shard_writer` per shard in ascending key order. Returns boundary keys for
+  // load_from_checkpoint().
   //
   // Splits pause for the whole call (directory stays stable); in-flight splits still complete,
   // so touched shards are held by outside_refs, not one long guard. Only the directory snapshot
   // is taken guarded. Non-splitting maintenance still runs concurrently: reorganize() blocks on
   // reorg_in_progress_ against any in-flight maintenance merge and always runs its callback.
-  template <typename OffsetMapper, typename PerShardWriter>
-  auto checkpoint_all_shards(OffsetMapper offset_mapper, PerShardWriter per_shard_writer) -> std::vector<Key> {
+  template <typename PerShardWriter>
+  auto checkpoint_all_shards(PerShardWriter per_shard_writer) -> std::vector<Key> {
     std::vector<Key> out_boundaries;
     with_checkpoint_shards(
         [&](auto &context) {
@@ -293,7 +320,7 @@ class ShardedT1Index {
           std::vector<EntrySnapshot> dumped;
           for (size_t idx = 0; idx < context.shard_count(); ++idx) {
             t1_debug::g_checkpoint_current_shard.store(idx + 1, std::memory_order_release);
-            context.extract_shard(idx, dumped, offset_mapper, per_shard_writer);
+            context.extract_shard(idx, dumped, per_shard_writer);
           }
           t1_debug::g_checkpoint_current_shard.store(0, std::memory_order_release);
         },
@@ -595,29 +622,21 @@ class ShardedT1Index {
     [[nodiscard]] auto shard_is_dirty(size_t index) const noexcept -> bool {
       return shards[index]->dirty_epoch.load(std::memory_order_acquire) > shards[index]->persisted_epoch;
     }
-    template <typename OffsetMapper, typename OnEntries>
-    void extract_shard(size_t index,
-                       std::vector<EntrySnapshot> &dumped,
-                       OffsetMapper &&offset_mapper,
-                       OnEntries &&on_entries) const {
-      owner.extract_shard_for_checkpoint(shards[index],
-                                         index + 1,
-                                         shards.size(),
-                                         dumped,
-                                         std::forward<OffsetMapper>(offset_mapper),
-                                         std::forward<OnEntries>(on_entries));
+    template <typename OnEntries>
+    void extract_shard(size_t index, std::vector<EntrySnapshot> &dumped, OnEntries &&on_entries) const {
+      owner.extract_shard_for_checkpoint(
+          shards[index], index + 1, shards.size(), dumped, std::forward<OnEntries>(on_entries));
     }
     void mark_persisted(size_t index) const noexcept { shards[index]->persisted_epoch = snapshot_epoch; }
   };
 
  private:
-  template <typename OffsetMapper, typename PerShardWriter>
+  template <typename PerShardWriter>
   // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
   void extract_shard_for_checkpoint(ShardSlot *slot,
                                     size_t shard_idx,
                                     size_t total_shards,
                                     std::vector<EntrySnapshot> &dumped,
-                                    OffsetMapper &&offset_mapper,
                                     PerShardWriter &&per_shard_writer) {
     const auto shard_start = std::chrono::steady_clock::now();
     // Merge-free shortcut: an empty active append means the merge output is the sorted
@@ -631,11 +650,10 @@ class ShardedT1Index {
         with_routing_guard([&] { return slot->index->memtable_size() == 0 && !slot->index->has_immutable(); });
     if (empty_memtables) {
       slot->index->dump_sorted_run(dumped);
-      offset_mapper(std::span<EntrySnapshot>(dumped));
       update_t2_bytes_and_queue_split(slot, dumped);
       per_shard_writer(dumped);
     } else {
-      slot->index->reorganize(offset_mapper, [&](std::span<const EntrySnapshot> merged) {
+      slot->index->reorganize([&](std::span<const EntrySnapshot> merged) {
         record_merged_shard(slot, merged);
         per_shard_writer(merged);
       });
@@ -690,7 +708,6 @@ class ShardedT1Index {
         slot->index->dump_sorted_run(entries);
       } else {
         slot->index->reorganize(
-            [](std::span<EntrySnapshot> /*merged*/) {},
             [&](std::span<const EntrySnapshot> merged) { entries.assign(merged.begin(), merged.end()); });
         slot->tombstones_since_maintenance.store(0, std::memory_order_relaxed);
       }
@@ -937,12 +954,11 @@ class ShardedT1Index {
     // look too small and grow without bound).
     std::vector<EntrySnapshot> merged_entries;
     target->index->reorganize(
-        [](std::span<EntrySnapshot> /*merged*/) {},
         [&](std::span<const EntrySnapshot> merged) { merged_entries.assign(merged.begin(), merged.end()); });
 
     constexpr size_t kMinSplitEntries = 2;
     if (merged_entries.size() < kMinSplitEntries || !(merged_entries.front().key < merged_entries.back().key)) {
-      // Too small (callback fired: real state, not a lost race) -- resume normal operation.
+      // Too small to split -- resume normal operation.
       // Reset superseded *before* maintenance_pending: request_maintenance_if_needed() CASes the
       // flag then checks superseded, so the reverse order could strand the flag true forever on
       // a shard about to read normal again. Clearing the flag at all is still needed: the purged
@@ -1116,8 +1132,7 @@ class ShardedT1Index {
     const size_t cap = slot->index->memtable_capacity();
     const bool over_soft = size >= maintenance_soft_threshold(cap);
     const bool delete_heavy = slot->tombstones_since_maintenance.load(std::memory_order_relaxed) >= target_shard_size_;
-    const bool over_t2_bytes =
-        size > 0 && slot->approx_t2_bytes.load(std::memory_order_relaxed) >= segment_bytes_;
+    const bool over_t2_bytes = size > 0 && slot->approx_t2_bytes.load(std::memory_order_relaxed) >= segment_bytes_;
     if (!over_soft && !delete_heavy && !over_t2_bytes) {
       return;
     }
@@ -1219,7 +1234,6 @@ class ShardedT1Index {
 
     std::vector<EntrySnapshot> merged_entries;
     const bool reorganized = slot->index->try_reorganize(
-        [](std::span<EntrySnapshot> /*merged*/) {},
         [&](std::span<const EntrySnapshot> merged) { merged_entries.assign(merged.begin(), merged.end()); });
     uint64_t merged_t2_bytes = 0;
     if (reorganized) {

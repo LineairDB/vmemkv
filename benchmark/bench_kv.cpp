@@ -744,13 +744,13 @@ static void register_benchmark_context() {
   benchmark::AddCustomContext("ycsb_window_seconds", std::to_string(get_ycsb_duration_seconds()));
   benchmark::AddCustomContext("warmup_policy",
                               "no warmup discard; corpus pre-populated on the same host, LTM cells cgroup-isolated");
-  benchmark::AddCustomContext("t1_memtable_capacity_log2", std::to_string(vmemkv::Config<>::kMemTableCapacityLog2));
+  benchmark::AddCustomContext("t1_memtable_capacity_log2", std::to_string(vmemkv::T1Config::kMemTableCapacityLog2));
   benchmark::AddCustomContext("t1_memtable_capacity_entries",
-                              std::to_string(vmemkv::Config<>::kMemTableCapacityEntries));
+                              std::to_string(vmemkv::T1Config::kMemTableCapacityEntries));
   benchmark::AddCustomContext("t1_shard_target_size_entries",
-                              std::to_string(vmemkv::Config<>::kShardTargetSizeEntries));
+                              std::to_string(vmemkv::T1Config::kShardTargetSizeEntries));
   benchmark::AddCustomContext("t1_shard_split_threshold_percent",
-                              std::to_string(vmemkv::Config<>::kShardSplitThresholdPercent));
+                              std::to_string(vmemkv::T1Config::kShardSplitThresholdPercent));
 }
 
 static inline bool prefer_large_value_first() { return get_env_flag01("VMEMKV_BENCH_LARGE_VALUE_FIRST", false); }
@@ -975,7 +975,7 @@ static auto make_vmemkv_clone_from_checkpoint(const std::string &master_path,
     // before_master_build_if_needed() -- see should_skip_cleanup()'s comment.
     auto master_store = make_vmemkv_fresh(
         master_path,
-        [master_path]() { return std::make_unique<Store>(master_path, Store::ConfigType::kDefaultCapacityBytes); },
+        [master_path]() { return std::make_unique<Store>(master_path, vmemkv::T2Config::kDefaultCapacityBytes); },
         register_primed_master_prefix(master_path),
         !should_skip_cleanup());
     bench_help::populate(*master_store, {key_count, val_size}, shuffled);
@@ -1034,7 +1034,7 @@ static auto make_vmemkv_clone_from_checkpoint(const std::string &master_path,
 
   quiesce_after_clone();
 
-  return std::make_unique<Store>(instance_path, Store::ConfigType::kDefaultCapacityBytes);
+  return std::make_unique<Store>(instance_path, vmemkv::T2Config::kDefaultCapacityBytes);
 }
 
 template <typename Tuple, typename Visitor, std::size_t... Indices>
@@ -1076,7 +1076,7 @@ static auto make_bench_store_fresh(const std::string &filename) {
     if constexpr (kUsesSingleArgConstructor<Store>) {
       return std::make_unique<Store>(filename);
     } else {
-      return std::make_unique<Store>(filename, Store::ConfigType::kDefaultCapacityBytes);
+      return std::make_unique<Store>(filename, vmemkv::T2Config::kDefaultCapacityBytes);
     }
   });
 }
@@ -1115,7 +1115,7 @@ static auto make_bench_fresh_corpus(const std::string &filename,
         [order, val_size](std::size_t index) { return bench_help::make_value_for_key((*order)[index], val_size); });
   } else {
     return make_vmemkv_fresh(
-        filename, [filename]() { return std::make_unique<Store>(filename, Store::ConfigType::kDefaultCapacityBytes); });
+        filename, [filename]() { return std::make_unique<Store>(filename, vmemkv::T2Config::kDefaultCapacityBytes); });
   }
 }
 
@@ -2468,7 +2468,7 @@ constexpr std::size_t kBackgroundJobProbeKeyCount = 10'000'000;
 
   setenv("VMEMKV_SUPPRESS_AUTO_COMPACT", "1", 1);
   auto store = make_vmemkv_fresh(
-      path, [&path]() { return std::make_unique<Store>(path, Store::ConfigType::kDefaultCapacityBytes); });
+      path, [&path]() { return std::make_unique<Store>(path, vmemkv::T2Config::kDefaultCapacityBytes); });
   bench_help::populate(*store, {key_count, args.val_size}, /*shuffled=*/true);
   // Ensure the 10M-key corpus is properly sharded (target ~8-10 shards)
   // before measuring whole-store maintenance under concurrent traffic.
@@ -2574,7 +2574,7 @@ constexpr double kOrganicSplitWindowSec = 1.2;
   setenv("VMEMKV_SUPPRESS_AUTO_REORG", "1", 1);
   setenv("VMEMKV_SUPPRESS_AUTO_COMPACT", "1", 1);
   auto store = make_vmemkv_fresh(
-      path, [&path]() { return std::make_unique<Store>(path, Store::ConfigType::kDefaultCapacityBytes); });
+      path, [&path]() { return std::make_unique<Store>(path, vmemkv::T2Config::kDefaultCapacityBytes); });
 
   // Automatic maintenance is suppressed during the probe.
 
@@ -2713,7 +2713,7 @@ constexpr double kOrganicSplitWindowSec = 1.2;
   setenv("VMEMKV_SUPPRESS_AUTO_REORG", "1", 1);
   setenv("VMEMKV_SUPPRESS_AUTO_COMPACT", "1", 1);
   auto store = make_vmemkv_fresh(
-      path, [&path]() { return std::make_unique<Store>(path, Store::ConfigType::kDefaultCapacityBytes); });
+      path, [&path]() { return std::make_unique<Store>(path, vmemkv::T2Config::kDefaultCapacityBytes); });
 
   // Interleaved append-only prime: gens overlapping runs over the same key range,
   // then settle to at most K runs (production steady state).
@@ -3427,7 +3427,7 @@ static inline void atomic_update_max(std::atomic<uint64_t> &dst, uint64_t val) {
   const double duration_sec = args.duration_sec > 0 ? args.duration_sec : 60.0;
 
   auto store = make_vmemkv_fresh(
-      path, [&path]() { return std::make_unique<Store>(path, Store::ConfigType::kDefaultCapacityBytes); });
+      path, [&path]() { return std::make_unique<Store>(path, vmemkv::T2Config::kDefaultCapacityBytes); });
   bench_help::populate(*store, {key_count, val_size}, /*shuffled=*/true);
   store->checkpoint();
 

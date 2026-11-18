@@ -1,6 +1,5 @@
 // t1_index.hpp — Fixed-size two-region in-memory index with lock-free readers.
-// Codec helpers live in t1_codec.hpp, merge helpers in
-// t1_merge.hpp (see docs/specification/low_level_design.md 7.5).
+// Codec and merge helpers live in t1_codec.hpp (see docs/specification/low_level_design.md 7.5).
 #pragma once
 
 #include <sys/mman.h>
@@ -12,6 +11,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <memory_resource>
@@ -22,7 +22,6 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
-#include <vmemkv/api/utils.hpp>
 #include <vmemkv/config.hpp>
 #include <vmemkv/core/bytes.hpp>
 #include <vmemkv/core/lock_free_hash_table.hpp>
@@ -32,9 +31,12 @@
 #include <vmemkv/optimizations/bloom_filter.hpp>
 #include <vmemkv/scan_control.hpp>
 #include <vmemkv/t1_index/t1_codec.hpp>
-#include <vmemkv/t1_index/t1_merge.hpp>
 
 namespace vmemkv {
+
+namespace t1_debug {
+inline std::function<void()> g_reorg_pre_publish_hook;
+}  // namespace t1_debug
 
 // ─── T1Index Structure Overview ─────────────────────────────────────────────
 //
@@ -65,19 +67,16 @@ namespace vmemkv {
 //               +-----------------------------+
 //
 // ─── Read Concurrency Protocol (EBR & Double-Buffering) ──────────────────────
-// 1. Enter epoch: register current epoch in thread-local slot (T1ReadHandle).
+// 1. Caller enters `epoch_domain_` guard.
 // 2. Search memtable_active_. If found, return payload.
-// 3. Search memtable_immutable_ (if exists/not null). If found, return payload.
+// 3. Search memtable_immutable_ (if present). If found, return payload.
 // 4. Search sorted_run_. If found, return payload.
-// 5. Exit epoch: clear thread-local slot registration upon handle destruction.
+// 5. Caller exits epoch guard.
 //
 class T1Index {
  public:
   using Key = t1_detail::StoreKey;
   using Payload = uint64_t;
-
-  // RAII epoch registration for readers (lets reorganize() know these buffers are in use).
-  using T1ReadHandle = typename ThreadReferenceTracker<uint64_t>::Guard;
 
   // `memtable_cap`: lock-free active MemTable capacity, not whole-KVS capacity.
   // Callers hold a guard on `epoch_domain` for read/write methods and lock-free size queries;
@@ -202,9 +201,6 @@ class T1Index {
       });
     });
   }
-
-  // One MemTable slot's bytes, for cache-derived entry budgets without depending on layout.
-  static auto memtable_slot_bytes() noexcept -> size_t;
 
   // Resident MemTable instances (active + not-yet-reclaimed retiring generations) and the
   // lifetime peak.
@@ -436,26 +432,21 @@ class T1Index {
   }
 
   // Merges memtable_active_ into sorted_run_; lock-free readers may run concurrently.
-  // - OffsetMapper: `void(span<EntrySnapshot> merged)` once, with the full deduped key-ordered
-  //   live set. May rewrite `.payload_bits` in place (e.g. relocate a T2 offset), in any order --
-  //   but must NOT reorder or resize `merged` (chk_writer and the SortedRegion built next both
-  //   require key order). Unpublished to other threads at this point, so in-place mutation is
-  //   safe. Entries it needn't touch (inline, T1-only reorg) must stay untouched.
-  // - ChkWriter: once with the finalized entries, for checkpoint serialization without T1Index
-  //   knowing about files. No-op default.
-  template <typename OffsetMapper, typename ChkWriter = NoOpChkWriter>
-  void reorganize(OffsetMapper offset_mapper, ChkWriter chk_writer = ChkWriter{}) {
+  // - ChkWriter: invoked once with the finalized key-ordered live entries after sorted_run_
+  //   publishes, for checkpoint serialization or shard metadata updates.
+  template <typename ChkWriter = NoOpChkWriter>
+  void reorganize(ChkWriter chk_writer = ChkWriter{}) {
     acquire_reorg_lock();
-    reorganize_locked(offset_mapper, chk_writer);
+    reorganize_locked(chk_writer);
   }
 
   // Non-blocking reorganize: returns false if another reorganize is already in flight.
-  template <typename OffsetMapper, typename ChkWriter = NoOpChkWriter>
-  auto try_reorganize(OffsetMapper offset_mapper, ChkWriter chk_writer = ChkWriter{}) -> bool {
+  template <typename ChkWriter = NoOpChkWriter>
+  auto try_reorganize(ChkWriter chk_writer = ChkWriter{}) -> bool {
     if (!try_acquire_reorg_lock()) {
       return false;
     }
-    reorganize_locked(offset_mapper, chk_writer);
+    reorganize_locked(chk_writer);
     return true;
   }
 
@@ -467,7 +458,7 @@ class T1Index {
       reorg_in_progress_.store(false, std::memory_order_release);
       return;
     }
-    reorganize_locked([](std::span<EntrySnapshot> /*merged*/) {}, chk_writer);
+    reorganize_locked(chk_writer);
   }
 
  private:
@@ -491,8 +482,8 @@ class T1Index {
     }
   }
 
-  template <typename OffsetMapper, typename ChkWriter>
-  void reorganize_locked(OffsetMapper offset_mapper, ChkWriter chk_writer) {
+  template <typename ChkWriter>
+  void reorganize_locked(ChkWriter chk_writer) {
     struct ReorgUnlock {
       std::atomic<bool> &flag;
       ~ReorgUnlock() { flag.store(false, std::memory_order_release); }
@@ -589,7 +580,9 @@ class T1Index {
 
     assert_no_duplicates(merged);
 
-    offset_mapper(std::span<EntrySnapshot>(merged));
+    if (t1_debug::g_reorg_pre_publish_hook) {
+      t1_debug::g_reorg_pre_publish_hook();
+    }
 
     auto *next_sorted = new SortedRun(merged);
 
@@ -875,8 +868,7 @@ class T1Index {
         if (!slot.published.load(std::memory_order_acquire)) {
           continue;
         }
-        // Consistent pair: every entry feeds the offset_mapper, so a torn pair could misdirect
-        // a T2 read.
+        // Consistent pair: readers and merges require hash metadata matching the payload.
         const auto [hash, value] = load_slot_consistent(slot);
         if (!is_live(value)) {
           continue;
@@ -1025,9 +1017,5 @@ class T1Index {
   // sorted-run Lost Update counterpart memtable_immutable_ already guards.
   FreezableRegion<const SortedRun *> sorted_write_frozen_;
 };
-
-inline auto T1Index::memtable_slot_bytes() noexcept -> size_t {
-  return sizeof(MemTableSlot);
-}
 
 }  // namespace vmemkv

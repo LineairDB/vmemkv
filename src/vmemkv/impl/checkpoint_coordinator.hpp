@@ -293,14 +293,13 @@ void emit_shard_group(const ShardChunkGroup &group,
                       CheckpointContext &context,
                       std::vector<EntrySnapshot> &dumped,
                       T1ChunkEmitter &emit) {
-  auto no_op_mapper = [](std::span<EntrySnapshot> /*merged*/) {};
   for (size_t shard_idx = group.shard_begin; shard_idx < group.shard_end; ++shard_idx) {
     emit.open_if_needed();
     if (emit.writer->shard_count() > 0) {
       emit.internal_boundaries.push_back(context.boundaries()[shard_idx - 1]);
     }
     bool skipped_post_target = false;
-    context.extract_shard(shard_idx, dumped, no_op_mapper, [&](std::span<const EntrySnapshot> entries) {
+    context.extract_shard(shard_idx, dumped, [&](std::span<const EntrySnapshot> entries) {
       const auto write_start = std::chrono::steady_clock::now();
       skipped_post_target = stream_filtered_shard(entries, emit.target, *emit.writer);
       emit.t1_write_phase += std::chrono::steady_clock::now() - write_start;

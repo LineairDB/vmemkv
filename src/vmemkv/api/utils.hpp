@@ -51,15 +51,6 @@ inline auto fnv1a64_update(uint64_t hash, const void *data, size_t size) noexcep
 }
 // NOLINTEND(readability-magic-numbers,readability-identifier-length)
 
-// Checksum over a header with its `checksum` field zeroed (taken by value, so writers with an
-// already-zero field and readers discarding the real value share this call). Duck-typed on a
-// `.checksum` member; no coupling between formats.
-template <typename Header>
-inline auto checksum_header(Header header) noexcept -> uint64_t {
-  header.checksum = 0;
-  return fnv1a64_update(kFnvOffsetBasis64, &header, sizeof(header));
-}
-
 // Folding one FNV-1a64 range at a time.
 inline auto fnv1a64_range(uint64_t hash, std::span<const std::byte> data) noexcept -> uint64_t {
   return fnv1a64_update(hash, data.data(), data.size());

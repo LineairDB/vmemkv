@@ -32,8 +32,7 @@ auto compute_checksum(const WalRecordHeader &header,
                       // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
                       std::span<const std::byte> key,
                       std::span<const std::byte> value) noexcept -> uint64_t {
-  // Same FNV chain as checksum_header_plus_spans did (header-zeroed, then spans in order),
-  // folded through the single shared accumulator.
+  // Hash header with checksum zeroed, then key and value bytes.
   FoldingChecksum sum;
   sum.add_header(header);
   sum.add(key);

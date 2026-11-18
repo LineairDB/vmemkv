@@ -1,46 +1,21 @@
-// config.hpp - VMemKV configuration facets and read-policy tags.
-//
-// `vmemkv::Config<ReadPolicies...>` is the source of truth for T1/T2 settings
-// and immutable-region read-policy selection.
-//
+// config.hpp - VMemKV engine defaults and runtime StoreOptions.
 #pragma once
 
 #include <cstddef>
 #include <cstdint>
-#include <type_traits>
+#include <limits>
 #include <vmemkv/stats.hpp>
 
 namespace vmemkv {
 
 inline constexpr uint64_t STORE_NOT_FOUND = ~0ULL;  // Tombstone payload; never a valid offset.
 
-// Bloom filtering and T1 inline-value storage are enabled in every configuration.
-// Read-path policies for the immutable/mutable split (docs/specification/low_level_design.md
-// 7.5). Default: quadfecta -- size- and reader-dependent choice among the four
-// T2ReadHandles (random_mmap, sequential_mmap, normal_mmap, pread_fd).
-// ReadPolicyRandomOnly: every immutable-region read goes through the primary mapping.
-// ReadPolicySeqOnly: every immutable-region read goes through the MADV_SEQUENTIAL mapping.
-// ReadPolicyNormalOnly: every immutable-region read goes through the plain mapping.
-// ReadPolicyPreadOnly: every immutable-region read goes through pread (no mmap readahead).
-struct ReadPolicyRandomOnly {};
-struct ReadPolicySeqOnly {};
-struct ReadPolicyNormalOnly {};
-struct ReadPolicyPreadOnly {};
-
-// ─── Facet configs ─────────────────────────────────────────────────────────
-// Single-responsibility value groups. Config<...> below aggregates them.
-// Flat names re-exported for ConfigT::X uses.
 struct T1Config {
-  // Per-shard MemTable capacity (ablation knob). Power of two for cache-friendly masking.
-  // Empty MemTables skip probing MemTableIndex (tail_ == 0 check), so unused shards do not
-  // fault index pages while active hot shards retain burst headroom during checkpoint pauses.
   static constexpr size_t kMemTableCapacityLog2 = 15;
   static constexpr size_t kMemTableCapacityEntries = size_t{1} << kMemTableCapacityLog2;
 
-  // Fallback per-shard live-entry target for ShardedT1Index (inline-only or standalone T1):
-  // T2-backed shards split once their referenced T2 bytes reach Config::kSegmentBytes (8 MiB),
-  // while inline-only shards split past kShardSplitThresholdPercent% of kShardTargetSizeEntries.
-  // See docs/specification/t1_sharding_design.md for the relation.
+  // Fallback per-shard live-entry target for inline-only shards (splits past
+  // kShardSplitThresholdPercent% of this target). T2-backed shards split at T2Config::kSegmentBytes.
   static constexpr size_t kShardTargetSizeEntries = size_t{1} << 20;
   static constexpr size_t kShardSplitThresholdPercent = 200;
 
@@ -48,62 +23,25 @@ struct T1Config {
   static constexpr uint64_t kT1ChunkSplitBytes = 32ULL << 20;
 };
 
+static_assert(T1Config::kMemTableCapacityLog2 > 0 &&
+                  T1Config::kMemTableCapacityLog2 < std::numeric_limits<size_t>::digits,
+              "kMemTableCapacityLog2 must be in (0, bitwidth(size_t))");
+
 struct T2Config {
-  // Default Tier 2 file capacity: 1 TiB.
   static constexpr size_t kDefaultCapacityBytes = 1ULL << 40;
-  // Fixed 8MiB segments for hole-punch accounting.
-  static constexpr uint64_t kSegmentBytes = 8ULL << 20;  // 8 MiB. Fixed, not tuned.
-  // Maximum T2 bytes relocated per compaction cycle (8 MiB segment budget).
+  static constexpr uint64_t kSegmentBytes = 8ULL << 20;  // 8 MiB segment size for hole-punch accounting.
   static constexpr uint64_t kCompactionMaxMoveBytesPerCycle = kSegmentBytes;
-  // Emergency cap on punch backlog segments to prevent runaway disk usage.
   static constexpr uint64_t kPunchBacklogCheckpointCapSegments = 1058;
-  // Chunk size for subdivided msync in checkpoint coordinator to avoid long foreground stalls.
-  static constexpr uint64_t kMsyncChunkBytes = 64ULL << 20;  // 64 MiB.
+  static constexpr uint64_t kMsyncChunkBytes = 64ULL << 20;
 };
 
 struct WalConfig {
-  // Checkpoint trigger: past this many WAL bytes since the last checkpoint, a checkpoint fires
-  // regardless of MemTable occupancy, bounding replay time.
-  // See docs/specification/low_level_design.md 4.4.
-  static constexpr size_t kMaxBytesSinceCheckpoint = 64ULL << 20;  // 64 MiB.
+  static constexpr size_t kMaxBytesSinceCheckpoint = 64ULL << 20;  // Checkpoint WAL threshold (64 MiB).
 };
 
-// Read-path policy facet (see the tags above for the policy meanings).
-template <bool RandomOnly, bool SeqOnly, bool NormalOnly, bool PreadOnly>
-struct ReadPolicyFlags {
-  static constexpr bool kRandomOnly = RandomOnly;
-  static constexpr bool kSeqOnly = SeqOnly;
-  static constexpr bool kNormalOnly = NormalOnly;
-  static constexpr bool kPreadOnly = PreadOnly;
-};
-// ─── Unified System Config Template ─────────────────────────────────────────
-// Aggregates the facet configs above.
-// Flat names re-exported for ConfigT::X uses.
-template <typename... ReadPolicies>
-struct Config : T1Config,
-                T2Config,
-                WalConfig,
-                ReadPolicyFlags<(std::is_same_v<ReadPolicyRandomOnly, ReadPolicies> || ...),
-                                (std::is_same_v<ReadPolicySeqOnly, ReadPolicies> || ...),
-                                (std::is_same_v<ReadPolicyNormalOnly, ReadPolicies> || ...),
-                                (std::is_same_v<ReadPolicyPreadOnly, ReadPolicies> || ...)> {
-  static constexpr bool UseReadPolicyRandomOnly = (std::is_same_v<ReadPolicyRandomOnly, ReadPolicies> || ...);
-  static constexpr bool UseReadPolicySeqOnly = (std::is_same_v<ReadPolicySeqOnly, ReadPolicies> || ...);
-  static constexpr bool UseReadPolicyNormalOnly = (std::is_same_v<ReadPolicyNormalOnly, ReadPolicies> || ...);
-  static constexpr bool UseReadPolicyPreadOnly = (std::is_same_v<ReadPolicyPreadOnly, ReadPolicies> || ...);
-
-  static constexpr size_t kBitsPerByte = 8;
-
-  static_assert(kMemTableCapacityLog2 > 0 && kMemTableCapacityLog2 < (sizeof(size_t) * kBitsPerByte),
-                "kMemTableCapacityLog2 must be in (0, bitwidth(size_t))");
-  // Number of pinned read-path policies: at most one may be set.
-  static constexpr int kActiveReadPolicies =
-      static_cast<int>(UseReadPolicyRandomOnly) + static_cast<int>(UseReadPolicySeqOnly) +
-      static_cast<int>(UseReadPolicyNormalOnly) + static_cast<int>(UseReadPolicyPreadOnly);
-  static_assert(kActiveReadPolicies <= 1, "ReadPolicy* tags are mutually exclusive");
-};
-
-// Runtime T2 read policy and engine tuning passed into non-template VMemKVImpl components.
+// Immutable-region T2 read policy (docs/specification/low_level_design.md 7.5):
+// - Adaptive: selects per-record across random_mmap, sequential_mmap, normal_mmap, and pread.
+// - RandomOnly / SeqOnly / NormalOnly / PreadOnly: pins every immutable read to one handle.
 enum class ReadPolicy : std::uint8_t {
   Adaptive,
   RandomOnly,
@@ -124,32 +62,6 @@ struct StoreOptions {
   size_t wal_max_bytes_since_checkpoint = WalConfig::kMaxBytesSinceCheckpoint;
   ReadPolicy read_policy = ReadPolicy::Adaptive;
 };
-
-template <typename ConfigT>
-constexpr auto make_store_options() noexcept -> StoreOptions {
-  ReadPolicy policy = ReadPolicy::Adaptive;
-  if constexpr (ConfigT::UseReadPolicyRandomOnly) {
-    policy = ReadPolicy::RandomOnly;
-  } else if constexpr (ConfigT::UseReadPolicySeqOnly) {
-    policy = ReadPolicy::SeqOnly;
-  } else if constexpr (ConfigT::UseReadPolicyNormalOnly) {
-    policy = ReadPolicy::NormalOnly;
-  } else if constexpr (ConfigT::UseReadPolicyPreadOnly) {
-    policy = ReadPolicy::PreadOnly;
-  }
-  return StoreOptions{
-      .memtable_capacity_entries = ConfigT::kMemTableCapacityEntries,
-      .shard_target_size_entries = ConfigT::kShardTargetSizeEntries,
-      .shard_split_threshold_percent = ConfigT::kShardSplitThresholdPercent,
-      .t1_chunk_split_bytes = ConfigT::kT1ChunkSplitBytes,
-      .segment_bytes = ConfigT::kSegmentBytes,
-      .compaction_max_move_bytes_per_cycle = ConfigT::kCompactionMaxMoveBytesPerCycle,
-      .punch_backlog_checkpoint_cap_segments = ConfigT::kPunchBacklogCheckpointCapSegments,
-      .msync_chunk_bytes = ConfigT::kMsyncChunkBytes,
-      .wal_max_bytes_since_checkpoint = ConfigT::kMaxBytesSinceCheckpoint,
-      .read_policy = policy,
-  };
-}
 
 // X-macro: the checkpoint phase-breakdown fields of VMemKVStatistics below, and the
 // matching atomics CheckpointCoordinator publishes them from. One list drives field

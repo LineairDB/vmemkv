@@ -219,11 +219,16 @@ constexpr uint64_t kStoreCapacityBytes = 64ULL * 1024 * 1024;
 }  // namespace
 
 namespace {
-// 1024-entry append region.
-struct TinyShardConfig : vmemkv_test::TinyAppendConfig<10> {
-  static constexpr size_t kShardTargetSizeEntries = 50;  // Forces splits well before kKeyCount below.
+struct TinyShardImpl : vmemkv::VMemKVImpl {
+  static auto make_options() -> vmemkv::StoreOptions {
+    vmemkv::StoreOptions opts;
+    opts.memtable_capacity_entries = size_t{1} << 10;
+    opts.shard_target_size_entries = 50;  // Forces splits well before kKeyCount below.
+    return opts;
+  }
+  TinyShardImpl(const std::filesystem::path &path, uint64_t capacity) : VMemKVImpl(path, capacity, make_options()) {}
 };
-using VMemKV_TinyShard = vmemkv::StoreAdapter<vmemkv::ConfiguredVMemKV<TinyShardConfig>>;
+using VMemKV_TinyShard = vmemkv::StoreAdapter<TinyShardImpl>;
 }  // namespace
 
 // ─── Checkpoint / Reload integration tests ──────────────────────────────────────────────────

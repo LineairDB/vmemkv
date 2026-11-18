@@ -210,7 +210,7 @@ class LMDBStore {
 
  private:
   // 1TB virtual address space reservation (sparse; LMDB only maps what's actually
-  // used). Matches vmemkv::Config<>::kDefaultCapacityBytes so both engines are
+  // used). Matches vmemkv::T2Config::kDefaultCapacityBytes so both engines are
   // given comparable headroom for LTM-scale corpora.
   static constexpr size_t kMapSizeBytes = 1ULL << 40;
   static constexpr unsigned int kMaxReaders = 512;

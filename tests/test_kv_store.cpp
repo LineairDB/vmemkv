@@ -424,7 +424,7 @@ TEST_CASE("Offset64 + hash-index disambiguates long keys sharing a prefix") {
         OffsetAppendMapIndex::PutResult::Applied);
   CHECK(epoch_domain.run([&] { return idx->get(vmemkv_test::to_span(key_one)); }) == 9U);
 
-  idx->reorganize([](auto) {});
+  idx->reorganize();
   CHECK(epoch_domain.run([&] { return idx->get(vmemkv_test::to_span(key_one)); }) == 9U);
   CHECK(epoch_domain.run([&] { return idx->get(vmemkv_test::to_span(key_two)); }) == 2U);
 }

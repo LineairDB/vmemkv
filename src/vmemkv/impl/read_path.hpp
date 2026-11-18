@@ -143,7 +143,7 @@ inline auto immutable_size_hint(uint64_t payload_bits) noexcept -> uint64_t {
   return t2_detail::payload_hint_bytes(payload_bits, t2_detail::kImmutableSizeHintMargin);
 }
 
-// Bounded pread() + header-bounds verification into `buf`, shared by ReadPolicyPreadOnly and
+// Bounded pread() + header-bounds verification into `buf`, shared by ReadPolicy::PreadOnly and
 // large Gets. Short reads/errors return std::nullopt (caller falls back to seqlock).
 inline auto read_immutable_via_pread(const T2Memory *mem,
                                      uint64_t offset,
@@ -167,7 +167,7 @@ inline auto read_immutable_via_pread(const T2Memory *mem,
   return make_record_view(header);
 }
 
-// Pread-pinned immutable-region read (ReadPolicyPreadOnly) using thread-local scratch.
+// Pread-pinned immutable-region read (ReadPolicy::PreadOnly) using thread-local scratch.
 inline auto read_pread_pinned(const T2Memory *mem,
                               uint64_t offset,
                               uint64_t read_only_offset,

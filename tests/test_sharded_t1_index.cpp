@@ -22,22 +22,19 @@
 
 namespace {
 
-using vmemkv_test::identity_offset_mapper;
 using vmemkv_test::to_span;
 
 // 1024-entry append region: holds this file's largest key count (800) without overflowing
 // before an explicit split -- these tests cover routing/splits, not MemTableFull
 // backpressure (see test_t1_index.cpp).
-using TinyAppendConfig = vmemkv_test::TinyAppendConfig<10>;
+constexpr size_t kTestMemTableCapacity = size_t{1} << 10;
 
 using TestIndex = vmemkv::ShardedT1Index;
 
-auto make_index() -> std::unique_ptr<TestIndex> {
-  return std::make_unique<TestIndex>(TinyAppendConfig::kMemTableCapacityEntries);
-}
+auto make_index() -> std::unique_ptr<TestIndex> { return std::make_unique<TestIndex>(kTestMemTableCapacity); }
 
 auto make_index_with_target_size(size_t target_shard_size, size_t worker_threads = 2) -> std::unique_ptr<TestIndex> {
-  return std::make_unique<TestIndex>(TinyAppendConfig::kMemTableCapacityEntries, target_shard_size, worker_threads);
+  return std::make_unique<TestIndex>(kTestMemTableCapacity, target_shard_size, worker_threads);
 }
 
 // Fixed-width keys ("k" + zero-padded index) so boundary comparisons match numeric order.
@@ -56,10 +53,9 @@ struct ShardSnapshot {
 
 auto capture_all(TestIndex &idx) -> ShardSnapshot {
   ShardSnapshot out;
-  out.boundaries = idx.checkpoint_all_shards(vmemkv_test::identity_offset_mapper(),
-                                             [&](std::span<const TestIndex::EntrySnapshot> merged) {
-                                               out.per_shard.emplace_back(merged.begin(), merged.end());
-                                             });
+  out.boundaries = idx.checkpoint_all_shards([&](std::span<const TestIndex::EntrySnapshot> merged) {
+    out.per_shard.emplace_back(merged.begin(), merged.end());
+  });
   return out;
 }
 
@@ -576,10 +572,9 @@ TEST_CASE("ShardedT1Index: checkpoint concurrent with put/get/scan/split loses n
   std::vector<TestIndex::Key> boundaries;
   for (int round = 0; round < 5; ++round) {
     per_shard.clear();
-    boundaries = idx->checkpoint_all_shards(vmemkv_test::identity_offset_mapper(),
-                                            [&](std::span<const TestIndex::EntrySnapshot> merged) {
-                                              per_shard.emplace_back(merged.begin(), merged.end());
-                                            });
+    boundaries = idx->checkpoint_all_shards([&](std::span<const TestIndex::EntrySnapshot> merged) {
+      per_shard.emplace_back(merged.begin(), merged.end());
+    });
     CHECK(boundaries.size() + 1 == per_shard.size());
     size_t total_entries = 0;
     for (const auto &shard_entries : per_shard) {
@@ -598,7 +593,7 @@ TEST_CASE("ShardedT1Index: worker_threads=0 defers background maintenance until 
   // target 50 with 0 workers: puts land and cross thresholds, but nothing splits -- the
   // deferred-start contract for single-threaded setup (e.g. checkpoint load) before any
   // background thread may touch the instance.
-  auto idx = std::make_unique<TestIndex>(TinyAppendConfig::kMemTableCapacityEntries,
+  auto idx = std::make_unique<TestIndex>(kTestMemTableCapacity,
                                          /*target_shard_size=*/50,
                                          /*worker_threads=*/0);
   constexpr int kCount = 600;
@@ -740,7 +735,7 @@ TEST_CASE("ShardedT1Index: shard splits at kSegmentBytes even below entry-count 
 }
 
 TEST_CASE("ShardedT1Index: reorganize drains only shards with pending MemTables") {
-  auto idx = make_index_with_target_size(TinyAppendConfig::kShardTargetSizeEntries, /*worker_threads=*/0);
+  auto idx = make_index_with_target_size(vmemkv::T1Config::kShardTargetSizeEntries, /*worker_threads=*/0);
   constexpr int kCount = 400;
   fill_sharded(*idx, kCount);
   idx->split_shard_containing(to_span(ikey(0)));

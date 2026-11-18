@@ -123,15 +123,17 @@ struct StoreFactory<vmemkv::StoreAdapter<Impl>> {
 
 #define STORE_TYPES VMemKVStores RivalStores
 
-struct FrequentCheckpointConfig : vmemkv::Config<> {
-  // Partial override style: inherit all defaults and only tune checkpoint aggressiveness.
-  static constexpr size_t kMaxBytesSinceCheckpoint = 64ULL << 10;  // 64 KiB.
+struct FrequentCheckpointImpl : vmemkv::VMemKVImpl {
+  static auto make_options() -> vmemkv::StoreOptions {
+    vmemkv::StoreOptions opts;
+    opts.wal_max_bytes_since_checkpoint = 64ULL << 10;  // 64 KiB.
+    return opts;
+  }
+  FrequentCheckpointImpl(const std::filesystem::path &path, uint64_t capacity)
+      : VMemKVImpl(path, capacity, make_options()) {}
 };
 
-static_assert(FrequentCheckpointConfig::kMemTableCapacityEntries ==
-              (size_t{1} << FrequentCheckpointConfig::kMemTableCapacityLog2));
-
-using VMemKV_FrequentCheckpoint = vmemkv::StoreAdapter<vmemkv::ConfiguredVMemKV<FrequentCheckpointConfig>>;
+using VMemKV_FrequentCheckpoint = vmemkv::StoreAdapter<FrequentCheckpointImpl>;
 
 template <typename StoreHandle>
 static void insert_sequential_u64_values(StoreHandle &store, int key_count) {

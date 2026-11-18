@@ -9,24 +9,10 @@
 #include <utility>
 #include <vector>
 #include <vmemkv/api/serializer.hpp>
-#include <vmemkv/config.hpp>
 
 namespace vmemkv {
 
-// Codec constant parity: public header and Config must agree.
-static_assert(vmemkv::detail::kBitsPerByte == vmemkv::Config<>::kBitsPerByte);
-
 namespace detail {
-template <typename T, typename = void>
-struct get_config_type {
-  using type = vmemkv::Config<>;
-};
-
-template <typename T>
-struct get_config_type<T, std::void_t<typename T::ConfigType>> {
-  using type = typename T::ConfigType;
-};
-
 template <typename T, typename = void>
 struct is_rival_store : std::false_type {};
 
@@ -50,7 +36,6 @@ template <typename KVSImpl>
 class StoreAdapter {
  public:
   static constexpr bool kIsEnabled = KVSImpl::kIsEnabled;
-  using ConfigType = typename detail::get_config_type<KVSImpl>::type;
   using Impl = KVSImpl;
 
   static auto name() -> std::string { return detail::store_name<KVSImpl>(); }

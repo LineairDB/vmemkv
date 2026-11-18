@@ -286,9 +286,8 @@ class T2Ownership {
     return last_checkpoint_count_.load(std::memory_order_relaxed);
   }
 
-  // Segments waiting for a coverage-granting checkpoint. Drives the checkpoint
-  // trigger alongside the WAL-size trigger: without relocation WAL records, the
-  // WAL alone no longer paces punch drainage.
+  // Segments waiting for a coverage-granting checkpoint. Drives checkpoint triggering
+  // alongside WAL size because compaction relocates records without writing WAL entries.
   auto punch_backlog_segments() const noexcept -> uint64_t {
     return punch_candidate_count_.load(std::memory_order_acquire);
   }
@@ -334,10 +333,6 @@ class T2Ownership {
   }
 
  private:
-  struct NoOpHook {
-    void operator()() const noexcept {}
-  };
-
   // Deduplicating lock-free Treiber stack over fixed segment indices `[0, segment_count_)`.
   struct IndexedSegmentStack {
     struct Node {
@@ -357,8 +352,12 @@ class T2Ownership {
       } while (!head.compare_exchange_weak(cur, seg, std::memory_order_release, std::memory_order_relaxed));
     }
 
-    template <typename BeforePush = NoOpHook>
-    auto try_push(uint64_t seg, BeforePush &&before_push = {}) noexcept -> bool {
+    auto try_push(uint64_t seg) noexcept -> bool {
+      return try_push(seg, []() noexcept {});
+    }
+
+    template <typename BeforePush>
+    auto try_push(uint64_t seg, BeforePush &&before_push) noexcept -> bool {
       if (seg >= nodes.size() || nodes[seg].pending.load(std::memory_order_relaxed)) {
         return false;
       }

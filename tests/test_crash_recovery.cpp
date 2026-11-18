@@ -294,9 +294,16 @@ TEST_CASE_TEMPLATE("crash recovery: delete-heavy workload restarts to correct sp
 
 namespace {
 // 256-entry append region: shrinks append-region capacity to force frequent reorganizes.
-using TinyAppendConfig = vmemkv_test::TinyAppendConfig<8>;
+struct TinyAppendImpl : vmemkv::VMemKVImpl {
+  static auto make_options() -> vmemkv::StoreOptions {
+    vmemkv::StoreOptions opts;
+    opts.memtable_capacity_entries = size_t{1} << 8;
+    return opts;
+  }
+  TinyAppendImpl(const std::filesystem::path &path, uint64_t capacity) : VMemKVImpl(path, capacity, make_options()) {}
+};
 
-using VMemKV_TinyAppend = vmemkv::StoreAdapter<vmemkv::ConfiguredVMemKV<TinyAppendConfig>>;
+using VMemKV_TinyAppend = vmemkv::StoreAdapter<TinyAppendImpl>;
 }  // namespace
 
 // Livelock guard: during recovery no reorg worker exists yet, so replay into a full append

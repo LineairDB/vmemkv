@@ -1,48 +1,12 @@
-// vmemkv_impl.hpp - vmemkv coordinator: routes reads/writes across T1Index and T2FlatFile.
+// vmemkv_impl.hpp - Coordinator routing reads and writes across ShardedT1Index, T2FlatFile, and Wal.
 //
-// The coordination logic itself lives in src/vmemkv/impl/: hooks.hpp (checkpoint seams and the
-// in-place-update barrier), t2_ownership.hpp (T2 payload codec, capture watermark,
-// barrier), read_path.hpp (base-region reads, seqlock-protected record reads), write_path.hpp
-// (inline payloads, lock-free appends, in-place updates, stripe protocol, WAL batching),
-// checkpoint_coordinator.hpp (checkpoint/reorganize orchestration),
-// and recovery.hpp (checkpoint adopt
-// helpers). Poll intervals live in core/background_poll.hpp. This class owns lifetimes (T1/T2/WAL,
-// stripes, background workers) and delegates every operation to those units.
-//
-// ─── CONCURRENCY SPECIFICATION & MATRIX ──────────────────────────────────────
-//
-// The vmemkv architecture enforces thread-safety at the VMemKVImpl level,
-// coordinating and routing operations across two underlying structural layers:
-// 1. T1Index (In-memory Index)
-// 2. T2FlatFile (Binary Disk Log File)
-//
-// +--------------------+-------------------+---------------------------------------------------+
-// | Component          | Read Operations   | Write Operations (Insert/Update/Delete)           |
-// +--------------------+-------------------+---------------------------------------------------+
-// | vmemkv::T1Index    | Thread-Safe       | Thread-Unsafe (relies on VMemKVImpl serialization)|
-// | vmemkv::T2FlatFile  | Thread-Safe       | Thread-Unsafe (relies on VMemKVImpl serialization)|
-// | vmemkv::VMemKVStore | Thread-Safe       | Thread-Safe (fully serialized/coordinated)        |
-// +--------------------+-------------------+---------------------------------------------------+
-//
-// Below is the Concurrency Matrix detailing synchronization across macro operations:
-//
-// +--------------------------+------------+--------------------+---------------------+-----------------------------+-----------------------------+
-// | Operation A \ Operation B | Get / Scan | Write (Same Key)   | Write (Diff Key)    | Reorganize (T1-only)        |
-// Checkpoint                  |
-// +--------------------------+------------+--------------------+---------------------+-----------------------------+-----------------------------+
-// | Get / Scan               | Concurrent | Concurrent         | Concurrent          | Concurrent (retry/snapshot) |
-// Concurrent                  | | Write (Same Key)         | Concurrent | Serial (Stripes)   | Concurrent          |
-// Concurrent                  | Concurrent (brief append stall) | | Write (Diff Key)         | Concurrent | Concurrent
-// | Concurrent (atomic) | Concurrent                  | Concurrent (brief append stall) | | Reorganize (T1-only)     |
-// Concurrent | Concurrent         | Concurrent          | Single-flight (trigger.running) | Single-flight
-// (trigger.running) | | Checkpoint               | Concurrent | Concurrent         | Concurrent          |
-// Single-flight (trigger.running) | Single-flight (trigger.running) |
-// +--------------------------+------------+--------------------+---------------------+-----------------------------+-----------------------------+
-//
-// Reorg/checkpoint single-flight is shared (checkpoint_coordinator.hpp). T1 background
-// maintenance runs on a sharded worker pool with per-shard Closing/Split protocol
-// (docs/specification/t1_sharding_design.md); explicit reorganize()/checkpoint() wait via
-// wait_until_reorg_not_running().
+// Component concurrency:
+// - ShardedT1Index / T1Index: lock-free readers and writers under EpochDomain; background maintenance
+//   and sharding serialize internally.
+// - T2FlatFile: thread-safe appends and seqlock-guarded mutable-region reads; in-place updates hold
+//   the per-key stripe lock plus InPlaceUpdateBarrier.
+// - VMemKVImpl: holds 256 per-key write stripes for read-modify-write atomicity across T1/T2/WAL
+//   and shares CheckpointState single-flight between reorganize() and checkpoint().
 
 #pragma once
 
@@ -78,7 +42,6 @@
 #include <vmemkv/impl/compaction.hpp>
 #include <vmemkv/impl/hooks.hpp>
 #include <vmemkv/impl/read_path.hpp>
-#include <vmemkv/impl/recovery.hpp>
 #include <vmemkv/impl/t2_ownership.hpp>
 #include <vmemkv/impl/write_path.hpp>
 #include <vmemkv/scan_control.hpp>
@@ -125,15 +88,6 @@ class VMemKVImpl {
   }
 
   using T1IndexT = vmemkv::ShardedT1Index;
-
-  // T1 payload codec, re-exported as ImplT::X names (tests use ImplT::kBlockAlignment et al.).
-  // Canonical values live in t1_codec.hpp's vmemkv::t2_detail namespace.
-  static constexpr uint64_t kSizeEmbeddingShift = t2_detail::kPayloadSizeShift;
-  static constexpr uint64_t kOffsetMask = t2_detail::kPayloadOffsetMask;
-  static constexpr uint64_t kBlockAlignment = t2_detail::kRecordBlockAlignment;
-  static_assert(kSizeEmbeddingShift == t2_detail::kPayloadSizeShift);
-  static_assert(kOffsetMask == t2_detail::kPayloadOffsetMask);
-  static_assert(kBlockAlignment == t2_detail::kRecordBlockAlignment);
 
   // Construction phases, in order (each depends on the previous):
   // 1. validate_swap: fail fast before any mmap/recovery work.
@@ -311,7 +265,7 @@ class VMemKVImpl {
     }
 
     const T2Memory *mem = t2_.get_memory();
-    const uint64_t offset = res.payload_bits & kOffsetMask;
+    const uint64_t offset = t2_detail::decode_offset(res.payload_bits);
 
     // Scratch for both paths below, used sequentially (never overlapping): the immutable region's
     // pread() destination, then the seqlock path's owned copy. thread_local/static: per-thread
@@ -330,9 +284,7 @@ class VMemKVImpl {
       // always-correct seqlock path instead of trusting this read.
     }
 
-    // Torn-read fix: copy_func only *copies* into an owned buffer and returns -- never calls
-    // back from inside. The version check bounds only the copy window, not what a callback
-    // might do inside it; a concurrent in-place update could tear the caller's bytes mid-read.
+    // Copy key/value inside the seqlock retry closure; invoke callback only after validation succeeds.
     bool key_matches = vmemkv::read_t2_record_seqlock([&]() -> T2RecordView { return T2FlatFile::at(offset, mem); },
                                                       [&](const T2RecordView &record) -> bool {
                                                         if (!vmemkv::bytes_equal(record.key, full_key)) {
@@ -470,15 +422,11 @@ class VMemKVImpl {
                  return scan_detail::invoke_callback(callback, imm_record->key, imm_record->value);
                }
 
-               // t2_.at() inside read_t2_record_seqlock() (as AtFunc), matching get_impl().
-               //
-               // Torn-read fix: copy into an owned buffer and return, never callback from inside
-               // (see get_impl()). thread_local/static: concurrent-safe, no per-call reallocation.
-               // Ownership: see tl_get_buf above; read_path.hpp owns tl_pread_scratch.
+               // Copy key/value inside the seqlock retry closure; invoke callback only after validation succeeds.
                thread_local static std::vector<std::byte> tl_scan_key_buf;
                thread_local static std::vector<std::byte> tl_scan_value_buf;
                const bool in_range = vmemkv::read_t2_record_seqlock(
-                   [&]() -> T2RecordView { return T2FlatFile::at(payload & kOffsetMask, mem); },
+                   [&]() -> T2RecordView { return T2FlatFile::at(t2_detail::decode_offset(payload), mem); },
                    [&](const T2RecordView &record) -> bool {
                      if (!vmemkv::bytes_in_range(record.key, lower_bound, upper_bound)) {
                        return false;
@@ -509,10 +457,14 @@ class VMemKVImpl {
   // Phase 4 of construction: start the unified T2 maintenance worker after recovery completes.
   void spawn_background_workers() { t2_worker_ = std::jthread(&VMemKVImpl::t2_maintenance_loop, this); }
 
-  // Manifest-named live T2 bytes for T2FlatFile's adopt-constructor. Static: runs in the
-  // constructor's initializer list before t2_ exists. Delegates to recovery_detail.
+  // Manifest-named live T2 bytes for T2FlatFile's adopt-constructor (runs in the initializer
+  // list before t2_ exists).
   static auto adopted_t2_bytes_used(const std::filesystem::path &t2_path) -> std::optional<uint64_t> {
-    return recovery_detail::adopted_t2_bytes_used(t2_path);
+    const auto manifest = vmemkv::read_manifest(vmemkv::derive_manifest_path(t2_path));
+    if (!manifest.has_value()) {
+      return std::nullopt;
+    }
+    return manifest->t2_bytes_used;
   }
 
   // Fast-boot (docs/specification/low_level_design.md 5.3): with a committed manifest, adopt its T1 sorted region
@@ -702,19 +654,5 @@ class VMemKVImpl {
   // loop polls stop_token, bounding shutdown latency to one interval.
   std::jthread t2_worker_;
 };
-
-// Bridges compile-time Config<...> structs (used by variants.hpp and unit tests) onto
-// non-template VMemKVImpl + StoreOptions.
-template <typename ConfigT = vmemkv::Config<>>
-class ConfiguredVMemKV : public VMemKVImpl {
- public:
-  using ConfigType = ConfigT;
-  static auto name() -> std::string { return VMemKVImpl::name(make_store_options<ConfigT>().read_policy); }
-
-  ConfiguredVMemKV(const std::filesystem::path &t2_path, uint64_t t2_bytes_capacity)
-      : VMemKVImpl(t2_path, t2_bytes_capacity, make_store_options<ConfigT>()) {}
-};
-
-using vmemkv = VMemKVImpl;
 
 }  // namespace vmemkv

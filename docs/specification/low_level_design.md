@@ -564,7 +564,7 @@ T2's Immutable Region (`< read_only_offset`, 2.2) never changes after writing, s
   - `sequential_mmap` (read-only mmap, `MADV_SEQUENTIAL`): Scan reads of sub-page records. A wide readahead window folds many small records' faults into few major faults. Get's read-policy ablation (`SeqOnly`) also pins here.
   - `normal_mmap` (read-only mmap, kernel default adaptive readahead policy): Scan reads of over-page records.
   - `pread_fd` (via a `dup()`ed file descriptor, `pread()`): `get_impl()` large-record reads (`> 1 page`), issuing a single bounded read sized by the T1 size hint instead of multi-page synchronous faults.
-- Read-policy pins (`ReadPolicyRandomOnly`, `ReadPolicySeqOnly`, `ReadPolicyNormalOnly`, `ReadPolicyPreadOnly`) force every immutable-region read through one handle for ablation: `NormalOnly` always uses the plain mapping, `PreadOnly` always preads into a thread-local scratch buffer (falling back to the seqlock path only when pread itself is unavailable). Mutable-region reads keep the seqlock path under every policy.
+- Read-policy pins (`ReadPolicy::RandomOnly`, `ReadPolicy::SeqOnly`, `ReadPolicy::NormalOnly`, `ReadPolicy::PreadOnly`) force every immutable-region read through one handle for ablation: `NormalOnly` always uses the plain mapping, `PreadOnly` always preads into a thread-local scratch buffer (falling back to the seqlock path only when pread itself is unavailable). Mutable-region reads keep the seqlock path under every policy.
 - `Scan` uses the master corpus shared with other Ops.
 
 ### 7.6 Recommended Paging Regime
