@@ -275,8 +275,8 @@ class VMemKVImpl {
   }
 
   // Retrieves a value and invokes callback with its raw bytes. Lock-free.
-  // A T1 lookup names a T2 offset guarded by one of two mechanisms: below base_boundary the
-  // offset is immutable forever (try_read_base_record() reads seqlock-free); at or above it,
+  // A T1 lookup names a T2 offset guarded by one of two mechanisms: below read_only_offset the
+  // offset is immutable forever (try_read_immutable_record() reads seqlock-free); at or above it,
   // read_t2_record_seqlock() re-checks a version around the read and retries torn observations.
   // get_memory() needs no handle: T2 never remaps to another T2Memory in a store's lifetime.
   template <typename Callback>
@@ -294,7 +294,7 @@ class VMemKVImpl {
     const T2Memory *mem = t2_.get_memory();
     const uint64_t offset = res.payload_bits & kOffsetMask;
 
-    // Scratch for both paths below, used sequentially (never overlapping): the base region's
+    // Scratch for both paths below, used sequentially (never overlapping): the immutable region's
     // pread() destination, then the seqlock path's owned copy. thread_local/static: per-thread
     // reuse, no per-call allocation.
     // Ownership: tl_get_buf/tl_scan_* live here (get/scan callback buffers); read_path.hpp
@@ -349,7 +349,7 @@ class VMemKVImpl {
             return {true, wal_.reserve_update(full_key, value)};
           }
           const vmemkv::InPlaceUpdateResult result =
-              vmemkv::try_in_place_update<ConfigT>(t1_, t2_, t2_own_, wal_, full_key, value);
+              vmemkv::try_in_place_update<ConfigT>(t2_, t2_own_, wal_, full_key, value, quick.payload_bits);
           if (result.outcome == vmemkv::InPlaceOutcome::Aborted) {
             return {};
           }

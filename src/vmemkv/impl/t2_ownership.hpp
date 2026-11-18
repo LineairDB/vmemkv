@@ -84,23 +84,10 @@ class T2Ownership {
   explicit T2Ownership(size_t segment_count = 0)
       : segment_count_(segment_count),
         seg_live_(segment_count),
-        punch_pending_(segment_count),
-        punch_nodes_(segment_count),
-        garbage_pending_(segment_count),
-        garbage_nodes_(segment_count),
-        dirty_flag_(segment_count) {
-    for (auto &counter : seg_live_) {
-      counter.store(0, std::memory_order_relaxed);
-    }
-    for (size_t i = 0; i < segment_count; ++i) {
-      punch_pending_[i].store(false, std::memory_order_relaxed);
-      punch_nodes_[i].evacuated_epoch = 0;
-      punch_nodes_[i].next.store(kInvalidSegment, std::memory_order_relaxed);
-      garbage_pending_[i].store(false, std::memory_order_relaxed);
-      garbage_nodes_[i].next.store(kInvalidSegment, std::memory_order_relaxed);
-      dirty_flag_[i].store(false, std::memory_order_relaxed);
-    }
-  }
+        dirty_flag_(segment_count),
+        punch_evacuated_epoch_(segment_count, 0),
+        punch_(segment_count),
+        garbage_(segment_count) {}
 
   static auto seg_index(uint64_t masked_offset) noexcept -> uint64_t { return masked_offset / ConfigT::kSegmentBytes; }
 
@@ -130,16 +117,7 @@ class T2Ownership {
       return;
     }
     dirty_flag_[seg].store(true, std::memory_order_relaxed);
-    if (garbage_pending_[seg].load(std::memory_order_relaxed)) {
-      return;
-    }
-    if (garbage_pending_[seg].exchange(true, std::memory_order_acq_rel)) {
-      return;
-    }
-    uint64_t head = garbage_head_.load(std::memory_order_relaxed);
-    do {
-      garbage_nodes_[seg].next.store(head, std::memory_order_relaxed);
-    } while (!garbage_head_.compare_exchange_weak(head, seg, std::memory_order_release, std::memory_order_relaxed));
+    garbage_.try_push(seg);
   }
 
   // Exclusive upper bound on segment indices eligible for garbage evacuation: a segment must
@@ -162,11 +140,7 @@ class T2Ownership {
       uint64_t seg,
       uint64_t read_only_offset,
       uint64_t tail_offset = std::numeric_limits<uint64_t>::max()) const noexcept -> bool {
-    if (seg >= evac_limit(read_only_offset, tail_offset)) {
-      return false;
-    }
-    return dirty_flag_[seg].load(std::memory_order_relaxed) && !punch_pending_[seg].load(std::memory_order_relaxed) &&
-           seg_live_[seg].load(std::memory_order_relaxed) > 0;
+    return seg < evac_limit(read_only_offset, tail_offset) && segment_has_garbage_flags(seg);
   }
 
   // True when `payload_bits` touches any frozen garbage segment.
@@ -175,25 +149,21 @@ class T2Ownership {
       uint64_t payload_bits,
       uint64_t read_only_offset,
       uint64_t tail_offset = std::numeric_limits<uint64_t>::max()) const noexcept -> bool {
-    const uint64_t off = payload_bits & t2_detail::kPayloadOffsetMask;
-    const uint64_t hint = hint_bytes(payload_bits);
-    const uint64_t first = seg_index(off);
-    const uint64_t last = seg_index(off + hint - 1);
-    return is_garbage_segment(first, read_only_offset, tail_offset) ||
-           (last != first && is_garbage_segment(last, read_only_offset, tail_offset));
+    const SegmentSpan span = payload_segment_span(payload_bits);
+    return is_garbage_segment(span.first, read_only_offset, tail_offset) ||
+           (span.last != span.first && is_garbage_segment(span.last, read_only_offset, tail_offset));
   }
 
   [[nodiscard]] auto has_garbage_segment(
       // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
       uint64_t read_only_offset,
       uint64_t tail_offset = std::numeric_limits<uint64_t>::max()) const noexcept -> bool {
-    for (uint64_t curr = garbage_head_.load(std::memory_order_acquire); curr != kInvalidSegment;
-         curr = garbage_nodes_[curr].next.load(std::memory_order_relaxed)) {
-      if (is_garbage_segment(curr, read_only_offset, tail_offset)) {
-        return true;
-      }
-    }
-    return false;
+    bool found = false;
+    scan_garbage_list(read_only_offset, tail_offset, [&]() noexcept {
+      found = true;
+      return false;
+    });
+    return found;
   }
 
   [[nodiscard]] auto garbage_segment_count(
@@ -201,12 +171,10 @@ class T2Ownership {
       uint64_t read_only_offset,
       uint64_t tail_offset = std::numeric_limits<uint64_t>::max()) const noexcept -> size_t {
     size_t count = 0;
-    for (uint64_t curr = garbage_head_.load(std::memory_order_acquire); curr != kInvalidSegment;
-         curr = garbage_nodes_[curr].next.load(std::memory_order_relaxed)) {
-      if (is_garbage_segment(curr, read_only_offset, tail_offset)) {
-        ++count;
-      }
-    }
+    scan_garbage_list(read_only_offset, tail_offset, [&]() noexcept {
+      ++count;
+      return true;
+    });
     return count;
   }
 
@@ -215,22 +183,16 @@ class T2Ownership {
       uint64_t read_only_offset,
       uint64_t tail_offset = std::numeric_limits<uint64_t>::max()) const noexcept {
     const uint64_t limit = evac_limit(read_only_offset, tail_offset);
-    uint64_t curr = garbage_head_.exchange(kInvalidSegment, std::memory_order_acquire);
+    uint64_t curr = garbage_.steal_all();
     while (curr != kInvalidSegment) {
-      const uint64_t next = garbage_nodes_[curr].next.load(std::memory_order_relaxed);
+      const uint64_t next = garbage_.nodes[curr].next.load(std::memory_order_relaxed);
       if (curr < limit) {
         dirty_flag_[curr].store(false, std::memory_order_relaxed);
-        garbage_pending_[curr].store(false, std::memory_order_release);
-      } else if (dirty_flag_[curr].load(std::memory_order_relaxed) &&
-                 !punch_pending_[curr].load(std::memory_order_relaxed) &&
-                 seg_live_[curr].load(std::memory_order_relaxed) > 0) {
-        uint64_t head = garbage_head_.load(std::memory_order_relaxed);
-        do {
-          garbage_nodes_[curr].next.store(head, std::memory_order_relaxed);
-        } while (
-            !garbage_head_.compare_exchange_weak(head, curr, std::memory_order_release, std::memory_order_relaxed));
+        garbage_.nodes[curr].pending.store(false, std::memory_order_release);
+      } else if (segment_has_garbage_flags(curr)) {
+        garbage_.push_link(curr);
       } else {
-        garbage_pending_[curr].store(false, std::memory_order_release);
+        garbage_.nodes[curr].pending.store(false, std::memory_order_release);
       }
       curr = next;
     }
@@ -247,21 +209,21 @@ class T2Ownership {
   }
 
   [[nodiscard]] auto has_punch_candidates() const noexcept -> bool {
-    return punch_head_.load(std::memory_order_relaxed) != kInvalidSegment;
+    return punch_.head.load(std::memory_order_relaxed) != kInvalidSegment;
   }
 
   // Takes all queued punch candidates while keeping punch_candidate_count_ accounting for
   // them until each is either retired (punched / non-empty) or re-queued via
   // requeue_deferred_punch_candidates().
   auto take_punch_candidates() const -> std::vector<PunchCandidate> {
-    uint64_t curr = punch_head_.exchange(kInvalidSegment, std::memory_order_acquire);
+    uint64_t curr = punch_.steal_all();
     std::vector<PunchCandidate> out;
     while (curr != kInvalidSegment) {
-      const uint64_t epoch = punch_nodes_[curr].evacuated_epoch;
+      const uint64_t epoch = punch_evacuated_epoch_[curr];
       out.push_back(PunchCandidate{curr, epoch});
-      punch_pending_[curr].store(false, std::memory_order_release);
-      const uint64_t next = punch_nodes_[curr].next.load(std::memory_order_relaxed);
-      punch_nodes_[curr].next.store(kInvalidSegment, std::memory_order_relaxed);
+      punch_.nodes[curr].pending.store(false, std::memory_order_release);
+      const uint64_t next = punch_.nodes[curr].next.load(std::memory_order_relaxed);
+      punch_.nodes[curr].next.store(kInvalidSegment, std::memory_order_relaxed);
       curr = next;
     }
     return out;
@@ -277,16 +239,14 @@ class T2Ownership {
   // take_punch_candidates() preserves their count while in flight.
   void requeue_deferred_punch_candidates(std::span<const PunchCandidate> candidates) const {
     for (const PunchCandidate &candidate : candidates) {
-      if (candidate.segment >= segment_count_) {
+      if (candidate.segment >= segment_count_ ||
+          punch_.nodes[candidate.segment].pending.exchange(true, std::memory_order_acq_rel)) {
+        // Out of range or already re-queued concurrently with its own count increment; drop token.
         retire_punch_candidates(1);
         continue;
       }
-      if (punch_pending_[candidate.segment].exchange(true, std::memory_order_acq_rel)) {
-        // Already re-queued concurrently with its own count increment; drop the in-flight token.
-        retire_punch_candidates(1);
-        continue;
-      }
-      push_node(candidate.segment, candidate.evacuated_epoch);
+      punch_evacuated_epoch_[candidate.segment] = candidate.evacuated_epoch;
+      punch_.push_link(candidate.segment);
     }
   }
 
@@ -334,22 +294,19 @@ class T2Ownership {
 
   // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
   void adjust_live(uint64_t payload_bits, bool add, bool allow_mark_dirty = true) {
-    const uint64_t off = payload_bits & t2_detail::kPayloadOffsetMask;
-    const uint64_t hint = hint_bytes(payload_bits);
-    const uint64_t seg0 = seg_index(off);
-    const uint64_t seg1 = seg_index(off + hint - 1);
-    if (add) {
-      if (seg0 < seg_live_.size()) {
-        seg_live_[seg0].fetch_add(hint, std::memory_order_relaxed);
+    const SegmentSpan span = payload_segment_span(payload_bits);
+    auto adjust_one = [&](uint64_t seg) {
+      if (add) {
+        if (seg < seg_live_.size()) {
+          seg_live_[seg].fetch_add(span.hint, std::memory_order_relaxed);
+        }
+      } else {
+        subtract_segment(seg, span.hint, allow_mark_dirty);
       }
-      if (seg1 != seg0 && seg1 < seg_live_.size()) {
-        seg_live_[seg1].fetch_add(hint, std::memory_order_relaxed);
-      }
-    } else {
-      subtract_segment(seg0, hint, allow_mark_dirty);
-      if (seg1 != seg0) {
-        subtract_segment(seg1, hint, allow_mark_dirty);
-      }
+    };
+    adjust_one(span.first);
+    if (span.last != span.first) {
+      adjust_one(span.last);
     }
   }
 
@@ -372,39 +329,77 @@ class T2Ownership {
   }
 
  private:
-  struct GarbageNode {
-    std::atomic<uint64_t> next{kInvalidSegment};
+  struct NoOpHook {
+    void operator()() const noexcept {}
   };
 
-  struct PunchNode {
-    uint64_t evacuated_epoch{0};
-    std::atomic<uint64_t> next{kInvalidSegment};
+  // Deduplicating lock-free Treiber stack over fixed segment indices `[0, segment_count_)`.
+  struct IndexedSegmentStack {
+    struct Node {
+      std::atomic<bool> pending{false};
+      std::atomic<uint64_t> next{kInvalidSegment};
+    };
+
+    std::vector<Node> nodes;
+    std::atomic<uint64_t> head{kInvalidSegment};
+
+    explicit IndexedSegmentStack(size_t count) : nodes(count) {}
+
+    void push_link(uint64_t seg) noexcept {
+      uint64_t cur = head.load(std::memory_order_relaxed);
+      do {
+        nodes[seg].next.store(cur, std::memory_order_relaxed);
+      } while (!head.compare_exchange_weak(cur, seg, std::memory_order_release, std::memory_order_relaxed));
+    }
+
+    template <typename BeforePush = NoOpHook>
+    auto try_push(uint64_t seg, BeforePush &&before_push = {}) noexcept -> bool {
+      if (seg >= nodes.size() || nodes[seg].pending.load(std::memory_order_relaxed)) {
+        return false;
+      }
+      if (nodes[seg].pending.exchange(true, std::memory_order_acq_rel)) {
+        return false;
+      }
+      before_push();
+      push_link(seg);
+      return true;
+    }
+
+    auto steal_all() noexcept -> uint64_t { return head.exchange(kInvalidSegment, std::memory_order_acquire); }
   };
 
-  void push_node(uint64_t seg, uint64_t epoch) const noexcept {
-    punch_nodes_[seg].evacuated_epoch = epoch;
-    uint64_t head = punch_head_.load(std::memory_order_relaxed);
-    do {
-      punch_nodes_[seg].next.store(head, std::memory_order_relaxed);
-    } while (!punch_head_.compare_exchange_weak(head, seg, std::memory_order_release, std::memory_order_relaxed));
+  struct SegmentSpan {
+    uint64_t hint;
+    uint64_t first;
+    uint64_t last;
+  };
+
+  [[nodiscard]] static auto payload_segment_span(uint64_t payload_bits) noexcept -> SegmentSpan {
+    const uint64_t off = t2_detail::decode_offset(payload_bits);
+    const uint64_t hint = hint_bytes(payload_bits);
+    return {hint, seg_index(off), seg_index(off + hint - 1)};
   }
 
-  void push_punch(uint64_t seg, uint64_t epoch) const noexcept {
-    push_node(seg, epoch);
-    punch_candidate_count_.fetch_add(1, std::memory_order_release);
+  [[nodiscard]] auto segment_has_garbage_flags(uint64_t seg) const noexcept -> bool {
+    return dirty_flag_[seg].load(std::memory_order_relaxed) &&
+           !punch_.nodes[seg].pending.load(std::memory_order_relaxed) &&
+           seg_live_[seg].load(std::memory_order_relaxed) > 0;
+  }
+
+  template <typename Visitor>
+  void scan_garbage_list(uint64_t read_only_offset, uint64_t tail_offset, Visitor &&visitor) const noexcept {
+    for (uint64_t curr = garbage_.head.load(std::memory_order_acquire); curr != kInvalidSegment;
+         curr = garbage_.nodes[curr].next.load(std::memory_order_relaxed)) {
+      if (is_garbage_segment(curr, read_only_offset, tail_offset) && !visitor()) {
+        return;
+      }
+    }
   }
 
   void queue_punch_candidate_with_epoch(uint64_t seg, uint64_t epoch) const noexcept {
-    if (seg >= segment_count_) {
-      return;
+    if (punch_.try_push(seg, [&]() noexcept { punch_evacuated_epoch_[seg] = epoch; })) {
+      punch_candidate_count_.fetch_add(1, std::memory_order_release);
     }
-    if (punch_pending_[seg].load(std::memory_order_relaxed)) {
-      return;
-    }
-    if (punch_pending_[seg].exchange(true, std::memory_order_acq_rel)) {
-      return;
-    }
-    push_punch(seg, epoch);
   }
 
   size_t segment_count_{0};
@@ -412,15 +407,11 @@ class T2Ownership {
   std::atomic<uint64_t> watermark_{0};
   InPlaceUpdateBarrier barrier_;
 
-  mutable std::vector<std::atomic<bool>> punch_pending_;
-  mutable std::vector<PunchNode> punch_nodes_;
-  mutable std::atomic<uint64_t> punch_head_{kInvalidSegment};
-  mutable std::atomic<uint64_t> punch_candidate_count_{0};
-
-  mutable std::vector<std::atomic<bool>> garbage_pending_;
-  mutable std::vector<GarbageNode> garbage_nodes_;
-  mutable std::atomic<uint64_t> garbage_head_{kInvalidSegment};
   mutable std::vector<std::atomic<bool>> dirty_flag_;
+  mutable std::vector<uint64_t> punch_evacuated_epoch_;
+  mutable IndexedSegmentStack punch_;
+  mutable std::atomic<uint64_t> punch_candidate_count_{0};
+  mutable IndexedSegmentStack garbage_;
   mutable std::atomic<uint64_t> last_checkpoint_count_{0};
 };
 

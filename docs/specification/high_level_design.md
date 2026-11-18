@@ -178,7 +178,7 @@ Several optimizations exist (the latter two are opt-in and operate correctly dis
 - Recommended paging regime for LTM operation (classic LRU; see low_level_design.md 7.6)
 - WAL Group Commit (implemented; lock-free fixed-length ring-buffer scheme; see low_level_design.md 7.1)
 - entry-level adaptive covering
-- O(1) misses via Bloom filter for `sorted_region` negative lookups
+- O(1) misses via Bloom filter for `SortedRun` negative lookups
 
 ## Appendix A. Relationship with LineairDB
 

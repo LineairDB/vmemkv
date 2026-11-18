@@ -161,25 +161,18 @@ void write_entry_lockfree(T1 &tier1,
   publish(encoded_payload, /*new_is_offset=*/true, /*new_is_inline=*/false, 0);
 }
 
-// update_impl()'s in-place decision for a non-inline entry: applies it or conclusively falls
-// through to write_entry_lockfree().
-template <typename ConfigT, typename T1>
-auto try_in_place_update(T1 &tier1,
-                         T2FlatFile &tier2,
+// update_impl()'s in-place decision for a resolved non-inline entry (`payload_bits`): applies it
+// or conclusively falls through to write_entry_lockfree().
+template <typename ConfigT>
+auto try_in_place_update(T2FlatFile &tier2,
                          T2Ownership<ConfigT> &own,
                          Wal &wal,
                          std::span<const std::byte> full_key,
-                         std::span<const std::byte> value) -> InPlaceUpdateResult {
-  const auto res = tier1.get_with_hash(full_key);
-  if (res.payload_bits == vmemkv::STORE_NOT_FOUND) {
-    return {InPlaceOutcome::Aborted};
-  }
-  if (t1_detail::is_inline(res.raw_hash)) {
-    return {InPlaceOutcome::FellThrough};
-  }
-
+                         std::span<const std::byte> value,
+                         uint64_t payload_bits) -> InPlaceUpdateResult {
+  assert(payload_bits != vmemkv::STORE_NOT_FOUND);
   const T2Memory *mem = tier2.get_memory();
-  const uint64_t offset = res.payload_bits & t2_detail::kPayloadOffsetMask;
+  const uint64_t offset = t2_detail::decode_offset(payload_bits);
   const uint64_t read_only_offset = mem->read_only_offset.load(std::memory_order_acquire);
 
   // Fast-path immutable region (FASTER ReadOnlyOffset invariant):
@@ -194,7 +187,7 @@ auto try_in_place_update(T1 &tier1,
     }
     thread_local static std::vector<std::byte> tl_imm_buf;
     if (const auto imm_record =
-            vmemkv::try_read_immutable_record<ConfigT>(mem, res.payload_bits, ImmutableReader::kGet, &tl_imm_buf);
+            vmemkv::try_read_immutable_record<ConfigT>(mem, payload_bits, ImmutableReader::kGet, &tl_imm_buf);
         imm_record.has_value()) {
       if (!vmemkv::bytes_equal(imm_record->key, full_key)) {
         return {InPlaceOutcome::Aborted};

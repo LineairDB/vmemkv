@@ -40,10 +40,10 @@ inline auto sum_entries_t2_bytes(const EntryRange &entries) noexcept -> uint64_t
   return total;
 }
 
-// Append entries allowed before maintenance (50% of append capacity).
-inline auto maintenance_soft_threshold(size_t append_cap) noexcept -> size_t {
+// MemTable entries allowed before maintenance (50% of MemTable capacity).
+inline auto maintenance_soft_threshold(size_t memtable_cap) noexcept -> size_t {
   constexpr size_t kSoftThresholdPercent = 50;
-  return (append_cap * kSoftThresholdPercent) / kPercentScale;
+  return (memtable_cap * kSoftThresholdPercent) / kPercentScale;
 }
 
 // Retries reorganize() until `on_merged` fires. A racing concurrent reorganize() makes a call

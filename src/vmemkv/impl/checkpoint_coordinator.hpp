@@ -181,7 +181,7 @@ auto stream_filtered_shard(std::span<const EntrySnapshot> entries,
                            vmemkv::ShardedT1CheckpointWriter &writer) -> bool {
   auto is_post_target = [target](const EntrySnapshot &entry) noexcept {
     return entry.payload_bits != vmemkv::STORE_NOT_FOUND && !t1_detail::is_inline(entry.hash) &&
-           (entry.payload_bits & t2_detail::kPayloadOffsetMask) >= target;
+           t2_detail::decode_offset(entry.payload_bits) >= target;
   };
   if (std::ranges::none_of(entries, is_post_target)) {
     writer.add_shard(entries);

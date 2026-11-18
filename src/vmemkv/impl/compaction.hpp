@@ -4,7 +4,7 @@
 // Each T1 shard is sized to at most one T2 segment (8MiB). When a shard is queued dirty (at
 // insert time or at startup) or overlaps a frozen garbage segment (< 50% live bytes),
 // repack_dirty_shard() rewrites the shard's live entries contiguously in key order to the T2
-// append frontier. Fully evacuated segments below base_boundary are hole-punched after
+// tail_offset frontier. Fully evacuated segments below read_only_offset are hole-punched after
 // two-checkpoint coverage.
 #pragma once
 
@@ -86,7 +86,7 @@ inline auto punch_supported(CompactionState &state, const std::filesystem::path 
   return state.punch_supported.load(std::memory_order_relaxed);
 }
 
-// Punches fully-evacuated 8MiB segments below base_boundary (seg_live == 0).
+// Punches fully-evacuated 8MiB segments below read_only_offset (seg_live == 0).
 // Boundary-straddling records credit both segments in T2Ownership, so seg_live == 0
 // guarantees no live record starts in or overhangs into the segment. Stateless across
 // restarts: T2Ownership rebuilds seg_live from the checkpoint + WAL on startup.
@@ -181,8 +181,8 @@ auto collect_shard_payloads(std::span<const EntrySnapshot> entries,
     }
     auto group_begin = payloads.begin() + static_cast<std::ptrdiff_t>(group_start);
     std::sort(group_begin, payloads.end(), [&](uint64_t lhs, uint64_t rhs) {
-      const uint64_t loff = lhs & t2_detail::kPayloadOffsetMask;
-      const uint64_t roff = rhs & t2_detail::kPayloadOffsetMask;
+      const uint64_t loff = t2_detail::decode_offset(lhs);
+      const uint64_t roff = t2_detail::decode_offset(rhs);
       const std::span<const std::byte> lkey = T2FlatFile::at(loff, mem).key;
       const std::span<const std::byte> rkey = T2FlatFile::at(roff, mem).key;
       if (const auto ord = std::lexicographical_compare_three_way(lkey.begin(), lkey.end(), rkey.begin(), rkey.end());
@@ -194,27 +194,29 @@ auto collect_shard_payloads(std::span<const EntrySnapshot> entries,
     payloads.erase(std::unique(group_begin,
                                payloads.end(),
                                [&](uint64_t lhs, uint64_t rhs) {
-                                 return std::ranges::equal(
-                                     T2FlatFile::at(lhs & t2_detail::kPayloadOffsetMask, mem).key,
-                                     T2FlatFile::at(rhs & t2_detail::kPayloadOffsetMask, mem).key);
+                                 return std::ranges::equal(T2FlatFile::at(t2_detail::decode_offset(lhs), mem).key,
+                                                           T2FlatFile::at(t2_detail::decode_offset(rhs), mem).key);
                                }),
                    payloads.end());
   }
   return payloads;
 }
 
-template <typename EntrySnapshot>
-auto shard_pages_local(std::span<const EntrySnapshot> entries, const vmemkv::T2Memory *mem) -> bool {
-  const std::vector<uint64_t> payloads = collect_shard_payloads(entries, mem);
+inline auto payloads_broken_page_locality(std::span<const uint64_t> payloads) -> bool {
   for (size_t i = 1; i < payloads.size(); ++i) {
     if (!t2_detail::are_t2_payloads_page_local(payloads[i - 1], payloads[i])) {
-      return false;
+      return true;
     }
   }
-  return true;
+  return false;
 }
 
-// Relocates one live record (by current T2 offset) to the append frontier.
+template <typename EntrySnapshot>
+auto shard_pages_local(std::span<const EntrySnapshot> entries, const vmemkv::T2Memory *mem) -> bool {
+  return !payloads_broken_page_locality(collect_shard_payloads(entries, mem));
+}
+
+// Relocates one live record (by current T2 offset) to the tail_offset frontier.
 // Returns the moved record's aligned byte size, or 0 when the entry moved concurrently,
 // vanished, or went inline. When probe is non-null and the segment probe is enabled,
 // accumulates validation (stripe lock + T1 recheck), data movement (T2 append),
@@ -230,7 +232,7 @@ auto relocate_one(T1 &tier1,
                   const vmemkv::T2Memory *mem,
                   CompactionState *probe = nullptr) -> uint64_t {
   const bool measure = probe != nullptr && segment_probe_enabled();
-  const uint64_t old_off = target_payload & t2_detail::kPayloadOffsetMask;
+  const uint64_t old_off = t2_detail::decode_offset(target_payload);
 
   // Reuse the immutable-region read path (mmap for small/resident records, bounded pread() for
   // non-resident multi-page records below read_only_offset) with no stripe lock held across I/O;
@@ -247,7 +249,7 @@ auto relocate_one(T1 &tier1,
   std::lock_guard<std::mutex> key_lock(lock_stripe(key));
   const auto cur = tier1.get_with_hash(key);
   if (cur.payload_bits == vmemkv::STORE_NOT_FOUND || t1_detail::is_inline(cur.raw_hash) ||
-      (cur.payload_bits & t2_detail::kPayloadOffsetMask) != old_off) {
+      t2_detail::decode_offset(cur.payload_bits) != old_off) {
     return 0;
   }
   const auto validate_end = measure ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -295,15 +297,6 @@ auto entries_overlap_garbage_segment(std::span<const EntrySnapshot> entries,
   });
 }
 
-inline auto payloads_broken_page_locality(std::span<const uint64_t> payloads) -> bool {
-  for (size_t i = 1; i < payloads.size(); ++i) {
-    if (!t2_detail::are_t2_payloads_page_local(payloads[i - 1], payloads[i])) {
-      return true;
-    }
-  }
-  return false;
-}
-
 template <typename ConfigT>
 auto payloads_overlap_garbage_segment(std::span<const uint64_t> payloads,
                                       const T2Ownership<ConfigT> &own,
@@ -333,7 +326,7 @@ inline void prefetch_payload_batch(std::span<const uint64_t> batch,
   std::vector<PageRange> ranges;
   ranges.reserve(batch.size());
   for (uint64_t payload : batch) {
-    const uint64_t off = payload & t2_detail::kPayloadOffsetMask;
+    const uint64_t off = t2_detail::decode_offset(payload);
     if (off >= limit) {
       continue;
     }

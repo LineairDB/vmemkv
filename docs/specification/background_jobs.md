@@ -23,7 +23,7 @@ flowchart TB
         CKP[Checkpoint: Chunked msync 64MiB + Manifest + WAL Rotate]
         REP[Compaction: Unified T1-Shard Repack]
         PUN[Hole Punch: Epoch-Gated Segment Reclaim]
-        CKP -->|base_boundary / epoch advance| PUN
+        CKP -->|read_only_offset / epoch advance| PUN
         PUN -->|backlog cap| CKP
     end
 

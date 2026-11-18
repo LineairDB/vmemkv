@@ -58,7 +58,7 @@ class LockFreeHashTable {
 
   // `on_displaced` is invoked with the slot that publish_slot() bumps out when two callers race
   // to insert the same key (routine in T1: resolve()'s immutable-region bypass makes every
-  // concurrent put() for a key already in append_immutable_ take the "not found, insert new"
+  // concurrent put() for a key already in memtable_immutable_ take the "not found, insert new"
   // path). Without this callback, the loser's slot stays published and reachable by
   // collect_live_entries()/scan()'s raw slot-array walks even though this index can no longer
   // find it -- an orphaned-but-live duplicate that would keep accumulating and get carried into

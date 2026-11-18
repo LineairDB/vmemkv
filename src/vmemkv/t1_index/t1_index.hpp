@@ -505,7 +505,7 @@ class T1Index {
   }
 
  public:
-  // Merges append_active_ into sorted_region_; lock-free readers may run concurrently.
+  // Merges memtable_active_ into sorted_run_; lock-free readers may run concurrently.
   // - OffsetMapper: `void(span<EntrySnapshot> merged)` once, with the full deduped key-ordered
   //   live set. May rewrite `.payload_bits` in place (e.g. relocate a T2 offset), in any order --
   //   but must NOT reorder or resize `merged` (chk_writer and the SortedRegion built next both

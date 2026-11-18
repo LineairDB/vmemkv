@@ -382,13 +382,13 @@ flowchart TD
 - Checkpoint LSN selection: read `checkpoint_lsn = wal.next_lsn() - 1` once, **before** 4.3 step 2's writer stop. Since Insert / Update / Delete WAL-append after T1 / T2 application (3.2), operations already WAL-LSN-assigned at this read are guaranteed to have completed their T1/T2 application.
 - Underestimating the checkpoint LSN (conservative) is allowed: startup WAL tail replay reapplying entries already in the checkpoint is side-effect-free and safe under `T1Index::put()`'s overwrite-in-place semantics (idempotent).
 - Never overestimate the checkpoint LSN: it would skip valid updates unreflected in the checkpoint during tail replay, losing data.
-- Write `t2_bytes_used` = the frontier read after the T1 merge snapshot to the manifest only after `[old_base_boundary, target)`'s `msync(MS_SYNC)` succeeds. The manifest frontier therefore covers every offset the T1 snapshot names; the sparse clone copy bounded by it never truncates file-referenced bytes. Bytes past `target` are WAL-durable (not msync'd); adoption and clones cover them since T1 already points into them.
+- Write `t2_bytes_used` = the frontier read after the T1 merge snapshot to the manifest only after `[old_read_only_offset, target)`'s `msync(MS_SYNC)` succeeds. The manifest frontier therefore covers every offset the T1 snapshot names; the sparse clone copy bounded by it never truncates file-referenced bytes. Bytes past `target` are WAL-durable (not msync'd); adoption and clones cover them since T1 already points into them.
 - Until the manifest is `rename()`d onto its official path, never trust Tier 2 file contents beyond the manifest's `t2_bytes_used`, however physically written.
 - Tier 2's checkpoint file physically holding bytes (file size) only needs to be **at or above** the manifest's `t2_bytes_used` (capacity may expand ahead of live data).
 
 ### 5.4 T1 Checkpoint File Format (`t1_index.chk`)
 
-The T1 checkpoint file, like Tier 2, assumes "mmap and use immediately" — a parse-free flat array format serializing each of the K shards' `sorted_region` plus inter-shard boundary keys into one file.
+The T1 checkpoint file, like Tier 2, assumes "mmap and use immediately" — a parse-free flat array format serializing each of the K shards' `SortedRun` plus inter-shard boundary keys into one file.
 
 **File Layout**
 
