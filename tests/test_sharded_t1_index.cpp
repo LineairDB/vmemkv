@@ -53,8 +53,15 @@ struct ShardSnapshot {
 
 auto capture_all(TestIndex &idx) -> ShardSnapshot {
   ShardSnapshot out;
-  out.boundaries = idx.checkpoint_all_shards([&](std::span<const TestIndex::EntrySnapshot> merged) {
-    out.per_shard.emplace_back(merged.begin(), merged.end());
+  idx.with_checkpoint_shards([&](auto &context) {
+    const auto bounds = context.boundaries();
+    out.boundaries.assign(bounds.begin(), bounds.end());
+    std::vector<TestIndex::EntrySnapshot> dumped;
+    for (size_t i = 0; i < context.shard_count(); ++i) {
+      context.extract_shard(i, dumped, [&](std::span<const TestIndex::EntrySnapshot> merged) {
+        out.per_shard.emplace_back(merged.begin(), merged.end());
+      });
+    }
   });
   return out;
 }
@@ -506,7 +513,7 @@ TEST_CASE("ShardedT1Index: concurrent inserts trigger multiple automatic splits 
   check_scan_sorted_unique(*idx, 0, kTotalKeys, static_cast<size_t>(kTotalKeys), /*require_sorted=*/false);
 }
 
-TEST_CASE("ShardedT1Index: checkpoint_all_shards captures every live key across all shards") {
+TEST_CASE("ShardedT1Index: with_checkpoint_shards captures every live key across all shards") {
   auto idx = make_index();
   constexpr int kCount = 400;
   fill_sharded(*idx, kCount);
@@ -568,16 +575,11 @@ TEST_CASE("ShardedT1Index: checkpoint concurrent with put/get/scan/split loses n
     }
   });
 
-  std::vector<std::vector<TestIndex::EntrySnapshot>> per_shard;
-  std::vector<TestIndex::Key> boundaries;
   for (int round = 0; round < 5; ++round) {
-    per_shard.clear();
-    boundaries = idx->checkpoint_all_shards([&](std::span<const TestIndex::EntrySnapshot> merged) {
-      per_shard.emplace_back(merged.begin(), merged.end());
-    });
-    CHECK(boundaries.size() + 1 == per_shard.size());
+    const ShardSnapshot snapshot = capture_all(*idx);
+    CHECK(snapshot.boundaries.size() + 1 == snapshot.per_shard.size());
     size_t total_entries = 0;
-    for (const auto &shard_entries : per_shard) {
+    for (const auto &shard_entries : snapshot.per_shard) {
       total_entries += shard_entries.size();
     }
     CHECK(total_entries == static_cast<size_t>(kCount));

@@ -31,8 +31,8 @@ namespace sharded_detail {
 
 inline constexpr size_t kPercentScale = 100;
 
-inline auto split_threshold(size_t target_shard_size, uint32_t percent) noexcept -> size_t {
-  return (target_shard_size * percent) / kPercentScale;
+inline auto split_threshold(size_t target_shard_size) noexcept -> size_t {
+  return (target_shard_size * T1Config::kShardSplitThresholdPercent) / kPercentScale;
 }
 
 inline auto payload_t2_bytes(uint64_t payload_bits, bool is_inline) noexcept -> uint64_t {
@@ -73,7 +73,7 @@ class ShardedT1Index {
   using EntrySnapshot = Shard::EntrySnapshot;
 
   // `target_shard_size`: the one knob callers tune -- a shard's background maintenance splits
-  // it past `shard_split_threshold_percent`% of this target
+  // it past T1Config::kShardSplitThresholdPercent% of this target
   // (see docs/specification/t1_sharding_design.md).
   // `worker_threads`: background maintenance pool size; defaults to a quarter of hardware
   // concurrency (cores stay reserved for foreground traffic). 0 defers startup (see
@@ -82,12 +82,8 @@ class ShardedT1Index {
   explicit ShardedT1Index(size_t memtable_cap = T1Config::kMemTableCapacityEntries,
                           size_t target_shard_size = T1Config::kShardTargetSizeEntries,
                           size_t worker_threads = default_worker_count(),
-                          uint32_t shard_split_threshold_percent = T1Config::kShardSplitThresholdPercent,
                           uint64_t segment_bytes = T2Config::kSegmentBytes)
-      : memtable_cap_(memtable_cap),
-        target_shard_size_(target_shard_size),
-        split_threshold_percent_(shard_split_threshold_percent),
-        segment_bytes_(segment_bytes) {
+      : memtable_cap_(memtable_cap), target_shard_size_(target_shard_size), segment_bytes_(segment_bytes) {
     auto *slot = new ShardSlot(std::make_unique<Shard>(epoch_domain_, memtable_cap));
     auto *dir = new Directory();
     dir->shards.push_back(slot);
@@ -287,7 +283,7 @@ class ShardedT1Index {
     ShardSlot *target = with_routing_guard([&]() -> ShardSlot * {
       ShardSlot *slot = resolve(prefix);
       if (splits_paused_.load(std::memory_order_acquire) != 0 || slot->split_paused.load(std::memory_order_seq_cst)) {
-        return slot;  // checkpoint_all_shards() in progress -- see its own comment. No-op.
+        return slot;  // with_checkpoint_shards() in progress -- see its own comment. No-op.
       }
       Split *expected = nullptr;
       claimed = slot->superseded.compare_exchange_strong(expected, kClosingSentinel, std::memory_order_seq_cst);
@@ -302,52 +298,31 @@ class ShardedT1Index {
     }
   }
 
-  // Captures every shard's live entries (merging when MemTables are non-empty) and invokes
-  // `per_shard_writer` per shard in ascending key order. Returns boundary keys for
-  // load_from_checkpoint().
-  //
-  // Splits pause for the whole call (directory stays stable); in-flight splits still complete,
-  // so touched shards are held by outside_refs, not one long guard. Only the directory snapshot
-  // is taken guarded. Non-splitting maintenance still runs concurrently: reorganize() blocks on
-  // reorg_in_progress_ against any in-flight maintenance merge and always runs its callback.
-  template <typename PerShardWriter>
-  auto checkpoint_all_shards(PerShardWriter per_shard_writer) -> std::vector<Key> {
-    std::vector<Key> out_boundaries;
-    with_checkpoint_shards(
-        [&](auto &context) {
-          const auto bounds = context.boundaries();
-          out_boundaries.assign(bounds.begin(), bounds.end());
-          std::vector<EntrySnapshot> dumped;
-          for (size_t idx = 0; idx < context.shard_count(); ++idx) {
-            t1_debug::g_checkpoint_current_shard.store(idx + 1, std::memory_order_release);
-            context.extract_shard(idx, dumped, per_shard_writer);
-          }
-          t1_debug::g_checkpoint_current_shard.store(0, std::memory_order_release);
-        },
-        /*advance_epoch=*/false);
-    return out_boundaries;
-  }
-
   struct CheckpointContext;
 
-  // Captures a split-paused snapshot of live shards. When `advance_epoch` is true, advances
-  // checkpoint_write_epoch_ and drains in-flight routing-guarded writes before invoking `func`.
+  // Captures a split-paused snapshot of live shards, advances checkpoint_write_epoch_, and
+  // drains in-flight routing-guarded writes before invoking `func`.
+  //
+  // Splits pause for the whole call (directory stays stable); in-flight splits still complete,
+  // so touched shards are held by outside_refs, not one long guard. Non-splitting maintenance
+  // still runs concurrently: reorganize() blocks on reorg_in_progress_ against any in-flight
+  // maintenance merge and always runs its callback.
   template <typename Func>
-  void with_checkpoint_shards(Func &&func, bool advance_epoch = true) {
+  void with_checkpoint_shards(Func &&func) {
     SplitPause pause(splits_paused_);
     wait_until_no_split();
 
-    uint64_t active_epoch = checkpoint_write_epoch_.load(std::memory_order_acquire);
-    if (advance_epoch) {
-      active_epoch = checkpoint_write_epoch_.fetch_add(1, std::memory_order_acq_rel);
-      const uint64_t bumped_routing = epoch_domain_.epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
-      epoch_domain_.tracker.wait_until_epoch(bumped_routing);
-    }
+    const uint64_t active_epoch = checkpoint_write_epoch_.fetch_add(1, std::memory_order_acq_rel);
+    const uint64_t bumped_routing = epoch_domain_.epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
+    epoch_domain_.tracker.wait_until_epoch(bumped_routing);
 
     PinnedShards pinned = pin_shards(/*skip_superseded=*/false,
                                      /*only_pending_memtables=*/false,
                                      /*copy_boundaries=*/true);
 
+    struct DebugShardReset {
+      ~DebugShardReset() { t1_debug::g_checkpoint_current_shard.store(0, std::memory_order_release); }
+    } reset_guard;
     t1_debug::g_checkpoint_total_shards.store(pinned.slots.size(), std::memory_order_release);
     CheckpointContext context{*this, pinned.slots, pinned.boundaries, active_epoch};
     func(context);
@@ -566,7 +541,7 @@ class ShardedT1Index {
     ShardSlot *high = nullptr;
   };
 
-  // Split pause is a refcount, not a flag: checkpoint_all_shards() pauses splits
+  // Split pause is a refcount, not a flag: with_checkpoint_shards() pauses splits
   // for its duration and resumes when the last guard exits.
   struct SplitPause {
     std::atomic<int> *count = nullptr;
@@ -624,21 +599,17 @@ class ShardedT1Index {
     }
     template <typename OnEntries>
     void extract_shard(size_t index, std::vector<EntrySnapshot> &dumped, OnEntries &&on_entries) const {
-      owner.extract_shard_for_checkpoint(
-          shards[index], index + 1, shards.size(), dumped, std::forward<OnEntries>(on_entries));
+      t1_debug::g_checkpoint_current_shard.store(index + 1, std::memory_order_release);
+      owner.extract_shard_for_checkpoint(shards[index], dumped, std::forward<OnEntries>(on_entries));
     }
     void mark_persisted(size_t index) const noexcept { shards[index]->persisted_epoch = snapshot_epoch; }
   };
 
  private:
   template <typename PerShardWriter>
-  // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
   void extract_shard_for_checkpoint(ShardSlot *slot,
-                                    size_t shard_idx,
-                                    size_t total_shards,
                                     std::vector<EntrySnapshot> &dumped,
                                     PerShardWriter &&per_shard_writer) {
-    const auto shard_start = std::chrono::steady_clock::now();
     // Merge-free shortcut: an empty active append means the merge output is the sorted
     // region as-is (same order, same tombstone-skipping) -- but only when no merge is
     // in flight (an in-flight reorganize() has frozen the previous active into immutable,
@@ -657,11 +628,6 @@ class ShardedT1Index {
         record_merged_shard(slot, merged);
         per_shard_writer(merged);
       });
-    }
-    const auto shard_elapsed = std::chrono::steady_clock::now() - shard_start;
-    if (shard_elapsed > std::chrono::seconds(1)) {
-      std::cerr << "[checkpoint_all_shards] Shard " << shard_idx << "/" << total_shards << " took "
-                << std::chrono::duration_cast<std::chrono::milliseconds>(shard_elapsed).count() << "ms\n";
     }
   }
 
@@ -744,8 +710,7 @@ class ShardedT1Index {
     if (entry_count < 2) {
       return false;
     }
-    return entry_count >= sharded_detail::split_threshold(target_shard_size_, split_threshold_percent_) ||
-           t2_bytes >= segment_bytes_;
+    return entry_count >= sharded_detail::split_threshold(target_shard_size_) || t2_bytes >= segment_bytes_;
   }
 
   // Queue ownership shared by maintenance and dirty-shard compaction queues.
@@ -1265,14 +1230,13 @@ class ShardedT1Index {
   std::atomic<Directory *> directory_{nullptr};
   size_t memtable_cap_;
   size_t target_shard_size_;
-  uint32_t split_threshold_percent_;
   uint64_t segment_bytes_;
   ShardQueue<&ShardSlot::maintenance_pending> queue_;
   ShardQueue<&ShardSlot::t2_dirty> dirty_queue_;
   std::atomic<size_t> active_dirty_visits_{0};
   std::atomic<size_t> compaction_cursor_{0};
   std::vector<std::jthread> workers_;
-  // Set for checkpoint_all_shards()' duration: directory stays stable (splits initiate only
+  // Set for with_checkpoint_shards()' duration: directory stays stable (splits initiate only
   // at the Closing CAS, which checks this); in-flight splits are unaffected.
   std::atomic<int> splits_paused_{0};
   std::atomic<size_t> active_maintenance_{0};

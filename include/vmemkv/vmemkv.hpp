@@ -85,12 +85,42 @@ inline auto encode_key(I value) noexcept -> std::array<std::byte, sizeof(I)> {
   std::memcpy(out.data(), &encoded, sizeof(I));
   return out;
 }
+template <typename I>
+inline auto encode_val(I value) noexcept -> std::array<std::byte, kEncodedValueBytes> {
+  auto encoded = static_cast<uint64_t>(value);
+  if constexpr (std::endian::native == std::endian::big) {
+    encoded = std::byteswap(encoded);
+  }
+  std::array<std::byte, kEncodedValueBytes> out{};
+  std::memcpy(out.data(), &encoded, kEncodedValueBytes);
+  return out;
+}
 template <typename T>
 inline auto to_span(const T &value) noexcept -> std::span<const std::byte> {
   if constexpr (is_bytes_v<T>) {
     return std::as_bytes(std::span(value));
   } else {
     return {reinterpret_cast<const std::byte *>(std::string_view(value).data()), std::string_view(value).size()};
+  }
+}
+template <typename T>
+inline auto serialize_key(const T &value) {
+  if constexpr (std::is_integral_v<std::decay_t<T>>) {
+    return encode_key(value);
+  } else if constexpr (is_raw_v<T>) {
+    return to_span(value);
+  } else {
+    return serialize_kvs(value);  // ADL
+  }
+}
+template <typename T>
+inline auto serialize_val(const T &value) {
+  if constexpr (std::is_integral_v<std::decay_t<T>>) {
+    return encode_val(value);
+  } else if constexpr (is_raw_v<T>) {
+    return to_span(value);
+  } else {
+    return serialize_kvs(value);  // ADL
   }
 }
 }  // namespace detail
@@ -114,24 +144,24 @@ class VMemKVStore {
   // Inserts key/value; false when the key exists. See docs/specification/low_level_design.md 3.2.
   template <typename K, typename V>
   [[nodiscard]] auto insert(const K &key, V &&value) -> bool {
-    return insert_bytes(key_bytes(key), val_bytes(std::forward<V>(value)));
+    return insert_bytes(detail::serialize_key(key), detail::serialize_val(value));
   }
   // Updates value in place or by append; false when the key is absent.
   // See docs/specification/low_level_design.md 3.3.
   template <typename K, typename V>
   [[nodiscard]] auto update(const K &key, V &&value) -> bool {
-    return update_bytes(key_bytes(key), val_bytes(std::forward<V>(value)));
+    return update_bytes(detail::serialize_key(key), detail::serialize_val(value));
   }
   // Removes key via tombstone; false when absent. See docs/specification/low_level_design.md 3.4.
   template <typename K>
   [[nodiscard]] auto remove(const K &key) -> bool {
-    return remove_bytes(key_bytes(key));
+    return remove_bytes(detail::serialize_key(key));
   }
   // Gets value via callback; false when absent. Span lives for the callback only.
   // See docs/specification/low_level_design.md 3.1.
   template <typename K, typename C>
   [[nodiscard]] auto get(const K &key, C callback) const -> bool {
-    auto key_span = key_bytes(key);
+    auto key_span = detail::serialize_key(key);
     return get_bytes(key_span, &callback, [](void *context, std::span<const std::byte> value) {
       (*static_cast<C *>(context))(value);
     });
@@ -140,8 +170,8 @@ class VMemKVStore {
   // See docs/specification/low_level_design.md 3.5.
   template <typename L, typename H, typename C>
   [[nodiscard]] auto scan(const L &lower, const H &upper, C callback) const -> size_t {
-    auto lower_span = key_bytes(lower);
-    auto upper_span = key_bytes(upper);
+    auto lower_span = detail::serialize_key(lower);
+    auto upper_span = detail::serialize_key(upper);
     return scan_bytes(lower_span,
                       upper_span,
                       &callback,
@@ -171,33 +201,6 @@ class VMemKVStore {
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
-
-  template <typename T>
-  static auto key_bytes(const T &value) {
-    if constexpr (std::is_integral_v<std::decay_t<T>>) {
-      return detail::encode_key(value);
-    } else if constexpr (detail::is_raw_v<T>) {
-      return detail::to_span(value);
-    } else {
-      return serialize_kvs(value);
-    }
-  }
-  template <typename T>
-  static auto val_bytes(const T &value) {
-    if constexpr (std::is_integral_v<std::decay_t<T>>) {
-      auto encoded = static_cast<uint64_t>(value);
-      if constexpr (std::endian::native == std::endian::big) {
-        encoded = std::byteswap(encoded);
-      }
-      std::array<std::byte, detail::kEncodedValueBytes> out{};
-      std::memcpy(out.data(), &encoded, detail::kEncodedValueBytes);
-      return out;
-    } else if constexpr (detail::is_raw_v<T>) {
-      return detail::to_span(value);
-    } else {
-      return serialize_kvs(value);
-    }
-  }
 
   auto insert_bytes(std::span<const std::byte> key, std::span<const std::byte> value) -> bool;
   auto update_bytes(std::span<const std::byte> key, std::span<const std::byte> value) -> bool;

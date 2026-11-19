@@ -47,7 +47,6 @@ struct CheckpointState {
   std::atomic<bool> running{false};
   std::vector<T1ChunkMeta> t1_chunks;
   uint64_t next_t1_chunk_id{1};
-  uint64_t t1_chunk_split_bytes{0};
   CheckpointStats stats;
 };
 
@@ -136,19 +135,16 @@ auto capture_checkpoint_target(T2FlatFile &tier2,
 
 // msync()'s addr must be page-aligned; old_read_only_offset is only block-aligned. Rounding
 // down re-syncs a small already-durable overlap -- harmless, msync() is idempotent.
-// Synchronizes in chunks (`chunk_bytes`) and yields between chunks to avoid
+// Synchronizes in chunks (`T2Config::kMsyncChunkBytes`) and yields between chunks to avoid
 // monopolizing kernel writeback and stalling concurrent foreground operations.
-inline void msync_target_range(const T2Memory *mem,
-                               uint64_t old_read_only_offset,
-                               uint64_t target,
-                               uint64_t chunk_bytes = T2Config::kMsyncChunkBytes) {
+inline void msync_target_range(const T2Memory *mem, uint64_t old_read_only_offset, uint64_t target) {
   if (target <= old_read_only_offset) {
     return;
   }
   const uint64_t page_size = t2_detail::os_page_size();
   const uint64_t aligned_start = old_read_only_offset - (old_read_only_offset % page_size);
   for (uint64_t cur = aligned_start; cur < target;) {
-    const uint64_t cur_len = std::min(chunk_bytes, target - cur);
+    const uint64_t cur_len = std::min(T2Config::kMsyncChunkBytes, target - cur);
     const int msync_rc = ::msync(mem->reads.random_mmap + cur, cur_len, MS_SYNC);
     if (msync_rc != 0) {
       throw std::system_error(errno, std::generic_category(), "msync t2 checkpoint");
@@ -330,11 +326,9 @@ inline auto publish_t1_checkpoint_and_manifest(CheckpointState &state,
                                                uint64_t checkpoint_lsn,
                                                uint64_t target,
                                                std::chrono::nanoseconds &t1_write_phase,
-                                               uint64_t default_t1_chunk_split_bytes = T1Config::kT1ChunkSplitBytes)
+                                               uint64_t t1_chunk_split_bytes = T1Config::kT1ChunkSplitBytes)
     -> std::chrono::nanoseconds {
   using EntrySnapshot = ShardedT1Index::EntrySnapshot;
-  const uint64_t split_bytes =
-      state.t1_chunk_split_bytes > 0 ? state.t1_chunk_split_bytes : default_t1_chunk_split_bytes;
   const std::filesystem::path t1_dir = vmemkv::derive_t1_chk_path(t2_path);
   std::filesystem::create_directories(t1_dir);
 
@@ -342,7 +336,8 @@ inline auto publish_t1_checkpoint_and_manifest(CheckpointState &state,
   std::chrono::nanoseconds t1_elapsed{0};
 
   tier1.with_checkpoint_shards([&](auto &context) {
-    T1ChunkEmitter emit{t1_dir, target, split_bytes, state.next_t1_chunk_id, t1_write_phase, {}, 0, {}, {}, {}, {}};
+    T1ChunkEmitter emit{
+        t1_dir, target, t1_chunk_split_bytes, state.next_t1_chunk_id, t1_write_phase, {}, 0, {}, {}, {}, {}};
     try {
       const auto groups = map_prev_chunks_to_shards(state.t1_chunks, context);
       emit.staged_chunks.reserve(groups.size());
@@ -353,7 +348,7 @@ inline auto publish_t1_checkpoint_and_manifest(CheckpointState &state,
         const ShardChunkGroup *next_group = (g_idx + 1 < groups.size()) ? &groups[g_idx + 1] : nullptr;
         const bool coalesce_clean =
             group.prev_chunk != nullptr && next_group != nullptr &&
-            should_coalesce_with_next(group.prev_chunk->approx_bytes, false, *next_group, split_bytes);
+            should_coalesce_with_next(group.prev_chunk->approx_bytes, false, *next_group, t1_chunk_split_bytes);
         if (emit.writer == nullptr && !group.dirty && !coalesce_clean) {
           emit.staged_chunks.push_back(*group.prev_chunk);
           continue;
@@ -479,8 +474,7 @@ void checkpoint_internal(CheckpointState &state,
     const vmemkv::T2Memory *mem = tier2.get_memory();
     const auto msync_start = std::chrono::steady_clock::now();
     g_checkpoint_debug_phase.store("checkpoint: msync_target_range", std::memory_order_release);
-    msync_target_range(
-        mem, checkpoint_target.old_read_only_offset, checkpoint_target.target, options.msync_chunk_bytes);
+    msync_target_range(mem, checkpoint_target.old_read_only_offset, checkpoint_target.target);
     msync_phase = std::chrono::steady_clock::now() - msync_start;
 
     pre_finish_hook();

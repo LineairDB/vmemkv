@@ -220,13 +220,17 @@ constexpr uint64_t kStoreCapacityBytes = 64ULL * 1024 * 1024;
 
 namespace {
 struct TinyShardImpl : vmemkv::VMemKVImpl {
-  static auto make_options() -> vmemkv::StoreOptions {
+  static auto make_options(uint64_t t1_chunk_split_bytes) -> vmemkv::StoreOptions {
     vmemkv::StoreOptions opts;
     opts.memtable_capacity_entries = size_t{1} << 10;
     opts.shard_target_size_entries = 50;  // Forces splits well before kKeyCount below.
+    opts.t1_chunk_split_bytes = t1_chunk_split_bytes;
     return opts;
   }
-  TinyShardImpl(const std::filesystem::path &path, uint64_t capacity) : VMemKVImpl(path, capacity, make_options()) {}
+  explicit TinyShardImpl(const std::filesystem::path &path,
+                         uint64_t capacity,
+                         uint64_t t1_chunk_split_bytes = vmemkv::T1Config::kT1ChunkSplitBytes)
+      : VMemKVImpl(path, capacity, make_options(t1_chunk_split_bytes)) {}
 };
 using VMemKV_TinyShard = vmemkv::StoreAdapter<TinyShardImpl>;
 }  // namespace
@@ -561,8 +565,7 @@ TEST_CASE("checkpoint: chunked T1 splits, preserves clean chunks, merges after d
   size_t shard_count_final = 0;
   std::vector<vmemkv::T1ChunkMeta> chunks_after_merge;
   {
-    auto store = std::make_unique<VMemKV_TinyShard>(path, kStoreCapacityBytes);
-    store->impl().set_t1_chunk_split_bytes_for_test(4096);
+    auto store = std::make_unique<VMemKV_TinyShard>(path, kStoreCapacityBytes, 4096);
     for (int i = 0; i < kKeyCount; ++i) {
       REQUIRE(store->insert(kKeyFor(i), vmemkv_test::indexed_value(i)));
     }

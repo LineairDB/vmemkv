@@ -101,7 +101,6 @@ class VMemKVImpl {
         t1_(options_.memtable_capacity_entries,
             options_.shard_target_size_entries,
             /*worker_threads=*/0,
-            options_.shard_split_threshold_percent,
             options_.segment_bytes),
         t2_(t2_path, t2_bytes_capacity, adopted_t2_bytes_used(t2_path)),
         wal_(vmemkv::derive_wal_path(t2_path)),
@@ -179,9 +178,6 @@ class VMemKVImpl {
   auto t2() noexcept -> vmemkv::T2FlatFile & { return t2_; }
   auto t2() const noexcept -> const vmemkv::T2FlatFile & { return t2_; }
   auto compaction_probe_state() const noexcept -> const vmemkv::CompactionState & { return compact_; }
-  void set_t1_chunk_split_bytes_for_test(uint64_t split_bytes) noexcept {
-    checkpoint_.t1_chunk_split_bytes = split_bytes;
-  }
   auto t1_checkpoint_chunks() const -> std::vector<vmemkv::T1ChunkMeta> { return checkpoint_.t1_chunks; }
   auto pending_segment_count() const -> size_t {
     const T2Memory *mem = t2_.get_memory();

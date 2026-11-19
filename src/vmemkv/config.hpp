@@ -53,12 +53,9 @@ enum class ReadPolicy : std::uint8_t {
 struct StoreOptions {
   size_t memtable_capacity_entries = T1Config::kMemTableCapacityEntries;
   size_t shard_target_size_entries = T1Config::kShardTargetSizeEntries;
-  uint32_t shard_split_threshold_percent = T1Config::kShardSplitThresholdPercent;
   uint64_t t1_chunk_split_bytes = T1Config::kT1ChunkSplitBytes;
   uint64_t segment_bytes = T2Config::kSegmentBytes;
-  uint64_t compaction_max_move_bytes_per_cycle = T2Config::kCompactionMaxMoveBytesPerCycle;
   uint64_t punch_backlog_checkpoint_cap_segments = T2Config::kPunchBacklogCheckpointCapSegments;
-  uint64_t msync_chunk_bytes = T2Config::kMsyncChunkBytes;
   size_t wal_max_bytes_since_checkpoint = WalConfig::kMaxBytesSinceCheckpoint;
   ReadPolicy read_policy = ReadPolicy::Adaptive;
 };

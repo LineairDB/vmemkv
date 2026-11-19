@@ -509,12 +509,12 @@ auto compact_cycle(CompactionState &state,
   if (had_dirty_shard) {
     tier1.for_each_dirty_shard([&](std::span<const EntrySnapshot> entries) -> bool {
       repack_dirty_shard(state, entries, tier1, tier2, own, lock_stripe, mem, options.read_policy, progress);
-      return progress.moved_bytes < options.compaction_max_move_bytes_per_cycle;
+      return progress.moved_bytes < T2Config::kCompactionMaxMoveBytesPerCycle;
     });
   }
   const auto dirty_end = measure ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
-  if (progress.moved_bytes < options.compaction_max_move_bytes_per_cycle) {
+  if (progress.moved_bytes < T2Config::kCompactionMaxMoveBytesPerCycle) {
     const uint64_t read_only = mem->read_only_offset.load(std::memory_order_acquire);
     const uint64_t tail = mem->tail_offset.load(std::memory_order_acquire);
     if (own.has_garbage_segment(read_only, tail)) {
@@ -530,7 +530,7 @@ auto compact_cycle(CompactionState &state,
                                options.read_policy,
                                progress,
                                /*check_page_locality=*/false);
-            return progress.moved_bytes < options.compaction_max_move_bytes_per_cycle;
+            return progress.moved_bytes < T2Config::kCompactionMaxMoveBytesPerCycle;
           });
       if (completed_all_shards) {
         own.clear_garbage_segments(read_only, tail);

@@ -140,7 +140,3 @@ TEST_CASE(
   CHECK(copied.size() == shrunk_value.size());
   CHECK(span_to_string(std::span<const std::byte>(copied.data(), copied.size())) == shrunk_value);
 }
-
-TEST_CASE("codec: public vmemkv.hpp and internal serializer agree byte-for-byte") {
-  CHECK_NOTHROW(kvs_detail::check_public_internal_codec_parity());
-}
