@@ -52,12 +52,12 @@ flowchart TB
 `quadfecta::Policy` lets callers pin every read to a single mechanism (useful for controlled comparison benchmarks or constrained environments):
 
 - `Policy::RandomOnly`: Always returns `random_mmap`.
-- `Policy::SeqOnly`: Returns `sequential_mmap`, falling back to `random_mmap` if secondary setup failed.
-- `Policy::NormalOnly`: Returns `normal_mmap`, falling back to `random_mmap` if secondary setup failed.
-- `Policy::PreadOnly`: Always executes `::pread()` via `pread_fd` (using caller `scratch`, or a `thread_local` scratch vector if `scratch == nullptr`).
+- `Policy::SeqOnly`: Returns `sequential_mmap` (lazily mapped on first use), falling back to `random_mmap` if secondary setup failed.
+- `Policy::NormalOnly`: Returns `normal_mmap` (lazily mapped on first use), falling back to `random_mmap` if secondary setup failed.
+- `Policy::PreadOnly`: Always executes `::pread()` via the independent `POSIX_FADV_RANDOM` `pread_fd` (using caller `scratch`, or a `thread_local` scratch vector if `scratch == nullptr`).
 - Under `Policy::Adaptive`:
-  - `Access::Sequential` selects `sequential_mmap` (`<= page_size()`) or `normal_mmap` (`> page_size()`), and falls back to `random_mmap` if the preferred secondary mapping is `nullptr`.
-  - `Access::Random` with `max_bytes > page_size()` requires a non-null caller `scratch`; if `scratch == nullptr` or `pread_fd < 0`, `view_at_most()` returns `std::nullopt` so the caller can invoke its own fallback path.
+  - `Access::Sequential` lazily materializes `sequential_mmap` (`<= page_size()`) or `normal_mmap` (`> page_size()`), and falls back to `random_mmap` if the preferred secondary mapping is `nullptr`.
+  - `Access::Random` with `max_bytes > page_size()` executes bounded `::pread()` via `pread_fd` (using caller `scratch`, or a `thread_local` fallback vector if `scratch == nullptr`). Use `read_into()` to write directly into a caller buffer without scratch copies.
 
 ---
 
@@ -98,14 +98,15 @@ Any system adopting `quadfecta::MappedReader` must satisfy three external invari
 | --- | --- |
 | `quadfecta::Access` | `Random` (point lookup) / `Sequential` (contiguous scan) |
 | `quadfecta::Policy` | `Adaptive` (default) or explicit `RandomOnly`, `SeqOnly`, `NormalOnly`, `PreadOnly` |
-| `MappedReader::open_readonly(path)` | Opens a read-only file, maps `random_mmap`, attaches secondary handles best-effort |
+| `MappedReader::open_readonly(path)` | Opens a read-only file, maps `random_mmap`, attaches independent `POSIX_FADV_RANDOM` `pread_fd` |
 | `MappedReader::open_readonly_fd(fd)` | Wraps an existing read-only regular FD (non-owning of caller `fd`) |
 | `MappedReader(primary_random_mmap, capacity)` | Adopts an existing primary `MADV_RANDOM` mapping (owned and unmapped on destruction) |
-| `open_secondary_handles(fd)` | Best-effort maps `normal_mmap`, `sequential_mmap`, and `F_DUPFD_CLOEXEC` `pread_fd` |
+| `open_secondary_handles(fd)` | Attaches independent `POSIX_FADV_RANDOM` `pread_fd` (`/proc/self/fd`) and FD for lazy `normal_mmap`/`sequential_mmap` |
 | `read(offset, size, access, scratch, policy)` | Fixed-size read returning exact `size` bytes or `std::nullopt` |
+| `read_into(offset, size, dst, access, policy)` | Directly populates caller-owned `dst` via `::pread()` (Q2/`PreadOnly`) or `memcpy()` without scratch copies |
 | `read_at_index(index, stride, access, scratch, policy, base)` | Indexed fixed-stride record read at `base + index * stride` |
 | `view_at_most(offset, max_bytes, valid_end, access, scratch, policy)` | Variable-length read returning mmap tail up to `min(valid_end, capacity())` or bounded `pread()` |
-| `prefetch(offset, len)` | Best-effort `MADV_WILLNEED` readahead trigger on `random_mmap` |
+| `prefetch(offset, len, access, policy)` | Best-effort `MADV_WILLNEED` trigger (skipped for `PreadOnly` and `Access::Random` with `len > page_size()`) |
 | `quadfecta::Cursor(reader, begin, end)` | Positional sequential stream cursor (`read_next`, `peek_at_most`, `advance`, `seek`) |
 | `quadfecta::records(reader, stride, scratch, policy, begin, end)` | C++20 input range over exact `stride`-byte sequential records (`Access::Sequential`) |
 | `quadfecta::chunks(reader, chunk_bytes, scratch, policy, begin, end)` | C++20 input range over sequential chunks up to `chunk_bytes` (allows partial final tail) |

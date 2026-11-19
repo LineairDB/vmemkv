@@ -3,14 +3,15 @@
 // Maintains up to four OS views over the same backing file, selecting one per read by
 // (Access, size <= page_size, Policy):
 // - Random     + <= page: MADV_RANDOM mmap (zero-copy, no readahead pollution)
-// - Random     +  > page: bounded pread() (avoids minor-fault / VM overhead on large gets)
-// - Sequential + <= page: MADV_SEQUENTIAL mmap (wide kernel readahead)
-// - Sequential +  > page: normal mmap (default kernel readahead)
+// - Random     +  > page: bounded pread() via independent fd + POSIX_FADV_RANDOM
+// - Sequential + <= page: MADV_SEQUENTIAL mmap (wide kernel readahead, lazy VMA)
+// - Sequential +  > page: normal mmap (default kernel readahead, lazy VMA)
 //
 // Dependencies: C++20/23 STL + Linux POSIX (<fcntl.h>, <sys/mman.h>, <sys/stat.h>, <unistd.h>).
-// Thread safety: all const read methods are lock-free and thread-safe when callers supply their
-// own `scratch` buffer (for Policy::PreadOnly with scratch == nullptr, a thread_local buffer is
-// used). Any concurrent writes to the backing file must be externally bounded below `valid_end`.
+// Thread safety: all const read methods are lock-free on the hot path and thread-safe when callers
+// supply their own `scratch` buffer or `read_into()` destination (when `scratch == nullptr`, both
+// Policy::PreadOnly and Policy::Adaptive fall back to a thread_local buffer). Any concurrent writes
+// to the backing file must be externally bounded below `valid_end`.
 #pragma once
 
 #include <fcntl.h>
@@ -19,12 +20,18 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <iterator>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <system_error>
@@ -54,7 +61,7 @@ class MappedReader {
   MappedReader() noexcept = default;
 
   // Adopts an existing primary MADV_RANDOM mapping of `capacity` bytes (owned and unmapped on
-  // destruction). Call open_secondary_handles(fd) to attach scan mmaps and pread_fd.
+  // destruction). Call open_secondary_handles(fd) to attach lazy scan mmaps and pread_fd.
   // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
   explicit MappedReader(std::byte *primary_random_mmap, uint64_t capacity) noexcept
       : random_mmap_(primary_random_mmap), capacity_(capacity) {}
@@ -77,9 +84,7 @@ class MappedReader {
   friend void swap(MappedReader &lhs, MappedReader &rhs) noexcept {
     using std::swap;
     swap(lhs.random_mmap_, rhs.random_mmap_);
-    swap(lhs.sequential_mmap_, rhs.sequential_mmap_);
-    swap(lhs.normal_mmap_, rhs.normal_mmap_);
-    swap(lhs.pread_fd_, rhs.pread_fd_);
+    swap(lhs.sec_, rhs.sec_);
     swap(lhs.capacity_, rhs.capacity_);
   }
 
@@ -87,6 +92,206 @@ class MappedReader {
   // Does not take ownership of `file_descriptor` (caller keeps responsibility for closing it).
   // Throws std::system_error if fstat or mapping the primary random view fails; secondary views are best-effort.
   [[nodiscard]] static auto open_readonly_fd(int file_descriptor) -> MappedReader {
+    return open_readonly_fd_impl(file_descriptor, nullptr);
+  }
+
+  // Opens an immutable/read-only file and sets up primary MADV_RANDOM mmap + independent
+  // POSIX_FADV_RANDOM pread_fd (secondary scan VMAs are materialized lazily on first use).
+  [[nodiscard]] static auto open_readonly(const std::filesystem::path &path) -> MappedReader {
+    const int file_descriptor = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (file_descriptor < 0) {
+      throw std::system_error(errno, std::generic_category(), "quadfecta open");
+    }
+    try {
+      MappedReader reader = open_readonly_fd_impl(file_descriptor, &path);
+      ::close(file_descriptor);
+      return reader;
+    } catch (...) {
+      ::close(file_descriptor);
+      throw;
+    }
+  }
+
+  // Best-effort setup of secondary read handles: attaches an independent POSIX_FADV_RANDOM
+  // pread_fd and retains a read-only fd to lazily map normal_mmap/sequential_mmap on demand.
+  // Idempotent when called repeatedly; safe across threads.
+  void open_secondary_handles(int file_descriptor) noexcept {
+    open_secondary_handles_impl(file_descriptor, nullptr);
+  }
+
+  [[nodiscard]] static auto page_size() noexcept -> uint64_t {
+    static const auto kCached = static_cast<uint64_t>(::sysconf(_SC_PAGESIZE));
+    return kCached;
+  }
+
+  [[nodiscard]] auto mapping_for(Access access,
+                                 bool is_small,
+                                 Policy policy = Policy::Adaptive) const noexcept -> std::byte * {
+    switch (policy) {
+      case Policy::RandomOnly:
+        return random_mmap_;
+      case Policy::SeqOnly: {
+        std::byte *seq = ensure_sequential_mmap();
+        return seq != nullptr ? seq : random_mmap_;
+      }
+      case Policy::NormalOnly: {
+        std::byte *norm = ensure_normal_mmap();
+        return norm != nullptr ? norm : random_mmap_;
+      }
+      case Policy::PreadOnly:
+        return nullptr;
+      case Policy::Adaptive:
+        break;
+    }
+    if (access == Access::Sequential) {
+      std::byte *preferred = is_small ? ensure_sequential_mmap() : ensure_normal_mmap();
+      return preferred != nullptr ? preferred : random_mmap_;
+    }
+    return is_small ? random_mmap_ : nullptr;
+  }
+
+  // Reads exactly `size` bytes at `offset`. Uses zero-copy mmap when selected, or copies into
+  // `scratch` via pread(). Returns std::nullopt on out-of-bounds or I/O error.
+  // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+  [[nodiscard]] auto read(uint64_t offset,
+                          uint64_t size,
+                          Access access,
+                          std::vector<std::byte> *scratch,
+                          Policy policy = Policy::Adaptive) const -> std::optional<std::span<const std::byte>> {
+    if (offset > capacity_ || size > capacity_ - offset) {
+      return std::nullopt;
+    }
+    if (size == 0) {
+      return std::span<const std::byte>{};
+    }
+    const auto window = view_at_most(offset, size, offset + size, access, scratch, policy);
+    if (!window.has_value() || window->size() < size) {
+      return std::nullopt;
+    }
+    return window->first(static_cast<size_t>(size));
+  }
+
+  // Reads exactly `size` bytes at `offset` directly into caller-owned `dst` without scratch allocation.
+  // Uses direct ::pread() for Q2 / Policy::PreadOnly, or memcpy() from the selected zero-copy VMA.
+  // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+  [[nodiscard]] auto read_into(uint64_t offset,
+                               uint64_t size,
+                               void *dst,
+                               Access access,
+                               Policy policy = Policy::Adaptive) const noexcept -> bool {
+    if (offset > capacity_ || size > capacity_ - offset) {
+      return false;
+    }
+    if (size == 0) {
+      return true;
+    }
+    if (dst == nullptr) {
+      return false;
+    }
+    const bool is_small = size <= page_size();
+    if (policy != Policy::PreadOnly) {
+      if (std::byte *mapping = mapping_for(access, is_small, policy); mapping != nullptr) {
+        std::memcpy(dst, mapping + offset, static_cast<size_t>(size));
+        return true;
+      }
+    }
+    const int read_fd = pread_fd();
+    if (read_fd < 0) {
+      return false;
+    }
+    const auto got = pread_some(read_fd, dst, static_cast<size_t>(size), offset);
+    return got.has_value() && *got == static_cast<size_t>(size);
+  }
+
+  // Indexed fixed-length record read at `base_offset + index * stride`.
+  // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+  [[nodiscard]] auto read_at_index(uint64_t index,
+                                   uint64_t stride,
+                                   Access access,
+                                   std::vector<std::byte> *scratch,
+                                   Policy policy = Policy::Adaptive,
+                                   uint64_t base_offset = 0) const -> std::optional<std::span<const std::byte>> {
+    if (stride == 0 || base_offset > capacity_ || index > (capacity_ - base_offset) / stride) {
+      return std::nullopt;
+    }
+    return read(base_offset + (index * stride), stride, access, scratch, policy);
+  }
+
+  // Variable-length read helper: returns an mmap view up to `min(valid_end, capacity())` bytes, or
+  // preads up to `min(max_bytes, valid_end - offset)` bytes into `scratch` (or a thread_local
+  // fallback vector when `scratch == nullptr`).
+  // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+  [[nodiscard]] auto view_at_most(uint64_t offset,
+                                  uint64_t max_bytes,
+                                  uint64_t valid_end,
+                                  Access access,
+                                  std::vector<std::byte> *scratch,
+                                  Policy policy = Policy::Adaptive) const -> std::optional<std::span<const std::byte>> {
+    const uint64_t limit = std::min(valid_end, capacity_);
+    if (offset >= limit) {
+      return std::nullopt;
+    }
+    const bool is_small = max_bytes <= page_size();
+
+    if (policy != Policy::PreadOnly) {
+      if (std::byte *mapping = mapping_for(access, is_small, policy); mapping != nullptr) {
+        return std::span<const std::byte>(mapping + offset, static_cast<size_t>(limit - offset));
+      }
+    }
+
+    thread_local std::vector<std::byte> tl_pread_scratch;
+    std::vector<std::byte> *target = scratch != nullptr ? scratch : &tl_pread_scratch;
+    return pread_window(offset, std::min(max_bytes, limit - offset), *target);
+  }
+
+  // Issues MADV_WILLNEED covering `[offset, offset + len)` clamped to capacity(), rounding
+  // start down to a page boundary as required by Linux madvise(2). Skips large random Q2 ranges
+  // and PreadOnly policy so pread-targeted windows do not populate mmap page tables.
+  // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+  void prefetch(uint64_t offset,
+                uint64_t len,
+                Access access = Access::Sequential,
+                Policy policy = Policy::Adaptive) const noexcept {
+    if (random_mmap_ == nullptr || offset >= capacity_ || len == 0) {
+      return;
+    }
+    if (policy == Policy::PreadOnly || (policy == Policy::Adaptive && access == Access::Random && len > page_size())) {
+      return;
+    }
+    const uint64_t page_mask = page_size() - 1;
+    const uint64_t aligned_start = offset & ~page_mask;
+    const uint64_t clamped_len = std::min(len, capacity_ - offset);
+    const uint64_t aligned_len = (offset - aligned_start) + clamped_len;
+    (void)::madvise(random_mmap_ + aligned_start, static_cast<size_t>(aligned_len), MADV_WILLNEED);
+  }
+
+  [[nodiscard]] auto random_mmap() const noexcept -> std::byte * { return random_mmap_; }
+  [[nodiscard]] auto sequential_mmap() const noexcept -> std::byte * { return ensure_sequential_mmap(); }
+  [[nodiscard]] auto normal_mmap() const noexcept -> std::byte * { return ensure_normal_mmap(); }
+  [[nodiscard]] auto peek_sequential_mmap() const noexcept -> std::byte * {
+    return sec_ ? sec_->sequential_mmap.load(std::memory_order_acquire) : nullptr;
+  }
+  [[nodiscard]] auto peek_normal_mmap() const noexcept -> std::byte * {
+    return sec_ ? sec_->normal_mmap.load(std::memory_order_acquire) : nullptr;
+  }
+  [[nodiscard]] auto pread_fd() const noexcept -> int { return sec_ ? sec_->pread_fd : -1; }
+  [[nodiscard]] auto has_independent_pread_fd() const noexcept -> bool {
+    return sec_ != nullptr && sec_->pread_fd_independent;
+  }
+  [[nodiscard]] auto capacity() const noexcept -> uint64_t { return capacity_; }
+
+ private:
+  struct SecondaryState {
+    std::atomic<std::byte *> sequential_mmap{nullptr};
+    std::atomic<std::byte *> normal_mmap{nullptr};
+    int mmap_fd = -1;
+    int pread_fd = -1;
+    bool pread_fd_independent = false;
+    std::mutex mu;
+  };
+
+  [[nodiscard]] static auto open_readonly_fd_impl(int file_descriptor,
+                                                  const std::filesystem::path *opt_path) -> MappedReader {
     if (file_descriptor < 0) {
       throw std::system_error(EBADF, std::generic_category(), "quadfecta invalid file descriptor");
     }
@@ -112,182 +317,99 @@ class MappedReader {
       primary = static_cast<std::byte *>(mapped);
     }
     MappedReader reader(primary, file_bytes);
-    reader.open_secondary_handles(file_descriptor);
+    reader.open_secondary_handles_impl(file_descriptor, opt_path);
     return reader;
   }
 
-  // Opens an immutable/read-only file and maps all four Quadfecta handles. Throws std::system_error
-  // if opening, stat'ing, or mapping the primary random view fails; secondary views are best-effort.
-  [[nodiscard]] static auto open_readonly(const std::filesystem::path &path) -> MappedReader {
-    const int file_descriptor = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  void open_secondary_handles_impl(int file_descriptor, const std::filesystem::path *opt_path) noexcept {
     if (file_descriptor < 0) {
-      throw std::system_error(errno, std::generic_category(), "quadfecta open");
-    }
-    try {
-      MappedReader reader = open_readonly_fd(file_descriptor);
-      ::close(file_descriptor);
-      return reader;
-    } catch (...) {
-      ::close(file_descriptor);
-      throw;
-    }
-  }
-
-  // Best-effort setup of secondary read views (normal_mmap, sequential_mmap, dup'd pread_fd).
-  // Idempotent when called repeatedly; should complete before publishing this reader across threads.
-  void open_secondary_handles(int file_descriptor) noexcept {
-    if (capacity_ > 0) {
-      if (normal_mmap_ == nullptr) {
-        normal_mmap_ = best_effort_mmap_ro(static_cast<size_t>(capacity_), file_descriptor);
-      }
-      if (sequential_mmap_ == nullptr) {
-        std::byte *seq = best_effort_mmap_ro(static_cast<size_t>(capacity_), file_descriptor);
-        if (seq != nullptr) {
-          if (::madvise(seq, static_cast<size_t>(capacity_), MADV_SEQUENTIAL) == 0) {
-            sequential_mmap_ = seq;
-          } else {
-            ::munmap(seq, static_cast<size_t>(capacity_));
-          }
-        }
-      }
-    }
-    if (pread_fd_ < 0) {
-      pread_fd_ = ::fcntl(file_descriptor, F_DUPFD_CLOEXEC, 0);
-    }
-  }
-
-  [[nodiscard]] static auto page_size() noexcept -> uint64_t {
-    static const auto kCached = static_cast<uint64_t>(::sysconf(_SC_PAGESIZE));
-    return kCached;
-  }
-
-  [[nodiscard]] auto mapping_for(Access access,
-                                 bool is_small,
-                                 Policy policy = Policy::Adaptive) const noexcept -> std::byte * {
-    switch (policy) {
-      case Policy::RandomOnly:
-        return random_mmap_;
-      case Policy::SeqOnly:
-        return sequential_mmap_ != nullptr ? sequential_mmap_ : random_mmap_;
-      case Policy::NormalOnly:
-        return normal_mmap_ != nullptr ? normal_mmap_ : random_mmap_;
-      case Policy::PreadOnly:
-        return nullptr;
-      case Policy::Adaptive:
-        break;
-    }
-    if (access == Access::Sequential) {
-      std::byte *preferred = is_small ? sequential_mmap_ : normal_mmap_;
-      return preferred != nullptr ? preferred : random_mmap_;
-    }
-    return is_small ? random_mmap_ : nullptr;
-  }
-
-  // Reads exactly `size` bytes at `offset`. Uses zero-copy mmap when selected, or copies into
-  // `scratch` via pread(). Returns std::nullopt on out-of-bounds, missing handle/scratch, or I/O error.
-  // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-  [[nodiscard]] auto read(uint64_t offset,
-                          uint64_t size,
-                          Access access,
-                          std::vector<std::byte> *scratch,
-                          Policy policy = Policy::Adaptive) const -> std::optional<std::span<const std::byte>> {
-    if (offset > capacity_ || size > capacity_ - offset) {
-      return std::nullopt;
-    }
-    if (size == 0) {
-      return std::span<const std::byte>{};
-    }
-    const auto window = view_at_most(offset, size, offset + size, access, scratch, policy);
-    if (!window.has_value() || window->size() < size) {
-      return std::nullopt;
-    }
-    return window->first(static_cast<size_t>(size));
-  }
-
-  // Indexed fixed-length record read at `base_offset + index * stride`.
-  // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-  [[nodiscard]] auto read_at_index(uint64_t index,
-                                   uint64_t stride,
-                                   Access access,
-                                   std::vector<std::byte> *scratch,
-                                   Policy policy = Policy::Adaptive,
-                                   uint64_t base_offset = 0) const -> std::optional<std::span<const std::byte>> {
-    if (stride == 0 || base_offset > capacity_ || index > (capacity_ - base_offset) / stride) {
-      return std::nullopt;
-    }
-    return read(base_offset + (index * stride), stride, access, scratch, policy);
-  }
-
-  // Variable-length read helper: returns an mmap view up to `min(valid_end, capacity())` bytes, or
-  // preads up to `min(max_bytes, valid_end - offset)` bytes into `scratch`. Callers parse record
-  // headers inside the returned span and verify total record length <= returned span size.
-  // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-  [[nodiscard]] auto view_at_most(uint64_t offset,
-                                  uint64_t max_bytes,
-                                  uint64_t valid_end,
-                                  Access access,
-                                  std::vector<std::byte> *scratch,
-                                  Policy policy = Policy::Adaptive) const -> std::optional<std::span<const std::byte>> {
-    const uint64_t limit = std::min(valid_end, capacity_);
-    if (offset >= limit) {
-      return std::nullopt;
-    }
-    const bool is_small = max_bytes <= page_size();
-
-    if (policy == Policy::PreadOnly) {
-      thread_local std::vector<std::byte> tl_pread_scratch;
-      std::vector<std::byte> *target = scratch != nullptr ? scratch : &tl_pread_scratch;
-      return pread_window(offset, std::min(max_bytes, limit - offset), *target);
-    }
-
-    if (std::byte *mapping = mapping_for(access, is_small, policy); mapping != nullptr) {
-      return std::span<const std::byte>(mapping + offset, static_cast<size_t>(limit - offset));
-    }
-
-    if (scratch != nullptr) {
-      return pread_window(offset, std::min(max_bytes, limit - offset), *scratch);
-    }
-    return std::nullopt;
-  }
-
-  // Issues MADV_WILLNEED covering `[offset, offset + len)` clamped to capacity(), rounding
-  // start down to a page boundary as required by Linux madvise(2). Best-effort no-op.
-  // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-  void prefetch(uint64_t offset, uint64_t len) const noexcept {
-    if (random_mmap_ == nullptr || offset >= capacity_ || len == 0) {
       return;
     }
-    const uint64_t page_mask = page_size() - 1;
-    const uint64_t aligned_start = offset & ~page_mask;
-    const uint64_t clamped_len = std::min(len, capacity_ - offset);
-    const uint64_t aligned_len = (offset - aligned_start) + clamped_len;
-    (void)::madvise(random_mmap_ + aligned_start, static_cast<size_t>(aligned_len), MADV_WILLNEED);
+    if (!sec_) {
+      sec_ = std::make_unique<SecondaryState>();
+    }
+    if (sec_->pread_fd < 0) {
+      int indep = -1;
+      if (opt_path != nullptr) {
+        indep = ::open(opt_path->c_str(), O_RDONLY | O_CLOEXEC);
+      } else {
+        constexpr size_t kProcFdPathBufferBytes = 64;
+        std::array<char, kProcFdPathBufferBytes> proc_path{};
+        std::snprintf(proc_path.data(), proc_path.size(), "/proc/self/fd/%d", file_descriptor);
+        indep = ::open(proc_path.data(), O_RDONLY | O_CLOEXEC);
+      }
+      if (indep >= 0) {
+        (void)::posix_fadvise(indep, 0, 0, POSIX_FADV_RANDOM);
+        sec_->pread_fd = indep;
+        sec_->pread_fd_independent = true;
+      } else {
+        sec_->pread_fd = ::fcntl(file_descriptor, F_DUPFD_CLOEXEC, 0);
+        sec_->pread_fd_independent = false;
+      }
+    }
+    if (capacity_ > 0 && sec_->mmap_fd < 0 &&
+        (sec_->sequential_mmap.load(std::memory_order_acquire) == nullptr ||
+         sec_->normal_mmap.load(std::memory_order_acquire) == nullptr)) {
+      sec_->mmap_fd = ::fcntl(file_descriptor, F_DUPFD_CLOEXEC, 0);
+    }
   }
 
-  [[nodiscard]] auto random_mmap() const noexcept -> std::byte * { return random_mmap_; }
-  [[nodiscard]] auto sequential_mmap() const noexcept -> std::byte * { return sequential_mmap_; }
-  [[nodiscard]] auto normal_mmap() const noexcept -> std::byte * { return normal_mmap_; }
-  [[nodiscard]] auto pread_fd() const noexcept -> int { return pread_fd_; }
-  [[nodiscard]] auto capacity() const noexcept -> uint64_t { return capacity_; }
+  [[nodiscard]] auto ensure_lazy_mmap(std::atomic<std::byte *> SecondaryState::*field, int advice) const noexcept
+      -> std::byte * {
+    if (!sec_ || capacity_ == 0) {
+      return nullptr;
+    }
+    std::byte *existing = (sec_.get()->*field).load(std::memory_order_acquire);
+    if (existing != nullptr) {
+      return existing;
+    }
+    std::lock_guard<std::mutex> lock(sec_->mu);
+    existing = (sec_.get()->*field).load(std::memory_order_relaxed);
+    if (existing != nullptr) {
+      return existing;
+    }
+    if (sec_->mmap_fd < 0) {
+      return nullptr;
+    }
+    std::byte *mapped = best_effort_mmap_ro(static_cast<size_t>(capacity_), sec_->mmap_fd);
+    if (mapped != nullptr && advice != MADV_NORMAL) {
+      if (::madvise(mapped, static_cast<size_t>(capacity_), advice) != 0) {
+        ::munmap(mapped, static_cast<size_t>(capacity_));
+        mapped = nullptr;
+      }
+    }
+    if (mapped != nullptr) {
+      (sec_.get()->*field).store(mapped, std::memory_order_release);
+      if (sec_->sequential_mmap.load(std::memory_order_relaxed) != nullptr &&
+          sec_->normal_mmap.load(std::memory_order_relaxed) != nullptr) {
+        ::close(sec_->mmap_fd);
+        sec_->mmap_fd = -1;
+      }
+    }
+    return mapped;
+  }
 
- private:
+  [[nodiscard]] auto ensure_sequential_mmap() const noexcept -> std::byte * {
+    return ensure_lazy_mmap(&SecondaryState::sequential_mmap, MADV_SEQUENTIAL);
+  }
+
+  [[nodiscard]] auto ensure_normal_mmap() const noexcept -> std::byte * {
+    return ensure_lazy_mmap(&SecondaryState::normal_mmap, MADV_NORMAL);
+  }
+
   static auto best_effort_mmap_ro(size_t size, int file_descriptor) noexcept -> std::byte * {
     void *mapped = ::mmap(nullptr, size, PROT_READ, MAP_SHARED, file_descriptor, 0);
     return mapped == MAP_FAILED ? nullptr : static_cast<std::byte *>(mapped);
   }
 
   // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-  auto pread_window(uint64_t offset,
-                    uint64_t len,
-                    std::vector<std::byte> &scratch) const -> std::optional<std::span<const std::byte>> {
-    if (pread_fd_ < 0) {
-      return std::nullopt;
-    }
-    scratch.resize(static_cast<size_t>(len));
+  static auto pread_some(int file_descriptor, void *dst, size_t len, uint64_t offset) noexcept
+      -> std::optional<size_t> {
+    auto *out = static_cast<std::byte *>(dst);
     size_t total = 0;
     while (total < len) {
-      const ssize_t bytes_read = ::pread(
-          pread_fd_, scratch.data() + total, static_cast<size_t>(len) - total, static_cast<off_t>(offset + total));
+      const ssize_t bytes_read =
+          ::pread(file_descriptor, out + total, len - total, static_cast<off_t>(offset + total));
       if (bytes_read > 0) {
         total += static_cast<size_t>(bytes_read);
         continue;
@@ -300,34 +422,54 @@ class MappedReader {
       }
       return std::nullopt;
     }
-    if (total == 0 && len > 0) {
+    return total;
+  }
+
+  // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+  auto pread_window(uint64_t offset,
+                    uint64_t len,
+                    std::vector<std::byte> &scratch) const -> std::optional<std::span<const std::byte>> {
+    const int read_fd = pread_fd();
+    if (read_fd < 0) {
       return std::nullopt;
     }
-    return std::span<const std::byte>(scratch.data(), total);
+    scratch.resize(static_cast<size_t>(len));
+    const auto total = pread_some(read_fd, scratch.data(), static_cast<size_t>(len), offset);
+    if (!total.has_value() || (*total == 0 && len > 0)) {
+      return std::nullopt;
+    }
+    return std::span<const std::byte>(scratch.data(), *total);
   }
 
   void reset() noexcept {
     if (capacity_ > 0) {
-      for (std::byte *mapping : {normal_mmap_, sequential_mmap_, random_mmap_}) {
-        if (mapping != nullptr) {
-          ::munmap(mapping, static_cast<size_t>(capacity_));
+      if (random_mmap_ != nullptr) {
+        ::munmap(random_mmap_, static_cast<size_t>(capacity_));
+      }
+      if (sec_) {
+        for (std::byte *mapping : {sec_->normal_mmap.load(std::memory_order_relaxed),
+                                   sec_->sequential_mmap.load(std::memory_order_relaxed)}) {
+          if (mapping != nullptr) {
+            ::munmap(mapping, static_cast<size_t>(capacity_));
+          }
         }
       }
     }
-    if (pread_fd_ >= 0) {
-      ::close(pread_fd_);
+    if (sec_) {
+      if (sec_->pread_fd >= 0) {
+        ::close(sec_->pread_fd);
+      }
+      if (sec_->mmap_fd >= 0) {
+        ::close(sec_->mmap_fd);
+      }
+      sec_.reset();
     }
     random_mmap_ = nullptr;
-    sequential_mmap_ = nullptr;
-    normal_mmap_ = nullptr;
-    pread_fd_ = -1;
     capacity_ = 0;
   }
 
   std::byte *random_mmap_ = nullptr;
-  std::byte *sequential_mmap_ = nullptr;
-  std::byte *normal_mmap_ = nullptr;
-  int pread_fd_ = -1;
+  mutable std::unique_ptr<SecondaryState> sec_;
   uint64_t capacity_ = 0;
 };
 

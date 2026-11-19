@@ -56,9 +56,11 @@ TEST_CASE("Quadfecta: open_readonly serves small and large reads across all poli
   auto reader = quadfecta::MappedReader::open_readonly(path.get());
   CHECK(reader.capacity() == total_size);
   CHECK(reader.random_mmap() != nullptr);
-  CHECK(reader.sequential_mmap() != nullptr);
-  CHECK(reader.normal_mmap() != nullptr);
+  // Secondary scan/normal VMAs remain unmapped until first sequential/normal demand (lazy mmap).
+  CHECK(reader.peek_sequential_mmap() == nullptr);
+  CHECK(reader.peek_normal_mmap() == nullptr);
   CHECK(reader.pread_fd() >= 0);
+  CHECK(reader.has_independent_pread_fd());
 
   std::vector<std::byte> scratch;
   const uint64_t large_len = page_size + 256;
@@ -77,18 +79,34 @@ TEST_CASE("Quadfecta: open_readonly serves small and large reads across all poli
       CHECK(std::memcmp(large_view->data(), payload.data() + page_size, large_len) == 0);
     }
   }
+  CHECK(reader.peek_sequential_mmap() != nullptr);
+  CHECK(reader.peek_normal_mmap() != nullptr);
+  CHECK(reader.sequential_mmap() != nullptr);
+  CHECK(reader.normal_mmap() != nullptr);
 
-  // Exact-page boundary stays on mmap; >page_size routes large random to pread and requires scratch.
+  // Unified scratch == nullptr contract: both Adaptive (Q2) and PreadOnly fall back to thread_local.
   CHECK(reader.read(0, page_size, quadfecta::Access::Random, nullptr, quadfecta::Policy::Adaptive).has_value());
-  CHECK_FALSE(
-      reader.read(page_size, large_len, quadfecta::Access::Random, nullptr, quadfecta::Policy::Adaptive).has_value());
-  // Policy::PreadOnly uses an internal thread_local scratch buffer when caller supplies nullptr.
+  const auto tl_q2 = reader.read(page_size, large_len, quadfecta::Access::Random, nullptr, quadfecta::Policy::Adaptive);
+  REQUIRE(tl_q2.has_value());
+  CHECK(std::memcmp(tl_q2->data(), payload.data() + page_size, large_len) == 0);
   const auto tl_pread = reader.read(64, 32, quadfecta::Access::Random, nullptr, quadfecta::Policy::PreadOnly);
   REQUIRE(tl_pread.has_value());
   CHECK(std::memcmp(tl_pread->data(), payload.data() + 64, 32) == 0);
 
+  // read_into() transfers directly into caller-owned destination without intermediate scratch allocation.
+  std::vector<std::byte> direct_buf(large_len);
+  REQUIRE(reader.read_into(page_size, large_len, direct_buf.data(), quadfecta::Access::Random));
+  CHECK(std::memcmp(direct_buf.data(), payload.data() + page_size, large_len) == 0);
+  REQUIRE(reader.read_into(64, 32, direct_buf.data(), quadfecta::Access::Random, quadfecta::Policy::PreadOnly));
+  CHECK(std::memcmp(direct_buf.data(), payload.data() + 64, 32) == 0);
+  CHECK(reader.read_into(0, 0, nullptr, quadfecta::Access::Random));
+  CHECK_FALSE(reader.read_into(0, 16, nullptr, quadfecta::Access::Random));
+  CHECK_FALSE(reader.read_into(total_size, 1, direct_buf.data(), quadfecta::Access::Random));
+
   reader.prefetch(0, page_size);
   reader.prefetch(128, 64);  // unaligned offset rounds down to page boundary without error
+  reader.prefetch(0, large_len, quadfecta::Access::Random, quadfecta::Policy::Adaptive);  // skipped for Q2
+  reader.prefetch(0, page_size, quadfecta::Access::Random, quadfecta::Policy::PreadOnly); // skipped for PreadOnly
   reader.prefetch(total_size, 64);
   reader.prefetch(0, 0);
 
@@ -205,6 +223,10 @@ TEST_CASE("Quadfecta: open_readonly_fd wraps caller FD without closing it and Se
   {
     auto reader = quadfecta::MappedReader::open_readonly_fd(fd);
     CHECK(reader.capacity() == payload.size());
+    CHECK(reader.has_independent_pread_fd());
+    CHECK(::lseek(fd, 0, SEEK_CUR) == 0);
+    REQUIRE(::lseek(reader.pread_fd(), 123, SEEK_SET) == 123);
+    CHECK(::lseek(fd, 0, SEEK_CUR) == 0);  // Independent open file description: f_pos/f_ra decoupled from fd.
     std::vector<std::byte> scratch;
     const auto span = reader.read(64, 128, quadfecta::Access::Random, &scratch);
     REQUIRE(span.has_value());
