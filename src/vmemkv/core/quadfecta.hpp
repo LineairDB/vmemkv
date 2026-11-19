@@ -358,15 +358,11 @@ class Cursor {
     if (reader_ == nullptr || size > remaining()) {
       return std::nullopt;
     }
-    if (size == 0) {
-      return std::span<const std::byte>{};
+    const auto span = reader_->read(pos_, size, Access::Sequential, scratch, policy);
+    if (span.has_value()) {
+      pos_ += size;
     }
-    const auto window = reader_->view_at_most(pos_, size, pos_ + size, Access::Sequential, scratch, policy);
-    if (!window.has_value() || window->size() < size) {
-      return std::nullopt;
-    }
-    pos_ += size;
-    return window->first(static_cast<size_t>(size));
+    return span;
   }
 
   // Variable-length sequential read helper at pos() bounded by end_. Does not advance pos();
