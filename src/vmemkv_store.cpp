@@ -1,5 +1,13 @@
 // Public facade over StoreAdapter<VMemKVImpl>; no logic here.
+#include <cstddef>
+#include <cstdint>
+#include <filesystem>
+#include <functional>
+#include <memory>
+#include <span>
+#include <string>
 #include <vmemkv/api/store_adapter.hpp>
+#include <vmemkv/scan_control.hpp>
 #include <vmemkv/stats.hpp>
 #include <vmemkv/vmemkv.hpp>
 #include <vmemkv/vmemkv_impl.hpp>

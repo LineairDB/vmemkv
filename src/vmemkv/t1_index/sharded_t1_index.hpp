@@ -20,9 +20,9 @@
 #include <vmemkv/config.hpp>
 #include <vmemkv/core/background_poll.hpp>
 #include <vmemkv/core/reference_tracker.hpp>
-#include <vmemkv/core/single_flight.hpp>
 #include <vmemkv/core/spin_backoff.hpp>
 #include <vmemkv/scan_control.hpp>
+#include <vmemkv/t1_index/t1_codec.hpp>
 #include <vmemkv/t1_index/t1_index.hpp>
 
 namespace vmemkv {
@@ -1024,6 +1024,7 @@ class ShardedT1Index {
 
     delete old_dir;
     delete target;
+    delete split_info;
     total_splits_.fetch_add(1, std::memory_order_relaxed);
   }
 

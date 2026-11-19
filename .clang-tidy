@@ -4,13 +4,17 @@ Checks: >
   bugprone-*,
   performance-*,
   modernize-*,
-  readability-*
+  readability-*,
+  misc-include-cleaner
 
 WarningsAsErrors: >
   bugprone-*,
   performance-*,
   modernize-*,
-  readability-*
+  readability-*,
+  misc-include-cleaner
 
 HeaderFilterRegex: '(^|.*/)(src|include/vmemkv)/.*\.(hpp|cpp)$'
 FormatStyle: none
+CheckOptions:
+  misc-include-cleaner.IgnoreHeaders: 'bits/.*'

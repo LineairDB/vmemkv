@@ -6,6 +6,7 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
@@ -14,8 +15,8 @@
 #include <mutex>
 #include <optional>
 #include <span>
-#include <string>
 #include <string_view>
+#include <system_error>
 #include <type_traits>
 #include <vector>
 #include <vmemkv/core/io.hpp>

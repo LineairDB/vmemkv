@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <linux/magic.h>
 #include <sys/mman.h>
+#include <sys/statfs.h>
 #include <sys/vfs.h>
 
 #include <algorithm>
@@ -20,9 +21,10 @@
 #include <cstdint>
 #include <filesystem>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <vector>
-#include <vmemkv/core/background_poll.hpp>
+#include <vmemkv/config.hpp>
 #include <vmemkv/core/env.hpp>
 #include <vmemkv/core/paths.hpp>
 #include <vmemkv/core/single_flight.hpp>
@@ -31,6 +33,7 @@
 #include <vmemkv/impl/t2_ownership.hpp>
 #include <vmemkv/t1_index/sharded_t1_index.hpp>
 #include <vmemkv/t1_index/t1_codec.hpp>
+#include <vmemkv/t1_index/t1_index.hpp>
 #include <vmemkv/t2_flat_file/t2_flat_file.hpp>
 
 namespace vmemkv {

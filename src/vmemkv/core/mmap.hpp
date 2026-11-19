@@ -2,12 +2,10 @@
 #pragma once
 
 #include <sys/mman.h>
-#include <unistd.h>
 
 #include <cerrno>
 #include <cstddef>
 #include <system_error>
-#include <utility>
 
 namespace vmemkv {
 

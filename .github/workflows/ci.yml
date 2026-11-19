@@ -82,6 +82,84 @@ jobs:
         kill "$watchdog_pid" 2>/dev/null || true
         exit "$ctest_exit"
 
+  sanitizer:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [ASAN_UBSAN, TSAN]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential cmake clang
+
+    - name: Configure and Build (${{ matrix.sanitizer }})
+      run: |
+        cmake -S . -B build-san \
+          -DCMAKE_CXX_COMPILER=clang++ \
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+          -DCMAKE_WARN_DEPRECATED=OFF \
+          -DENABLE_BENCHMARK=OFF \
+          -DENABLE_ROCKSDB=OFF \
+          -DENABLE_LMDB=OFF \
+          -DENABLE_LEANSTORE=OFF \
+          -DVMEMKV_SANITIZER=${{ matrix.sanitizer }}
+        cmake --build build-san --parallel
+
+    - name: Run Tests (${{ matrix.sanitizer }})
+      run: ctest --test-dir build-san --output-on-failure -j "$(nproc)"
+
+  coverage:
+    runs-on: ubuntu-24.04
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential cmake clang llvm
+
+    - name: Configure and Build (Coverage)
+      run: |
+        cmake -S . -B build-cov \
+          -DCMAKE_CXX_COMPILER=clang++ \
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+          -DCMAKE_WARN_DEPRECATED=OFF \
+          -DENABLE_BENCHMARK=OFF \
+          -DENABLE_ROCKSDB=OFF \
+          -DENABLE_LMDB=OFF \
+          -DENABLE_LEANSTORE=OFF \
+          -DENABLE_COVERAGE=ON
+        cmake --build build-cov --parallel
+
+    - name: Run Tests and Generate Coverage Report
+      run: |
+        ctest --test-dir build-cov --output-on-failure -j "$(nproc)"
+        cmake --build build-cov --target coverage
+
+    - name: Publish Step Summary
+      run: |
+        {
+          echo "## Code Coverage (llvm-cov)"
+          echo '```'
+          cat build-cov/coverage/summary.txt
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Upload Coverage Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-report
+        path: |
+          build-cov/coverage/summary.txt
+          build-cov/coverage/coverage.lcov
+          build-cov/coverage/html/
+
   install-check:
     runs-on: ubuntu-24.04
 

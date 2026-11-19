@@ -8,17 +8,17 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
-#include <memory>
-#include <optional>
 #include <span>
 #include <stdexcept>
 #include <vector>
-#include <vmemkv/core/env.hpp>
+#include <vmemkv/config.hpp>
 #include <vmemkv/core/utils.hpp>
 #include <vmemkv/impl/hooks.hpp>
-#include <vmemkv/t1_index/t1_index.hpp>
+#include <vmemkv/t1_index/t1_codec.hpp>
+#include <vmemkv/t2_flat_file/t2_flat_file.hpp>
 
 namespace vmemkv {
 

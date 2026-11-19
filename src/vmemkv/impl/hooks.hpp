@@ -5,6 +5,7 @@
 #pragma once
 
 #include <concepts>
+#include <cstdint>
 #include <vmemkv/core/reference_tracker.hpp>
 #include <vmemkv/t2_flat_file/t2_flat_file.hpp>
 

@@ -39,5 +39,12 @@ foreach(case_file IN LISTS VMEMKV_TEST_CASES)
   # alive, so a genuine hang still gets diagnosed (via the watchdog) well before this kills it.
   # LEANSTORE_DRAM_GIB=1: unit-test corpora are tiny; the LeanStore adapter defaults
   # to a 16GiB buffer pool that small runners cannot allocate.
-  set_tests_properties(${case_name} PROPERTIES TIMEOUT 1200 ENVIRONMENT "LEANSTORE_DRAM_GIB=1")
+  set(_test_env "LEANSTORE_DRAM_GIB=1")
+  if(VMEMKV_SANITIZER STREQUAL "TSAN")
+    list(APPEND _test_env "TSAN_OPTIONS=suppressions=${CMAKE_SOURCE_DIR}/tsan_suppressions.txt")
+  endif()
+  if(ENABLE_COVERAGE)
+    list(APPEND _test_env "LLVM_PROFILE_FILE=${CMAKE_BINARY_DIR}/coverage/${case_name}-%p.profraw")
+  endif()
+  set_tests_properties(${case_name} PROPERTIES TIMEOUT 1200 ENVIRONMENT "${_test_env}")
 endforeach()

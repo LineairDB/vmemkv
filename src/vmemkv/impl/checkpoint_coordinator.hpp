@@ -5,19 +5,19 @@
 #pragma once
 
 #include <sys/mman.h>
-#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <span>
-#include <stdexcept>
 #include <system_error>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <vmemkv/checkpoint/checkpoint.hpp>
 #include <vmemkv/config.hpp>
@@ -25,9 +25,12 @@
 #include <vmemkv/core/env.hpp>
 #include <vmemkv/core/paths.hpp>
 #include <vmemkv/core/single_flight.hpp>
+#include <vmemkv/core/utils.hpp>
 #include <vmemkv/impl/hooks.hpp>
 #include <vmemkv/impl/t2_ownership.hpp>
+#include <vmemkv/stats.hpp>
 #include <vmemkv/t1_index/sharded_t1_index.hpp>
+#include <vmemkv/t1_index/t1_codec.hpp>
 #include <vmemkv/t2_flat_file/t2_flat_file.hpp>
 #include <vmemkv/wal/wal.hpp>
 

@@ -5,10 +5,12 @@
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
+#include <ios>
 #include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <system_error>
 
 namespace vmemkv {
 

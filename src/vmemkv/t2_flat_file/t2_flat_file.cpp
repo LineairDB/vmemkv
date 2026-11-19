@@ -1,15 +1,24 @@
 #include <fcntl.h>
+#include <linux/falloc.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cassert>
+#include <cerrno>
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <limits>
 #include <optional>
+#include <span>
+#include <stdexcept>
 #include <system_error>
 #include <vmemkv/core/io.hpp>
 #include <vmemkv/core/mmap.hpp>
 #include <vmemkv/core/paths.hpp>
+#include <vmemkv/core/utils.hpp>
 #include <vmemkv/t2_flat_file/t2_flat_file.hpp>
 
 namespace vmemkv {
@@ -191,7 +200,9 @@ auto T2FlatFile::punch_if_occupied(uint64_t offset, uint64_t len) const noexcept
   if (file_descriptor < 0) {
     return PunchOutcome::Failed;
   }
-  const off_t data_at = ::lseek(file_descriptor, static_cast<off_t>(offset), SEEK_DATA);
+  // SEEK_DATA is a POSIX/GNU lseek whence constant from <unistd.h> (<stdio.h> trips modernize-deprecated-headers).
+  const off_t data_at =
+      ::lseek(file_descriptor, static_cast<off_t>(offset), SEEK_DATA);  // NOLINT(misc-include-cleaner)
   const int seek_errno = errno;
   if (data_at < 0) {
     ::close(file_descriptor);

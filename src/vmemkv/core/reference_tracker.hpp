@@ -6,10 +6,10 @@
 #include <cassert>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <iostream>
 #include <mutex>
 #include <stdexcept>
-#include <thread>
 #include <vmemkv/core/spin_backoff.hpp>
 
 namespace vmemkv {

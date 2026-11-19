@@ -28,10 +28,9 @@
 #include <span>
 #include <vector>
 #include <vmemkv/config.hpp>
-#include <vmemkv/core/bytes.hpp>
 #include <vmemkv/core/spin_backoff.hpp>
 #include <vmemkv/impl/t2_ownership.hpp>
-#include <vmemkv/t1_index/t1_index.hpp>
+#include <vmemkv/t1_index/t1_codec.hpp>
 #include <vmemkv/t2_flat_file/t2_flat_file.hpp>
 
 namespace vmemkv {

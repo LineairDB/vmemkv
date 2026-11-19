@@ -1,13 +1,25 @@
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <sys/uio.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <climits>
+#include <condition_variable>
+#include <cstddef>
+#include <cstdint>
+#include <exception>
+#include <filesystem>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vmemkv/core/paths.hpp>
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #endif
@@ -16,7 +28,6 @@
 #include <memory>
 #include <mutex>
 #include <system_error>
-#include <thread>
 #include <vector>
 #include <vmemkv/core/io.hpp>
 #include <vmemkv/core/spin_backoff.hpp>

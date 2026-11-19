@@ -1,15 +1,27 @@
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <limits>
+#include <optional>
+#include <span>
 #include <stdexcept>
+#include <string>
 #include <system_error>
 #include <unordered_set>
+#include <utility>
+#include <vector>
 #include <vmemkv/checkpoint/checkpoint.hpp>
 #include <vmemkv/core/io.hpp>
 #include <vmemkv/core/mmap.hpp>
+#include <vmemkv/core/paths.hpp>
+#include <vmemkv/core/utils.hpp>
 
 namespace vmemkv {
 

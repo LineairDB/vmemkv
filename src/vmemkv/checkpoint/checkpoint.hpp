@@ -8,12 +8,10 @@
 #include <filesystem>
 #include <optional>
 #include <span>
-#include <string>
 #include <type_traits>
 #include <vector>
 #include <vmemkv/core/io.hpp>
 #include <vmemkv/core/mmap.hpp>
-#include <vmemkv/core/paths.hpp>
 #include <vmemkv/core/utils.hpp>
 
 namespace vmemkv {

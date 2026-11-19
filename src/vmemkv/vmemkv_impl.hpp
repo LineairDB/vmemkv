@@ -19,14 +19,12 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
-#include <memory>
 #include <mutex>
-#include <numeric>
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <stop_token>
 #include <string>
-#include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -35,8 +33,10 @@
 #include <vmemkv/core/background_poll.hpp>
 #include <vmemkv/core/bytes.hpp>
 #include <vmemkv/core/cgroup_memory_throttle.hpp>
+#include <vmemkv/core/paths.hpp>
 #include <vmemkv/core/reference_tracker.hpp>
 #include <vmemkv/core/single_flight.hpp>
+#include <vmemkv/core/spin_backoff.hpp>
 #include <vmemkv/core/swap_check.hpp>
 #include <vmemkv/impl/checkpoint_coordinator.hpp>
 #include <vmemkv/impl/compaction.hpp>
@@ -45,7 +45,9 @@
 #include <vmemkv/impl/t2_ownership.hpp>
 #include <vmemkv/impl/write_path.hpp>
 #include <vmemkv/scan_control.hpp>
+#include <vmemkv/stats.hpp>
 #include <vmemkv/t1_index/sharded_t1_index.hpp>
+#include <vmemkv/t1_index/t1_codec.hpp>
 #include <vmemkv/t2_flat_file/t2_flat_file.hpp>
 #include <vmemkv/wal/wal.hpp>
 

@@ -2,8 +2,6 @@
 // Codec and merge helpers live in t1_codec.hpp (see docs/specification/low_level_design.md 7.5).
 #pragma once
 
-#include <sys/mman.h>
-
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -15,15 +13,11 @@
 #include <iostream>
 #include <memory>
 #include <memory_resource>
-#include <mutex>
 #include <span>
-#include <system_error>
-#include <thread>
-#include <type_traits>
+#include <tuple>
 #include <utility>
 #include <vector>
 #include <vmemkv/config.hpp>
-#include <vmemkv/core/bytes.hpp>
 #include <vmemkv/core/lock_free_hash_table.hpp>
 #include <vmemkv/core/mmap.hpp>
 #include <vmemkv/core/reference_tracker.hpp>

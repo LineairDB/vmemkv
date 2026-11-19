@@ -9,13 +9,10 @@
 
 #pragma once
 
-#include <sys/mman.h>
-
 #include <atomic>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
-#include <system_error>
 #include <vmemkv/core/mmap.hpp>
 
 template <typename Key, typename Slot>

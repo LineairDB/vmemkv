@@ -1,7 +1,9 @@
 // paths.hpp - Sibling-path derivation for one store's files.
 #pragma once
 
+#include <cstdint>
 #include <filesystem>
+#include <string>
 #include <string_view>
 #include <vmemkv/core/env.hpp>
 

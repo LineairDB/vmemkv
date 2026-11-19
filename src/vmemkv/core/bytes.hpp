@@ -2,7 +2,6 @@
 #pragma once
 
 #include <algorithm>
-#include <compare>
 #include <cstddef>
 #include <cstring>
 #include <span>

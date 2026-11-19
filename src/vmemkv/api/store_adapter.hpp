@@ -2,13 +2,13 @@
 #pragma once
 
 #include <algorithm>
-#include <optional>
+#include <cstddef>
 #include <span>
 #include <string>
-#include <tuple>
+#include <type_traits>
 #include <utility>
-#include <vector>
 #include <vmemkv/api/serializer.hpp>
+#include <vmemkv/stats.hpp>
 
 namespace vmemkv {
 

@@ -24,6 +24,29 @@ endif()
 option(ENABLE_ROCKSDB "Build with RocksDB backend" OFF)
 option(ENABLE_LMDB "Build with LMDB backend" OFF)
 option(ENABLE_LEANSTORE "Build with LeanStore backend" OFF)
+option(ENABLE_COVERAGE "Enable LLVM source-based code coverage" OFF)
+set(VMEMKV_SANITIZER "NONE" CACHE STRING "Enable sanitizer: NONE, ASAN_UBSAN, or TSAN")
+set_property(CACHE VMEMKV_SANITIZER PROPERTY STRINGS NONE ASAN_UBSAN TSAN)
+
+if(NOT VMEMKV_SANITIZER STREQUAL "NONE")
+  if(VMEMKV_SANITIZER STREQUAL "ASAN_UBSAN")
+    add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=address,undefined)
+  elseif(VMEMKV_SANITIZER STREQUAL "TSAN")
+    add_compile_options(-fsanitize=thread -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=thread)
+  else()
+    message(FATAL_ERROR "Invalid VMEMKV_SANITIZER='${VMEMKV_SANITIZER}' (expected NONE, ASAN_UBSAN, or TSAN)")
+  endif()
+endif()
+
+if(ENABLE_COVERAGE)
+  if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    message(FATAL_ERROR "ENABLE_COVERAGE requires Clang (llvm-cov source-based coverage)")
+  endif()
+  add_compile_options(-fprofile-instr-generate -fcoverage-mapping)
+  add_link_options(-fprofile-instr-generate -fcoverage-mapping)
+endif()
 add_library(vmemkv_headers INTERFACE)
 target_compile_features(vmemkv_headers INTERFACE cxx_std_23)
 target_include_directories(vmemkv_headers INTERFACE
@@ -98,7 +121,7 @@ if(CLANG_TIDY_PROGRAM)
   # header-filter findings repeat per including TU single- or multi-process alike, and `sort`
   # keeps the interleaved output deterministic.
   add_custom_target(clang-tidy-check
-    COMMAND bash -lc "set -o pipefail; find ${CMAKE_CURRENT_SOURCE_DIR}/src -name '*.cpp' -print0 | xargs -0 -P ${CLANG_TIDY_JOBS} -n 1 ${CLANG_TIDY_PROGRAM} -quiet --extra-arg=-w --header-filter='${CLANG_TIDY_HEADER_FILTER}' -p ${CMAKE_BINARY_DIR} 2>&1 | sort | sed -E '/^[0-9]+ warnings generated\\.$/d; /Suppressed [0-9]+ warnings/d; /Use -header-filter=\\.\\*/d; /Use -system-headers/d'"
+    COMMAND bash -lc "set -euo pipefail; { find ${CMAKE_CURRENT_SOURCE_DIR}/src -name '*.cpp' -print0 | xargs -0 -P ${CLANG_TIDY_JOBS} -n 1 ${CLANG_TIDY_PROGRAM} -quiet --extra-arg=-w --header-filter='${CLANG_TIDY_HEADER_FILTER}' -p ${CMAKE_BINARY_DIR} 2>&1 && find ${CMAKE_CURRENT_SOURCE_DIR}/include/vmemkv ${CMAKE_CURRENT_SOURCE_DIR}/src/vmemkv -name '*.hpp' -print0 | xargs -0 -P ${CLANG_TIDY_JOBS} -n 1 ${CLANG_TIDY_PROGRAM} -quiet --extra-arg=-w --extra-arg=-xc++ --extra-arg=-Wno-pragma-once-outside-header --header-filter='${CLANG_TIDY_HEADER_FILTER}' -p ${CMAKE_BINARY_DIR} 2>&1; } | sort -u | sed -E '/^[0-9]+ warnings generated\\.$/d; /Suppressed [0-9]+ warnings/d; /Use -header-filter=\\.\\*/d; /Use -system-headers/d'"
     COMMENT "Running clang-tidy static analysis..."
     VERBATIM
   )
@@ -113,6 +136,18 @@ if(CLANG_TIDY_PROGRAM)
     )
     set_tests_properties(cmake_tidy_check PROPERTIES LABELS "lint;tidy")
   endif()
+endif()
+
+if(ENABLE_COVERAGE AND ENABLE_TESTS)
+  find_program(LLVM_PROFDATA_PROGRAM NAMES llvm-profdata llvm-profdata-18 REQUIRED)
+  find_program(LLVM_COV_PROGRAM NAMES llvm-cov llvm-cov-18 REQUIRED)
+  file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/coverage")
+  set(_cov_ignore_regex "(.*/_deps/|.*/tests/|.*/src/rivals/)")
+  add_custom_target(coverage
+    COMMAND bash -lc "set -euo pipefail; mkdir -p ${CMAKE_BINARY_DIR}/coverage; ${LLVM_PROFDATA_PROGRAM} merge -sparse ${CMAKE_BINARY_DIR}/coverage/*.profraw -o ${CMAKE_BINARY_DIR}/coverage/coverage.profdata; objs=(); for bin in ${CMAKE_BINARY_DIR}/tests/test_*; do [ -x \"$bin\" ] && objs+=(-object \"$bin\"); done; ${LLVM_COV_PROGRAM} report \"\${objs[@]}\" -instr-profile=${CMAKE_BINARY_DIR}/coverage/coverage.profdata -ignore-filename-regex='${_cov_ignore_regex}' | tee ${CMAKE_BINARY_DIR}/coverage/summary.txt; ${LLVM_COV_PROGRAM} export \"\${objs[@]}\" -instr-profile=${CMAKE_BINARY_DIR}/coverage/coverage.profdata -ignore-filename-regex='${_cov_ignore_regex}' -format=lcov > ${CMAKE_BINARY_DIR}/coverage/coverage.lcov; ${LLVM_COV_PROGRAM} show \"\${objs[@]}\" -instr-profile=${CMAKE_BINARY_DIR}/coverage/coverage.profdata -ignore-filename-regex='${_cov_ignore_regex}' -format=html -output-dir=${CMAKE_BINARY_DIR}/coverage/html"
+    COMMENT "Generating LLVM source-based coverage report..."
+    VERBATIM
+  )
 endif()
 
 # ── Install ───────────────────────────────────────────────────────────────────
