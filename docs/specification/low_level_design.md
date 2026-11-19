@@ -556,7 +556,7 @@ Right after mapping Tier 2's main mmap (`random_mmap`, 2.2), calls `madvise(...,
 
 ### 7.5 Immutable-Region Read Paths for Scan/Get
 
-T2's Immutable Region (`< read_only_offset`, 2.2) never changes after writing, so it reads directly from dedicated read paths bypassing the main mmap's `MADV_RANDOM` (7.4), needing no seqlock retry (3.3's forced immutable-region COW detour for in-place updates guarantees this invariance).
+T2's Immutable Region (`< read_only_offset`, 2.2) never changes after writing, so it reads directly from dedicated read paths (`quadfecta::MappedReader`, see [`quadfecta.md`](quadfecta.md)) bypassing the main mmap's `MADV_RANDOM` (7.4), needing no seqlock retry (3.3's forced immutable-region COW detour for in-place updates guarantees this invariance).
 
 - **Premise**: Immutable/Mutable split (2.2) and forced immutable-region COW detour for in-place updates (3.3).
 - **One record's own length (2.1's Embedded Block Count) selects among the 3 mmap paths plus `pread_fd`**. `madvise` is a VMA (whole-mapping) attribute, not a per-read one, so serving both small and large records well takes multiple paths. Every path points at the same byte run, so a wrong choice only mismatches the readahead policy — data never corrupts:

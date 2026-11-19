@@ -49,7 +49,7 @@ Declarative glossary unifying VMemKV concepts with **FASTER** and **LSM-tree** t
 | **Writer Gate** | `WriterGate`, `stop_writers_and_wait` | EBR Quiesce Barrier | Drains in-flight T2 writers at checkpoint frontier capture. |
 | **Key Stripe Lock** | `write_stripes_` (256 mutexes) | Striped Key Latching | Hash-partitioned mutex serializing same-key T1/T2 mutations. |
 | **Seqlock** | `SlotBase::version`, `ValueRecordHeader::version` | Linux Seqlock | Odd/even sequence guard enabling lock-free reads of mutable slots. |
-| **Quadfecta Read Path** | `T2ReadHandles` (3 mmaps + `pread_fd`) | Novel (VM Alias + `pread`) | Routes `random`/`seq`/`normal` mmap or `pread` by op (`Get`/`Scan`) and size. |
+| **Quadfecta Read Path** | `quadfecta::MappedReader` (`T2Memory::reads`, 3 mmaps + `pread_fd`) | Novel (VM Alias + `pread`) | Routes `random`/`seq`/`normal` mmap or `pread` by op (`Get`/`Scan`) and size (`quadfecta.md`). |
 | **Unified Shard Repack** | `repack_dirty_shard()`, `compact_cycle()` | Novel (T1/T2 Co-Compaction) | Rewrites one shard key-ordered to fix 4 KiB scan locality and sparse segments. |
 | **Dirty Shard Queue** | `dirty_queue_`, `t2_dirty` | Write-Dirtied Work Set | O(1) FIFO set tracking T1 shards needing scan-locality check or repack. |
 | **Garbage Segment** | `garbage_head_` (`<50%` live) | Sparse Log Segment | Frozen `< read_only_offset` segment below 50% live bytes awaiting evacuation. |
