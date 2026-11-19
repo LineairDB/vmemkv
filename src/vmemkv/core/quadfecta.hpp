@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <iterator>
 #include <limits>
 #include <optional>
 #include <span>
@@ -33,6 +34,7 @@
 namespace quadfecta {
 
 static_assert(sizeof(off_t) >= sizeof(int64_t), "quadfecta requires 64-bit off_t");
+static_assert(sizeof(size_t) >= sizeof(uint64_t), "quadfecta requires 64-bit size_t");
 
 enum class Access : std::uint8_t {
   Random,      // Single-record point access (avoid readahead).
@@ -46,6 +48,9 @@ enum class Policy : std::uint8_t {
   NormalOnly,  // Pins all reads to normal-advice mmap (falls back to random_mmap).
   PreadOnly,   // Pins all reads to bounded pread().
 };
+
+class Cursor;
+class RecordRange;
 
 class MappedReader {
  public:
@@ -81,6 +86,39 @@ class MappedReader {
     return *this;
   }
 
+  // Wraps an already-open read-only regular file descriptor into a MappedReader.
+  // Does not take ownership of `file_descriptor` (caller keeps responsibility for closing it).
+  // Throws std::system_error if fstat or mapping the primary random view fails; secondary views are best-effort.
+  [[nodiscard]] static auto open_readonly_fd(int file_descriptor) -> MappedReader {
+    if (file_descriptor < 0) {
+      throw std::system_error(EBADF, std::generic_category(), "quadfecta invalid file descriptor");
+    }
+    struct stat file_stat {};
+    if (::fstat(file_descriptor, &file_stat) != 0) {
+      throw std::system_error(errno, std::generic_category(), "quadfecta fstat");
+    }
+    if (!S_ISREG(file_stat.st_mode) || file_stat.st_size < 0) {
+      throw std::system_error(EINVAL, std::generic_category(), "quadfecta requires regular non-negative file");
+    }
+    const auto file_bytes = static_cast<uint64_t>(file_stat.st_size);
+    std::byte *primary = nullptr;
+    if (file_bytes > 0) {
+      void *mapped = ::mmap(nullptr, static_cast<size_t>(file_bytes), PROT_READ, MAP_SHARED, file_descriptor, 0);
+      if (mapped == MAP_FAILED) {
+        throw std::system_error(errno, std::generic_category(), "quadfecta mmap");
+      }
+      if (::madvise(mapped, static_cast<size_t>(file_bytes), MADV_RANDOM) != 0) {
+        const int err = errno;
+        ::munmap(mapped, static_cast<size_t>(file_bytes));
+        throw std::system_error(err, std::generic_category(), "quadfecta madvise MADV_RANDOM");
+      }
+      primary = static_cast<std::byte *>(mapped);
+    }
+    MappedReader reader(primary, file_bytes);
+    reader.open_secondary_handles(file_descriptor);
+    return reader;
+  }
+
   // Opens an immutable/read-only file and maps all four Quadfecta handles. Throws std::system_error
   // if opening, stat'ing, or mapping the primary random view fails; secondary views are best-effort.
   [[nodiscard]] static auto open_readonly(const std::filesystem::path &path) -> MappedReader {
@@ -89,34 +127,7 @@ class MappedReader {
       throw std::system_error(errno, std::generic_category(), "quadfecta open");
     }
     try {
-      struct stat file_stat {};
-      if (::fstat(file_descriptor, &file_stat) != 0) {
-        throw std::system_error(errno, std::generic_category(), "quadfecta fstat");
-      }
-      if (!S_ISREG(file_stat.st_mode) || file_stat.st_size < 0) {
-        throw std::system_error(EINVAL, std::generic_category(), "quadfecta requires regular non-negative file");
-      }
-      const auto file_bytes = static_cast<uint64_t>(file_stat.st_size);
-      if constexpr (sizeof(uint64_t) > sizeof(size_t)) {
-        if (file_bytes > std::numeric_limits<size_t>::max()) {
-          throw std::system_error(EOVERFLOW, std::generic_category(), "quadfecta file exceeds address space");
-        }
-      }
-      std::byte *primary = nullptr;
-      if (file_bytes > 0) {
-        void *mapped = ::mmap(nullptr, static_cast<size_t>(file_bytes), PROT_READ, MAP_SHARED, file_descriptor, 0);
-        if (mapped == MAP_FAILED) {
-          throw std::system_error(errno, std::generic_category(), "quadfecta mmap");
-        }
-        if (::madvise(mapped, static_cast<size_t>(file_bytes), MADV_RANDOM) != 0) {
-          const int err = errno;
-          ::munmap(mapped, static_cast<size_t>(file_bytes));
-          throw std::system_error(err, std::generic_category(), "quadfecta madvise MADV_RANDOM");
-        }
-        primary = static_cast<std::byte *>(mapped);
-      }
-      MappedReader reader(primary, file_bytes);
-      reader.open_secondary_handles(file_descriptor);
+      MappedReader reader = open_readonly_fd(file_descriptor);
       ::close(file_descriptor);
       return reader;
     } catch (...) {
@@ -196,6 +207,47 @@ class MappedReader {
     return window->first(static_cast<size_t>(size));
   }
 
+  // Indexed fixed-length record read at `base_offset + index * stride`.
+  // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+  [[nodiscard]] auto read_at_index(uint64_t index,
+                                   uint64_t stride,
+                                   Access access,
+                                   std::vector<std::byte> *scratch,
+                                   Policy policy = Policy::Adaptive,
+                                   uint64_t base_offset = 0) const -> std::optional<std::span<const std::byte>> {
+    if (stride == 0 || base_offset > capacity_ || index > (capacity_ - base_offset) / stride) {
+      return std::nullopt;
+    }
+    return read(base_offset + (index * stride), stride, access, scratch, policy);
+  }
+
+  // Creates a positional sequential cursor bounded by `[begin_offset, min(end_offset, capacity()))`.
+  // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+  [[nodiscard]] inline auto cursor(uint64_t begin_offset = 0,
+                                   uint64_t end_offset = std::numeric_limits<uint64_t>::max()) const noexcept -> Cursor;
+
+  // Iterates exact `stride`-byte fixed-length records over `[begin_offset, end_offset)` sequentially.
+  [[nodiscard]] inline auto records(uint64_t stride,
+                                    std::vector<std::byte> *scratch,
+                                    Policy policy = Policy::Adaptive) const noexcept -> RecordRange;
+  // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+  [[nodiscard]] inline auto records(uint64_t begin_offset,
+                                    uint64_t end_offset,
+                                    uint64_t stride,
+                                    std::vector<std::byte> *scratch,
+                                    Policy policy = Policy::Adaptive) const noexcept -> RecordRange;
+
+  // Iterates sequential chunks of up to `chunk_bytes` (the final chunk may be shorter).
+  [[nodiscard]] inline auto chunks(uint64_t chunk_bytes,
+                                   std::vector<std::byte> *scratch,
+                                   Policy policy = Policy::Adaptive) const noexcept -> RecordRange;
+  // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+  [[nodiscard]] inline auto chunks(uint64_t begin_offset,
+                                   uint64_t end_offset,
+                                   uint64_t chunk_bytes,
+                                   std::vector<std::byte> *scratch,
+                                   Policy policy = Policy::Adaptive) const noexcept -> RecordRange;
+
   // Variable-length read helper: returns an mmap view up to `min(valid_end, capacity())` bytes, or
   // preads up to `min(max_bytes, valid_end - offset)` bytes into `scratch`. Callers parse record
   // headers inside the returned span and verify total record length <= returned span size.
@@ -222,7 +274,7 @@ class MappedReader {
       return std::span<const std::byte>(mapping + offset, static_cast<size_t>(limit - offset));
     }
 
-    if (access == Access::Random && scratch != nullptr) {
+    if (scratch != nullptr) {
       return pread_window(offset, std::min(max_bytes, limit - offset), *scratch);
     }
     return std::nullopt;
@@ -312,5 +364,166 @@ class MappedReader {
   int pread_fd_ = -1;
   uint64_t capacity_ = 0;
 };
+
+// Positional sequential stream cursor over a MappedReader (Access::Sequential).
+// Fits cursor-oriented scans (e.g. Lucene IndexInput, RocksDB BlobLogSequentialReader, Git packs).
+class Cursor {
+ public:
+  Cursor() noexcept = default;
+
+  // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+  explicit Cursor(const MappedReader &reader,
+                  uint64_t begin_offset = 0,
+                  uint64_t end_offset = std::numeric_limits<uint64_t>::max()) noexcept
+      : reader_(&reader), end_(std::min(end_offset, reader.capacity())), pos_(std::min(begin_offset, end_)) {}
+
+  [[nodiscard]] auto pos() const noexcept -> uint64_t { return pos_; }
+  [[nodiscard]] auto end() const noexcept -> uint64_t { return end_; }
+  [[nodiscard]] auto remaining() const noexcept -> uint64_t { return end_ - pos_; }
+  [[nodiscard]] auto at_end() const noexcept -> bool { return pos_ >= end_; }
+
+  void seek(uint64_t offset) noexcept { pos_ = std::min(offset, end_); }
+  void advance(uint64_t bytes) noexcept { pos_ += std::min(bytes, end_ - pos_); }
+
+  // Reads `size` sequential bytes from pos() and advances pos() on success.
+  [[nodiscard]] auto read_next(uint64_t size,
+                               std::vector<std::byte> *scratch,
+                               Policy policy = Policy::Adaptive) -> std::optional<std::span<const std::byte>> {
+    if (reader_ == nullptr || size > remaining()) {
+      return std::nullopt;
+    }
+    if (size == 0) {
+      return std::span<const std::byte>{};
+    }
+    const auto window = reader_->view_at_most(pos_, size, pos_ + size, Access::Sequential, scratch, policy);
+    if (!window.has_value() || window->size() < size) {
+      return std::nullopt;
+    }
+    pos_ += size;
+    return window->first(static_cast<size_t>(size));
+  }
+
+  // Variable-length sequential read helper at pos() bounded by end_. Does not advance pos();
+  // call advance(consumed_bytes) after parsing the record length.
+  [[nodiscard]] auto peek_at_most(uint64_t max_bytes,
+                                  std::vector<std::byte> *scratch,
+                                  Policy policy = Policy::Adaptive) const -> std::optional<std::span<const std::byte>> {
+    if (reader_ == nullptr) {
+      return std::nullopt;
+    }
+    return reader_->view_at_most(pos_, max_bytes, end_, Access::Sequential, scratch, policy);
+  }
+
+ private:
+  const MappedReader *reader_ = nullptr;
+  uint64_t end_ = 0;
+  uint64_t pos_ = 0;
+};
+
+// C++20 input range yielding sequential fixed-stride records or chunks via Quadfecta.
+class RecordRange {
+ public:
+  enum class TailMode : std::uint8_t { ExactOnly, AllowPartial };
+
+  class Iterator {
+   public:
+    using iterator_concept = std::input_iterator_tag;
+    using iterator_category = std::input_iterator_tag;
+    using value_type = std::span<const std::byte>;
+    using difference_type = std::ptrdiff_t;
+
+    Iterator() noexcept = default;
+
+    [[nodiscard]] auto operator*() const noexcept -> value_type { return current_.value_or(value_type{}); }
+
+    auto operator++() -> Iterator & {
+      fetch_next();
+      return *this;
+    }
+
+    void operator++(int) { ++(*this); }
+
+    [[nodiscard]] friend auto operator==(const Iterator &iter, std::default_sentinel_t /*unused*/) noexcept -> bool {
+      return !iter.current_.has_value();
+    }
+
+   private:
+    friend class RecordRange;
+
+    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+    Iterator(Cursor cursor, uint64_t stride, std::vector<std::byte> *scratch, Policy policy, TailMode tail_mode)
+        : cursor_(cursor), stride_(stride), scratch_(scratch), policy_(policy), tail_mode_(tail_mode) {
+      fetch_next();
+    }
+
+    void fetch_next() {
+      if (stride_ == 0 || cursor_.at_end()) {
+        current_ = std::nullopt;
+        return;
+      }
+      const uint64_t want = tail_mode_ == TailMode::AllowPartial ? std::min(stride_, cursor_.remaining()) : stride_;
+      current_ = cursor_.read_next(want, scratch_, policy_);
+    }
+
+    Cursor cursor_;
+    uint64_t stride_ = 0;
+    std::vector<std::byte> *scratch_ = nullptr;
+    Policy policy_ = Policy::Adaptive;
+    TailMode tail_mode_ = TailMode::ExactOnly;
+    std::optional<value_type> current_;
+  };
+
+  RecordRange(Cursor cursor,
+              uint64_t stride,
+              std::vector<std::byte> *scratch,
+              Policy policy = Policy::Adaptive,
+              TailMode tail_mode = TailMode::ExactOnly) noexcept
+      : cursor_(cursor), stride_(stride), scratch_(scratch), policy_(policy), tail_mode_(tail_mode) {}
+
+  [[nodiscard]] auto begin() const -> Iterator { return {cursor_, stride_, scratch_, policy_, tail_mode_}; }
+  [[nodiscard]] static auto end() noexcept -> std::default_sentinel_t { return std::default_sentinel; }
+
+ private:
+  Cursor cursor_;
+  uint64_t stride_ = 0;
+  std::vector<std::byte> *scratch_ = nullptr;
+  Policy policy_ = Policy::Adaptive;
+  TailMode tail_mode_ = TailMode::ExactOnly;
+};
+
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+inline auto MappedReader::cursor(uint64_t begin_offset, uint64_t end_offset) const noexcept -> Cursor {
+  return Cursor(*this, begin_offset, end_offset);
+}
+
+inline auto MappedReader::records(uint64_t stride,
+                                  std::vector<std::byte> *scratch,
+                                  Policy policy) const noexcept -> RecordRange {
+  return {cursor(0, capacity_), stride, scratch, policy, RecordRange::TailMode::ExactOnly};
+}
+
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+inline auto MappedReader::records(uint64_t begin_offset,
+                                  uint64_t end_offset,
+                                  uint64_t stride,
+                                  std::vector<std::byte> *scratch,
+                                  Policy policy) const noexcept -> RecordRange {
+  return {cursor(begin_offset, end_offset), stride, scratch, policy, RecordRange::TailMode::ExactOnly};
+}
+
+inline auto MappedReader::chunks(uint64_t chunk_bytes,
+                                 std::vector<std::byte> *scratch,
+                                 Policy policy) const noexcept -> RecordRange {
+  return {cursor(0, capacity_), chunk_bytes, scratch, policy, RecordRange::TailMode::AllowPartial};
+}
+
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+inline auto MappedReader::chunks(uint64_t begin_offset,
+                                 uint64_t end_offset,
+                                 uint64_t chunk_bytes,
+                                 std::vector<std::byte> *scratch,
+                                 Policy policy) const noexcept -> RecordRange {
+  return {cursor(begin_offset, end_offset), chunk_bytes, scratch, policy, RecordRange::TailMode::AllowPartial};
+}
 
 }  // namespace quadfecta

@@ -99,11 +99,16 @@ Any system adopting `quadfecta::MappedReader` must satisfy three external invari
 | `quadfecta::Access` | `Random` (point lookup) / `Sequential` (contiguous scan) |
 | `quadfecta::Policy` | `Adaptive` (default) or explicit `RandomOnly`, `SeqOnly`, `NormalOnly`, `PreadOnly` |
 | `MappedReader::open_readonly(path)` | Opens a read-only file, maps `random_mmap`, attaches secondary handles best-effort |
+| `MappedReader::open_readonly_fd(fd)` | Wraps an existing read-only regular FD (non-owning of caller `fd`) |
 | `MappedReader(primary_random_mmap, capacity)` | Adopts an existing primary `MADV_RANDOM` mapping (owned and unmapped on destruction) |
 | `open_secondary_handles(fd)` | Best-effort maps `normal_mmap`, `sequential_mmap`, and `F_DUPFD_CLOEXEC` `pread_fd` |
 | `read(offset, size, access, scratch, policy)` | Fixed-size read returning exact `size` bytes or `std::nullopt` |
+| `read_at_index(index, stride, access, scratch, policy, base)` | Indexed fixed-stride record read at `base + index * stride` |
 | `view_at_most(offset, max_bytes, valid_end, access, scratch, policy)` | Variable-length read returning mmap tail up to `min(valid_end, capacity())` or bounded `pread()` |
 | `prefetch(offset, len)` | Best-effort `MADV_WILLNEED` readahead trigger on `random_mmap` |
+| `cursor(begin, end)` | Positional sequential stream cursor (`Cursor`: `read_next`, `peek_at_most`, `advance`, `seek`) |
+| `records([begin, end,] stride, scratch, policy)` | C++20 input range over exact `stride`-byte sequential records (`Access::Sequential`) |
+| `chunks([begin, end,] chunk_bytes, scratch, policy)` | C++20 input range over sequential chunks up to `chunk_bytes` (allows partial final tail) |
 
 ### Pattern A: Fixed-Size / Known-Length Reads (`read`)
 
@@ -132,6 +137,29 @@ if (sizeof(Header) + hdr->payload_len > window->size()) {
   return std::nullopt;  // Size hint underestimated actual record; caller falls back
 }
 return parse_record(hdr);
+```
+
+### Pattern C: Sequential Scans & Fixed-Stride Iteration (`Cursor`, `records`, `chunks`)
+
+Suitable for scanning fixed-length entry tables (e.g., index files) or streaming sequential containers:
+
+```cpp
+std::vector<std::byte> scratch;
+
+// Fixed-stride records (auto-routed to sequential_mmap / normal_mmap / pread by stride size)
+for (std::span<const std::byte> rec : reader.records(base_off, end_off, record_stride, &scratch)) {
+  process_fixed_record(rec);
+}
+
+// Variable-length sequential stream via Cursor
+auto cur = reader.cursor(start_off, end_off);
+while (!cur.at_end()) {
+  auto win = cur.peek_at_most(header_hint, &scratch);
+  if (!win.has_value() || win->size() < sizeof(Header)) break;
+  const uint64_t record_bytes = parse_len(*win);
+  consume(win->first(record_bytes));
+  cur.advance(record_bytes);
+}
 ```
 
 ### Integration in VMemKV

@@ -11,6 +11,9 @@
 #include <filesystem>
 #include <fstream>
 #include <ios>
+#include <iterator>
+#include <limits>
+#include <ranges>
 #include <system_error>
 #include <utility>
 #include <vector>
@@ -18,6 +21,9 @@
 #include <vmemkv/core/utils.hpp>
 
 #include "test_support.hpp"
+
+static_assert(std::input_iterator<quadfecta::RecordRange::Iterator>);
+static_assert(std::ranges::input_range<quadfecta::RecordRange>);
 
 namespace {
 
@@ -143,6 +149,7 @@ TEST_CASE("Quadfecta: open_readonly handles missing and empty files and primary-
 
   const auto missing = vmemkv_test::reserve_unique_temp_path("quadfecta_missing");
   CHECK_THROWS_AS((void)quadfecta::MappedReader::open_readonly(missing), std::system_error);
+  CHECK_THROWS_AS((void)quadfecta::MappedReader::open_readonly_fd(-1), std::system_error);
 
   const auto empty_path = vmemkv_test::ScopedTempPath("quadfecta_empty", vmemkv::remove_quiet);
   write_binary_file(empty_path.get(), {});
@@ -186,4 +193,116 @@ TEST_CASE("Quadfecta: open_readonly handles missing and empty files and primary-
   const auto span = reassigned.read(17, 16, quadfecta::Access::Sequential, &scratch);
   REQUIRE(span.has_value());
   CHECK(std::memcmp(span->data(), bytes + 17, 16) == 0);
+}
+
+TEST_CASE("Quadfecta: open_readonly_fd wraps caller FD without closing it and Sequential falls back to pread") {
+  const auto path = vmemkv_test::ScopedTempPath("quadfecta_from_fd", vmemkv::remove_quiet);
+  const auto payload = make_pattern_bytes(quadfecta::MappedReader::page_size() * 2);
+  write_binary_file(path.get(), payload);
+
+  const int fd = ::open(path.get().c_str(), O_RDONLY | O_CLOEXEC);
+  REQUIRE(fd >= 0);
+  {
+    auto reader = quadfecta::MappedReader::open_readonly_fd(fd);
+    CHECK(reader.capacity() == payload.size());
+    std::vector<std::byte> scratch;
+    const auto span = reader.read(64, 128, quadfecta::Access::Random, &scratch);
+    REQUIRE(span.has_value());
+    CHECK(std::memcmp(span->data(), payload.data() + 64, 128) == 0);
+  }
+  {
+    // When primary mapping is null (mmap absent) and secondary pread_fd is attached, reads fall back to pread.
+    quadfecta::MappedReader fallback_reader(nullptr, payload.size());
+    fallback_reader.open_secondary_handles(fd);
+    std::vector<std::byte> scratch;
+    const auto span = fallback_reader.read(64, 128, quadfecta::Access::Random, &scratch, quadfecta::Policy::RandomOnly);
+    REQUIRE(span.has_value());
+    CHECK(std::memcmp(span->data(), payload.data() + 64, 128) == 0);
+  }
+  // Caller's FD must still be open after MappedReader destruction.
+  CHECK(::close(fd) == 0);
+}
+
+TEST_CASE("Quadfecta: read_at_index, Cursor, records(), and chunks() across Adaptive and PreadOnly") {
+  const auto path = vmemkv_test::ScopedTempPath("quadfecta_iter", vmemkv::remove_quiet);
+  const uint64_t page_size = quadfecta::MappedReader::page_size();
+  // Non-multiple of 32-byte stride and non-multiple of (page_size + 128) chunk size.
+  const size_t total_size = static_cast<size_t>((page_size * 2) + 300);
+  const auto payload = make_pattern_bytes(total_size);
+  write_binary_file(path.get(), payload);
+
+  const auto reader = quadfecta::MappedReader::open_readonly(path.get());
+  std::vector<std::byte> scratch;
+
+  // Indexed fixed-length reads with base offset and overflow/zero-stride guards.
+  constexpr uint64_t kBaseOffset = 12;
+  constexpr uint64_t kStride = 32;
+  for (quadfecta::Policy policy : {quadfecta::Policy::Adaptive, quadfecta::Policy::PreadOnly}) {
+    const auto rec = reader.read_at_index(5, kStride, quadfecta::Access::Random, &scratch, policy, kBaseOffset);
+    REQUIRE(rec.has_value());
+    CHECK(rec->size() == kStride);
+    CHECK(std::memcmp(rec->data(), payload.data() + kBaseOffset + (5 * kStride), kStride) == 0);
+  }
+  CHECK_FALSE(reader.read_at_index(0, 0, quadfecta::Access::Random, &scratch).has_value());
+  CHECK_FALSE(reader.read_at_index(std::numeric_limits<uint64_t>::max(), kStride, quadfecta::Access::Random, &scratch)
+                  .has_value());
+  CHECK_FALSE(reader.read_at_index(10000, kStride, quadfecta::Access::Random, &scratch, quadfecta::Policy::Adaptive, 0)
+                  .has_value());
+
+  // Sequential Cursor: fixed read_next, seek, and peek_at_most + advance.
+  auto cursor = reader.cursor(16, 16 + 100);
+  CHECK(cursor.pos() == 16);
+  CHECK(cursor.end() == 116);
+  CHECK(cursor.remaining() == 100);
+  CHECK_FALSE(cursor.at_end());
+  const auto first = cursor.read_next(40, &scratch);
+  REQUIRE(first.has_value());
+  CHECK(cursor.pos() == 56);
+  CHECK(std::memcmp(first->data(), payload.data() + 16, 40) == 0);
+  // Requesting past remaining() returns nullopt without advancing pos().
+  CHECK_FALSE(cursor.read_next(61, &scratch).has_value());
+  CHECK(cursor.pos() == 56);
+  // Variable-length peek_at_most + advance across Adaptive and PreadOnly.
+  const auto peek = cursor.peek_at_most(64, &scratch, quadfecta::Policy::PreadOnly);
+  REQUIRE(peek.has_value());
+  CHECK(peek->size() == 60);
+  CHECK(std::memcmp(peek->data(), payload.data() + 56, 60) == 0);
+  cursor.advance(25);
+  CHECK(cursor.pos() == 81);
+  cursor.seek(10);
+  CHECK(cursor.pos() == 10);
+  cursor.advance(1000);
+  CHECK(cursor.at_end());
+
+  // Fixed-stride records() drops trailing partial bytes (< kStride).
+  for (quadfecta::Policy policy : {quadfecta::Policy::Adaptive, quadfecta::Policy::PreadOnly}) {
+    std::vector<std::byte> collected;
+    for (std::span<const std::byte> rec : reader.records(kBaseOffset, total_size, kStride, &scratch, policy)) {
+      CHECK(rec.size() == kStride);
+      collected.insert(collected.end(), rec.begin(), rec.end());
+    }
+    const size_t expected_full_bytes = ((total_size - kBaseOffset) / kStride) * kStride;
+    REQUIRE(collected.size() == expected_full_bytes);
+    CHECK(std::memcmp(collected.data(), payload.data() + kBaseOffset, expected_full_bytes) == 0);
+  }
+  // Zero stride yields an empty range cleanly.
+  size_t zero_count = 0;
+  for ([[maybe_unused]] auto rec : reader.records(0, &scratch)) {
+    ++zero_count;
+  }
+  CHECK(zero_count == 0);
+
+  // Sequential chunks() includes the shorter trailing tail for both small and large chunk sizes.
+  for (uint64_t chunk_size : {uint64_t{512}, page_size + 128}) {
+    for (quadfecta::Policy policy : {quadfecta::Policy::Adaptive, quadfecta::Policy::PreadOnly}) {
+      std::vector<std::byte> reassembled;
+      reassembled.reserve(total_size);
+      for (std::span<const std::byte> chunk : reader.chunks(chunk_size, &scratch, policy)) {
+        CHECK(chunk.size() <= chunk_size);
+        reassembled.insert(reassembled.end(), chunk.begin(), chunk.end());
+      }
+      REQUIRE(reassembled.size() == payload.size());
+      CHECK(std::memcmp(reassembled.data(), payload.data(), payload.size()) == 0);
+    }
+  }
 }
