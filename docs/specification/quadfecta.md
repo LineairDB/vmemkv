@@ -106,9 +106,9 @@ Any system adopting `quadfecta::MappedReader` must satisfy three external invari
 | `read_at_index(index, stride, access, scratch, policy, base)` | Indexed fixed-stride record read at `base + index * stride` |
 | `view_at_most(offset, max_bytes, valid_end, access, scratch, policy)` | Variable-length read returning mmap tail up to `min(valid_end, capacity())` or bounded `pread()` |
 | `prefetch(offset, len)` | Best-effort `MADV_WILLNEED` readahead trigger on `random_mmap` |
-| `cursor(begin, end)` | Positional sequential stream cursor (`Cursor`: `read_next`, `peek_at_most`, `advance`, `seek`) |
-| `records([begin, end,] stride, scratch, policy)` | C++20 input range over exact `stride`-byte sequential records (`Access::Sequential`) |
-| `chunks([begin, end,] chunk_bytes, scratch, policy)` | C++20 input range over sequential chunks up to `chunk_bytes` (allows partial final tail) |
+| `quadfecta::Cursor(reader, begin, end)` | Positional sequential stream cursor (`read_next`, `peek_at_most`, `advance`, `seek`) |
+| `quadfecta::records(reader, stride, scratch, policy, begin, end)` | C++20 input range over exact `stride`-byte sequential records (`Access::Sequential`) |
+| `quadfecta::chunks(reader, chunk_bytes, scratch, policy, begin, end)` | C++20 input range over sequential chunks up to `chunk_bytes` (allows partial final tail) |
 
 ### Pattern A: Fixed-Size / Known-Length Reads (`read`)
 
@@ -147,12 +147,12 @@ Suitable for scanning fixed-length entry tables (e.g., index files) or streaming
 std::vector<std::byte> scratch;
 
 // Fixed-stride records (auto-routed to sequential_mmap / normal_mmap / pread by stride size)
-for (std::span<const std::byte> rec : reader.records(base_off, end_off, record_stride, &scratch)) {
+for (std::span<const std::byte> rec : quadfecta::records(reader, record_stride, &scratch, quadfecta::Policy::Adaptive, base_off, end_off)) {
   process_fixed_record(rec);
 }
 
 // Variable-length sequential stream via Cursor
-auto cur = reader.cursor(start_off, end_off);
+quadfecta::Cursor cur(reader, start_off, end_off);
 while (!cur.at_end()) {
   auto win = cur.peek_at_most(header_hint, &scratch);
   if (!win.has_value() || win->size() < sizeof(Header)) break;

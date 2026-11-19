@@ -49,9 +49,6 @@ enum class Policy : std::uint8_t {
   PreadOnly,   // Pins all reads to bounded pread().
 };
 
-class Cursor;
-class RecordRange;
-
 class MappedReader {
  public:
   MappedReader() noexcept = default;
@@ -67,23 +64,23 @@ class MappedReader {
   MappedReader(const MappedReader &) = delete;
   auto operator=(const MappedReader &) -> MappedReader & = delete;
 
-  MappedReader(MappedReader &&other) noexcept
-      : random_mmap_(std::exchange(other.random_mmap_, nullptr)),
-        sequential_mmap_(std::exchange(other.sequential_mmap_, nullptr)),
-        normal_mmap_(std::exchange(other.normal_mmap_, nullptr)),
-        pread_fd_(std::exchange(other.pread_fd_, -1)),
-        capacity_(std::exchange(other.capacity_, 0)) {}
+  MappedReader(MappedReader &&other) noexcept { swap(*this, other); }
 
   auto operator=(MappedReader &&other) noexcept -> MappedReader & {
     if (this != &other) {
       reset();
-      random_mmap_ = std::exchange(other.random_mmap_, nullptr);
-      sequential_mmap_ = std::exchange(other.sequential_mmap_, nullptr);
-      normal_mmap_ = std::exchange(other.normal_mmap_, nullptr);
-      pread_fd_ = std::exchange(other.pread_fd_, -1);
-      capacity_ = std::exchange(other.capacity_, 0);
+      swap(*this, other);
     }
     return *this;
+  }
+
+  friend void swap(MappedReader &lhs, MappedReader &rhs) noexcept {
+    using std::swap;
+    swap(lhs.random_mmap_, rhs.random_mmap_);
+    swap(lhs.sequential_mmap_, rhs.sequential_mmap_);
+    swap(lhs.normal_mmap_, rhs.normal_mmap_);
+    swap(lhs.pread_fd_, rhs.pread_fd_);
+    swap(lhs.capacity_, rhs.capacity_);
   }
 
   // Wraps an already-open read-only regular file descriptor into a MappedReader.
@@ -221,33 +218,6 @@ class MappedReader {
     return read(base_offset + (index * stride), stride, access, scratch, policy);
   }
 
-  // Creates a positional sequential cursor bounded by `[begin_offset, min(end_offset, capacity()))`.
-  // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-  [[nodiscard]] inline auto cursor(uint64_t begin_offset = 0,
-                                   uint64_t end_offset = std::numeric_limits<uint64_t>::max()) const noexcept -> Cursor;
-
-  // Iterates exact `stride`-byte fixed-length records over `[begin_offset, end_offset)` sequentially.
-  [[nodiscard]] inline auto records(uint64_t stride,
-                                    std::vector<std::byte> *scratch,
-                                    Policy policy = Policy::Adaptive) const noexcept -> RecordRange;
-  // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-  [[nodiscard]] inline auto records(uint64_t begin_offset,
-                                    uint64_t end_offset,
-                                    uint64_t stride,
-                                    std::vector<std::byte> *scratch,
-                                    Policy policy = Policy::Adaptive) const noexcept -> RecordRange;
-
-  // Iterates sequential chunks of up to `chunk_bytes` (the final chunk may be shorter).
-  [[nodiscard]] inline auto chunks(uint64_t chunk_bytes,
-                                   std::vector<std::byte> *scratch,
-                                   Policy policy = Policy::Adaptive) const noexcept -> RecordRange;
-  // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-  [[nodiscard]] inline auto chunks(uint64_t begin_offset,
-                                   uint64_t end_offset,
-                                   uint64_t chunk_bytes,
-                                   std::vector<std::byte> *scratch,
-                                   Policy policy = Policy::Adaptive) const noexcept -> RecordRange;
-
   // Variable-length read helper: returns an mmap view up to `min(valid_end, capacity())` bytes, or
   // preads up to `min(max_bytes, valid_end - offset)` bytes into `scratch`. Callers parse record
   // headers inside the returned span and verify total record length <= returned span size.
@@ -338,14 +308,10 @@ class MappedReader {
 
   void reset() noexcept {
     if (capacity_ > 0) {
-      if (normal_mmap_ != nullptr) {
-        ::munmap(normal_mmap_, static_cast<size_t>(capacity_));
-      }
-      if (sequential_mmap_ != nullptr) {
-        ::munmap(sequential_mmap_, static_cast<size_t>(capacity_));
-      }
-      if (random_mmap_ != nullptr) {
-        ::munmap(random_mmap_, static_cast<size_t>(capacity_));
+      for (std::byte *mapping : {normal_mmap_, sequential_mmap_, random_mmap_}) {
+        if (mapping != nullptr) {
+          ::munmap(mapping, static_cast<size_t>(capacity_));
+        }
       }
     }
     if (pread_fd_ >= 0) {
@@ -425,6 +391,13 @@ class RecordRange {
  public:
   enum class TailMode : std::uint8_t { ExactOnly, AllowPartial };
 
+  struct Spec {
+    uint64_t stride = 0;
+    std::vector<std::byte> *scratch = nullptr;
+    Policy policy = Policy::Adaptive;
+    TailMode tail_mode = TailMode::ExactOnly;
+  };
+
   class Iterator {
    public:
     using iterator_concept = std::input_iterator_tag;
@@ -433,97 +406,66 @@ class RecordRange {
     using difference_type = std::ptrdiff_t;
 
     Iterator() noexcept = default;
-
     [[nodiscard]] auto operator*() const noexcept -> value_type { return current_.value_or(value_type{}); }
-
     auto operator++() -> Iterator & {
       fetch_next();
       return *this;
     }
-
     void operator++(int) { ++(*this); }
-
     [[nodiscard]] friend auto operator==(const Iterator &iter, std::default_sentinel_t /*unused*/) noexcept -> bool {
       return !iter.current_.has_value();
     }
 
    private:
     friend class RecordRange;
-
-    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-    Iterator(Cursor cursor, uint64_t stride, std::vector<std::byte> *scratch, Policy policy, TailMode tail_mode)
-        : cursor_(cursor), stride_(stride), scratch_(scratch), policy_(policy), tail_mode_(tail_mode) {
-      fetch_next();
-    }
+    Iterator(Cursor cursor, Spec spec) : cursor_(cursor), spec_(spec) { fetch_next(); }
 
     void fetch_next() {
-      if (stride_ == 0 || cursor_.at_end()) {
+      if (spec_.stride == 0 || cursor_.at_end()) {
         current_ = std::nullopt;
         return;
       }
-      const uint64_t want = tail_mode_ == TailMode::AllowPartial ? std::min(stride_, cursor_.remaining()) : stride_;
-      current_ = cursor_.read_next(want, scratch_, policy_);
+      const uint64_t want =
+          spec_.tail_mode == TailMode::AllowPartial ? std::min(spec_.stride, cursor_.remaining()) : spec_.stride;
+      current_ = cursor_.read_next(want, spec_.scratch, spec_.policy);
     }
 
     Cursor cursor_;
-    uint64_t stride_ = 0;
-    std::vector<std::byte> *scratch_ = nullptr;
-    Policy policy_ = Policy::Adaptive;
-    TailMode tail_mode_ = TailMode::ExactOnly;
+    Spec spec_{};
     std::optional<value_type> current_;
   };
 
-  RecordRange(Cursor cursor,
-              uint64_t stride,
-              std::vector<std::byte> *scratch,
-              Policy policy = Policy::Adaptive,
-              TailMode tail_mode = TailMode::ExactOnly) noexcept
-      : cursor_(cursor), stride_(stride), scratch_(scratch), policy_(policy), tail_mode_(tail_mode) {}
+  RecordRange(Cursor cursor, Spec spec) noexcept : cursor_(cursor), spec_(spec) {}
 
-  [[nodiscard]] auto begin() const -> Iterator { return {cursor_, stride_, scratch_, policy_, tail_mode_}; }
+  [[nodiscard]] auto begin() const -> Iterator { return {cursor_, spec_}; }
   [[nodiscard]] static auto end() noexcept -> std::default_sentinel_t { return std::default_sentinel; }
 
  private:
   Cursor cursor_;
-  uint64_t stride_ = 0;
-  std::vector<std::byte> *scratch_ = nullptr;
-  Policy policy_ = Policy::Adaptive;
-  TailMode tail_mode_ = TailMode::ExactOnly;
+  Spec spec_{};
 };
 
+// Iterates exact `stride`-byte sequential records over `[begin_offset, min(end_offset, reader.capacity()))`.
 // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-inline auto MappedReader::cursor(uint64_t begin_offset, uint64_t end_offset) const noexcept -> Cursor {
-  return Cursor(*this, begin_offset, end_offset);
-}
-
-inline auto MappedReader::records(uint64_t stride,
-                                  std::vector<std::byte> *scratch,
-                                  Policy policy) const noexcept -> RecordRange {
-  return {cursor(0, capacity_), stride, scratch, policy, RecordRange::TailMode::ExactOnly};
-}
-
-// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-inline auto MappedReader::records(uint64_t begin_offset,
-                                  uint64_t end_offset,
+[[nodiscard]] inline auto records(const MappedReader &reader,
                                   uint64_t stride,
                                   std::vector<std::byte> *scratch,
-                                  Policy policy) const noexcept -> RecordRange {
-  return {cursor(begin_offset, end_offset), stride, scratch, policy, RecordRange::TailMode::ExactOnly};
+                                  Policy policy = Policy::Adaptive,
+                                  uint64_t begin_offset = 0,
+                                  uint64_t end_offset = std::numeric_limits<uint64_t>::max()) noexcept -> RecordRange {
+  return {Cursor(reader, begin_offset, end_offset), {stride, scratch, policy, RecordRange::TailMode::ExactOnly}};
 }
 
-inline auto MappedReader::chunks(uint64_t chunk_bytes,
-                                 std::vector<std::byte> *scratch,
-                                 Policy policy) const noexcept -> RecordRange {
-  return {cursor(0, capacity_), chunk_bytes, scratch, policy, RecordRange::TailMode::AllowPartial};
-}
-
+// Iterates sequential chunks up to `chunk_bytes` (including any shorter trailing chunk).
 // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-inline auto MappedReader::chunks(uint64_t begin_offset,
-                                 uint64_t end_offset,
+[[nodiscard]] inline auto chunks(const MappedReader &reader,
                                  uint64_t chunk_bytes,
                                  std::vector<std::byte> *scratch,
-                                 Policy policy) const noexcept -> RecordRange {
-  return {cursor(begin_offset, end_offset), chunk_bytes, scratch, policy, RecordRange::TailMode::AllowPartial};
+                                 Policy policy = Policy::Adaptive,
+                                 uint64_t begin_offset = 0,
+                                 uint64_t end_offset = std::numeric_limits<uint64_t>::max()) noexcept -> RecordRange {
+  return {Cursor(reader, begin_offset, end_offset),
+          {chunk_bytes, scratch, policy, RecordRange::TailMode::AllowPartial}};
 }
 
 }  // namespace quadfecta

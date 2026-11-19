@@ -250,7 +250,7 @@ TEST_CASE("Quadfecta: read_at_index, Cursor, records(), and chunks() across Adap
                   .has_value());
 
   // Sequential Cursor: fixed read_next, seek, and peek_at_most + advance.
-  auto cursor = reader.cursor(16, 16 + 100);
+  quadfecta::Cursor cursor(reader, 16, 16 + 100);
   CHECK(cursor.pos() == 16);
   CHECK(cursor.end() == 116);
   CHECK(cursor.remaining() == 100);
@@ -277,7 +277,8 @@ TEST_CASE("Quadfecta: read_at_index, Cursor, records(), and chunks() across Adap
   // Fixed-stride records() drops trailing partial bytes (< kStride).
   for (quadfecta::Policy policy : {quadfecta::Policy::Adaptive, quadfecta::Policy::PreadOnly}) {
     std::vector<std::byte> collected;
-    for (std::span<const std::byte> rec : reader.records(kBaseOffset, total_size, kStride, &scratch, policy)) {
+    for (std::span<const std::byte> rec :
+         quadfecta::records(reader, kStride, &scratch, policy, kBaseOffset, total_size)) {
       CHECK(rec.size() == kStride);
       collected.insert(collected.end(), rec.begin(), rec.end());
     }
@@ -287,7 +288,7 @@ TEST_CASE("Quadfecta: read_at_index, Cursor, records(), and chunks() across Adap
   }
   // Zero stride yields an empty range cleanly.
   size_t zero_count = 0;
-  for ([[maybe_unused]] auto rec : reader.records(0, &scratch)) {
+  for ([[maybe_unused]] auto rec : quadfecta::records(reader, 0, &scratch)) {
     ++zero_count;
   }
   CHECK(zero_count == 0);
@@ -297,7 +298,7 @@ TEST_CASE("Quadfecta: read_at_index, Cursor, records(), and chunks() across Adap
     for (quadfecta::Policy policy : {quadfecta::Policy::Adaptive, quadfecta::Policy::PreadOnly}) {
       std::vector<std::byte> reassembled;
       reassembled.reserve(total_size);
-      for (std::span<const std::byte> chunk : reader.chunks(chunk_size, &scratch, policy)) {
+      for (std::span<const std::byte> chunk : quadfecta::chunks(reader, chunk_size, &scratch, policy)) {
         CHECK(chunk.size() <= chunk_size);
         reassembled.insert(reassembled.end(), chunk.begin(), chunk.end());
       }
