@@ -7,9 +7,9 @@
 #include <limits>
 #include <optional>
 #include <system_error>
-#include <vmemkv/checkpoint/checkpoint.hpp>
 #include <vmemkv/core/io.hpp>
 #include <vmemkv/core/mmap.hpp>
+#include <vmemkv/core/paths.hpp>
 #include <vmemkv/t2_flat_file/t2_flat_file.hpp>
 
 namespace vmemkv {

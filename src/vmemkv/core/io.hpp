@@ -7,6 +7,7 @@
 
 #include <cerrno>
 #include <cstddef>
+#include <cstdint>
 #include <system_error>
 
 namespace vmemkv {

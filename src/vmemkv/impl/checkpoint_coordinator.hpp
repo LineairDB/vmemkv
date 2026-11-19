@@ -20,12 +20,11 @@
 #include <thread>
 #include <vector>
 #include <vmemkv/checkpoint/checkpoint.hpp>
-#include <vmemkv/checkpoint/paths.hpp>
 #include <vmemkv/config.hpp>
 #include <vmemkv/core/background_poll.hpp>
 #include <vmemkv/core/env.hpp>
+#include <vmemkv/core/paths.hpp>
 #include <vmemkv/core/single_flight.hpp>
-#include <vmemkv/impl/compaction.hpp>
 #include <vmemkv/impl/hooks.hpp>
 #include <vmemkv/impl/t2_ownership.hpp>
 #include <vmemkv/t1_index/sharded_t1_index.hpp>

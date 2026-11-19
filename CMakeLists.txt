@@ -41,9 +41,9 @@ endif()
 # ── Static library for source implementation ─────────────────────────────────
 add_library(vmemkv STATIC
   src/vmemkv_store.cpp
-  src/t2_flat_file/t2_flat_file.cpp
-  src/wal/wal.cpp
-  src/checkpoint/checkpoint.cpp
+  src/vmemkv/t2_flat_file/t2_flat_file.cpp
+  src/vmemkv/wal/wal.cpp
+  src/vmemkv/checkpoint/checkpoint.cpp
 )
 target_link_libraries(vmemkv PUBLIC vmemkv_headers PRIVATE $<BUILD_INTERFACE:vmemkv_warnings>)
 # Private implementation headers live under src/ (src/vmemkv/...); kept off the

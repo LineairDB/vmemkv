@@ -19,7 +19,7 @@
 #include <thread>
 #include <vector>
 #include <vmemkv/checkpoint/checkpoint.hpp>
-#include <vmemkv/checkpoint/paths.hpp>
+#include <vmemkv/core/paths.hpp>
 #include <vmemkv/impl/hooks.hpp>
 #include <vmemkv/impl/t2_ownership.hpp>
 #include <vmemkv/variants.hpp>

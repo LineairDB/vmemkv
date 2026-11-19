@@ -1,6 +1,6 @@
-#T1 Range - Sharding Design
+# T1 Range-Sharding Design
 
-Eliminates the O(corpus) cost of `reorganize()`/`checkpoint()` (see [`t1_index_structure_decision.md`](t1_index_structure_decision.md)) by splitting a single `T1Index` into K independent shards. Each shard uses `src/vmemkv/t1_index/t1_index.hpp` with sharding hooks (freeze/bypass, offset-mapped reorganize, sorted-region dump/load).
+T1 is range-partitioned into K independent `T1Index` shards (`src/vmemkv/t1_index/sharded_t1_index.hpp`, leaf shard `src/vmemkv/t1_index/t1_index.hpp`) so `reorganize()` and `checkpoint()` scale per shard rather than over the full corpus.
 
 ## Overall Structure
 
@@ -25,27 +25,21 @@ The directory applies one level up the RCU-style pattern T1Index itself already 
 
 **2-phase protocol (Closing → Split)**:
 
-1. A normal `reorganize()` completes;
-if the resulting (`merged`) live entries reach either `kSegmentBytes` (8 MiB) of referenced T2 payload bytes or the entry-count fallback threshold (`kShardTargetSizeEntries × kShardSplitThresholdPercent`), the shard qualifies for split.
-2. Set the target shard's `ShardSlot.superseded` to `Closing` (S1/S2 don't exist yet; merely a mark of "accept no further new writes"). put/remove check `superseded` and spin-wait on `Closing` without writing (get/scan may keep reading the target shard directly — data is intact, only writes stop).
+1. A normal `reorganize()` completes; if the resulting (`merged`) live entries reach either `kSegmentBytes` (8 MiB) of referenced T2 payload bytes or the entry-count fallback threshold (`kShardTargetSizeEntries × kShardSplitThresholdPercent`), the shard qualifies for split.
+2. Set the target shard's `ShardSlot.superseded` to `Closing` (S1/S2 don't exist yet; merely a mark of "accept no further new writes"). `put`/`remove` check `superseded` and spin-wait on `Closing` without writing (`get`/`scan` may keep reading the target shard directly — data is intact, only writes stop).
 3. Call the target shard's `reorganize()` once more. It folds writes that were in flight on the target shard when `Closing` was set into `merged`. New writes arriving after `Closing` are stopped by (2), so this second `merged` is that shard's complete final state.
 4. Split this final `merged` in the middle, building new shards from each half (empty append region + split sorted region).
-5. Update `superseded` from `Closing` to `Split{
-  S1, S2, branch key
-}
-` (puts / removes spin - waiting on `Closing` wake here and redirect to S1 or S2).6. Replace the directory with
-    new entries(boundaries to S1, S2) .7. Free the shard only after epoch
-    - based reclamation confirms every operation that could directly reference the target shard via the old directory
-          has completed.
+5. Update `superseded` from `Closing` to `Split{S1, S2, branch key}` (`put`/`remove` callers spin-waiting on `Closing` wake here and redirect to S1 or S2).
+6. Replace the directory with new entries mapping boundaries to S1 and S2.
+7. Free the shard only after epoch-based reclamation confirms every operation referencing the target shard via the old directory has completed.
 
-          Cost is amortized O(1) /
-          insert; worst-case one-shot cost is O(shard size), independent of total corpus size (the second `reorganize()` is also O(shard size), adding only a constant factor). Even with monotonically increasing keys like `bench_helpers.hpp`'s `ikey()` (`"k"` + 15 hex digits), only the rightmost shard keeps growing, so this property holds.
+Cost is amortized O(1) per insert; worst-case one-shot cost is O(shard size), independent of total corpus size (the second `reorganize()` is also O(shard size), adding only a constant factor). This bound also holds for monotonically increasing keys (e.g., `bench_helpers.hpp`'s `ikey()`), where only the rightmost shard grows and splits.
 
 ## MemTable Capacity and Byte-Bounded Shard Splitting
 
-Each shard's `kMemTableCapacityEntries` is fixed and bears no proportional relation to the shard target size. New shards inherit the parent shard's `memtable_capacity()`. The default is `Config::kMemTableCapacityEntries` (32K entries).
+Each shard's `kMemTableCapacityEntries` is fixed and independent of the shard target size. The default is `T1Config::kMemTableCapacityEntries` (32K entries).
 
-Split decisions use `should_split_shard(entry_count, t2_bytes)`: a shard splits when its referenced T2 live bytes reach `Config::kSegmentBytes` (8 MiB, matching the T2 hole-punch segment size regardless of record value size) or when its live entry count reaches `kShardTargetSizeEntries` × `kShardSplitThresholdPercent` (fallback for inline-only or standalone T1 workloads). This guarantees that repacking a single T1 shard moves at most one 8 MiB T2 segment's worth of data.
+Split decisions use `should_split_shard(entry_count, t2_bytes)`: a shard splits when its referenced T2 live bytes reach `T2Config::kSegmentBytes` (8 MiB, matching the T2 hole-punch segment size regardless of record value size) or when its live entry count reaches `kShardTargetSizeEntries` × `kShardSplitThresholdPercent` (fallback for inline-only or standalone T1 workloads). This bounds single-shard repack work to one 8 MiB T2 segment.
 
 Splits all run independently and concurrently per shard via the mechanism in the "background worker thread pool" section. Only directory updates serialize through CAS on the shared object.
 
@@ -102,8 +96,4 @@ Under sustained write load exceeding pool throughput, multiple shards reach the 
 
 ## Checkpoint / Recovery
 
-T2 and WAL are global (shard-independent). `checkpoint()` forces `reorganize()`s (including split decisions) of each of the K shards, serializing boundary keys plus each shard's sorted entries into the checkpoint file. This repeats K times with "T1 checkpoint before WAL rotation" ordering. Recovery rebuilds directory + K shards from this file, then replays the WAL remainder with directory-based routing. Forwarding pointers protect during checkpoint, so no split-specific new hazards arise.
-
-## Related Documents
-
-- [`t1_index_structure_decision.md`](t1_index_structure_decision.md): the decision to keep a flat array per shard, and the range-sharding definition.
+T2 and WAL are global (shard-independent). `checkpoint()` merges pending shards via `with_checkpoint_shards()`, serializing boundary keys plus dirty/coalesced shard checkpoint chunks. Recovery rebuilds the directory and K shards from those chunks, then replays the remaining WAL with directory-based routing. Forwarding pointers protect concurrent reads and writes during checkpoints.

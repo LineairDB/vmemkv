@@ -163,12 +163,12 @@ See [`background_jobs.md`](background_jobs.md) for the unified design and lifecy
 
 ## 7. Fault Tolerance and WAL
 
-vmemkv guarantees durability through the following.
+vmemkv guarantees durability using logical redo with no undo log (tolerating OS page-cache writeback / `STEAL` and non-forced T2 data writes / `NO-FORCE`):
 
-- Tier 1 is a pure in-RAM structure with no path writing itself back to disk. It is rebuilt on every boot from the T1 checkpoint file (when present) plus WAL replay.
-- Updates apply to Tier 2 / Tier 1 first, and only on success WAL-append + `fsync`. Success is returned to the caller only after the WAL `fsync` completes. This ordering keeps failed applies out of the WAL; see low_level_design.md 3.2 Failure Rule for the detailed reason.
-- On failure, recover by checkpoint load + WAL replay
-- After checkpoint completes, the WAL rotates per low_level_design.md 5.5
+- Tier 1 is a pure in-RAM structure rebuilt on boot from the T1 checkpoint files (when present) plus WAL replay.
+- Mutations apply to Tier 2 / Tier 1 first, and only on success WAL-append + `fsync`. Success is returned to the caller only after the WAL `fsync` completes, keeping failed applies out of the WAL (see low_level_design.md 3.2).
+- Recovery trusts T2 only up to the manifest's `t2_bytes_used` (guaranteed complete and `msync`ed before publication) and discards/rebuilds anything beyond it by replaying WAL records through the ordinary write path (`write_entry_lockfree()`). Because old tail offsets are never referenced after replay, torn tail pages stolen to disk before crash are harmless and require no undo log.
+- After checkpoint completes, the WAL rotates per low_level_design.md 5.5.
 
 ## 8. Optimization Overview
 

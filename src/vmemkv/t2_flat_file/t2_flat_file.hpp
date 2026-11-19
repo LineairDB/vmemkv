@@ -12,9 +12,9 @@
 #include <span>
 #include <utility>
 #include <vector>
-#include <vmemkv/api/utils.hpp>
 #include <vmemkv/core/reference_tracker.hpp>
 #include <vmemkv/core/spin_backoff.hpp>
+#include <vmemkv/core/utils.hpp>
 
 // alloc_len != value_len: fits-within-alloc updates overwrite in place without appending.
 struct ValueRecordHeader {

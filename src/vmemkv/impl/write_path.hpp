@@ -15,9 +15,9 @@
 #include <optional>
 #include <span>
 #include <vector>
-#include <vmemkv/api/utils.hpp>
 #include <vmemkv/config.hpp>
 #include <vmemkv/core/bytes.hpp>
+#include <vmemkv/core/utils.hpp>
 #include <vmemkv/impl/read_path.hpp>
 #include <vmemkv/impl/t2_ownership.hpp>
 #include <vmemkv/t1_index/sharded_t1_index.hpp>

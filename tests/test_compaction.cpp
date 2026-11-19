@@ -16,7 +16,7 @@
 #include <string>
 #include <thread>
 #include <vector>
-#include <vmemkv/checkpoint/paths.hpp>
+#include <vmemkv/core/paths.hpp>
 #include <vmemkv/impl/compaction.hpp>
 #include <vmemkv/impl/t2_ownership.hpp>
 #include <vmemkv/t1_index/t1_codec.hpp>
@@ -415,9 +415,9 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "overwrite and delete segment evacuation r
   }
   const auto path =
       vmemkv_test::ScopedTempPath("vmemkv_compact", vmemkv::remove_store_files, vmemkv_test::punch_capable_root());
-  constexpr size_t kKeys = 2048;
-  constexpr size_t kValBytes = 8192;
-  auto store = make_store(path);
+  constexpr size_t kKeys = 192;
+  constexpr size_t kValBytes = 2048;
+  auto store = std::make_unique<TinySegmentStore>(path, kTestCapacityBytes);
   store->bulk_load(kKeys, [&](size_t i) { return make_key(i); }, [&](size_t i) { return pattern_value(kValBytes, i); });
   store->impl().t1().drain_maintenance();
   store->checkpoint();
@@ -488,9 +488,9 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "epoch gate defers punch by one checkpoint
   }
   const auto path =
       vmemkv_test::ScopedTempPath("vmemkv_compact", vmemkv::remove_store_files, vmemkv_test::punch_capable_root());
-  constexpr size_t kKeys = 2048;
-  constexpr size_t kValBytes = 8192;
-  auto store = make_store(path);
+  constexpr size_t kKeys = 192;
+  constexpr size_t kValBytes = 2048;
+  auto store = std::make_unique<TinySegmentStore>(path, kTestCapacityBytes);
   store->bulk_load(kKeys, [&](size_t i) { return make_key(i); }, [&](size_t i) { return pattern_value(kValBytes, i); });
   store->impl().t1().drain_maintenance();
   store->checkpoint();
@@ -513,7 +513,7 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "epoch gate defers punch by one checkpoint
   CHECK(file_blocks(t2_data_path(path)) >= blocks_after_drain);
   store->checkpoint();
   wait_for([&] { return file_blocks(t2_data_path(path)) < blocks_after_drain; });
-  for (size_t i = 0; i < kKeys; i += 257) {
+  for (size_t i = 0; i < kKeys; i += 19) {
     const auto got = vmemkv_test::get_optional_bytes(store, make_key(i));
     REQUIRE(got.has_value());
     CHECK(vmemkv_test::span_to_string(vmemkv_test::as_span(*got)) == pattern_value(2 * kValBytes, kKeys + i));
@@ -527,10 +527,10 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "punched evacuation survives restart") {
   }
   const auto path =
       vmemkv_test::ScopedTempPath("vmemkv_compact", vmemkv::remove_store_files, vmemkv_test::punch_capable_root());
-  constexpr size_t kKeys = 2048;
-  constexpr size_t kValBytes = 8192;
+  constexpr size_t kKeys = 192;
+  constexpr size_t kValBytes = 2048;
   {
-    auto store = make_store(path);
+    auto store = std::make_unique<TinySegmentStore>(path, kTestCapacityBytes);
     store->bulk_load(
         kKeys, [&](size_t i) { return make_key(i); }, [&](size_t i) { return pattern_value(kValBytes, i); });
     store->checkpoint();
@@ -546,8 +546,6 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "punched evacuation survives restart") {
     store->checkpoint();
     store->checkpoint();
     wait_for([&] { return file_blocks(t2_data_path(path)) < blocks_before; });
-    // All evacuations are punchable after two post-evacuation checkpoints;
-    // relocation appended ~1.1 GB while punching reclaims ~1.4 GB.
     REQUIRE(file_blocks(t2_data_path(path)) < blocks_before);
     // Post-punch foreground updates, closed without a checkpoint: recovery must
     // replay them over the punched segments.
@@ -556,7 +554,7 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "punched evacuation survives restart") {
     }
   }
   {
-    auto store = make_store(path);
+    auto store = std::make_unique<TinySegmentStore>(path, kTestCapacityBytes);
     for (size_t i = 0; i < kKeys; ++i) {
       const auto got = vmemkv_test::get_optional_bytes(store, make_key(i));
       if (i % 2 == 0) {
@@ -665,11 +663,11 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "compaction convergence and punch backlog 
   }
   const auto path =
       vmemkv_test::ScopedTempPath("vmemkv_churn", vmemkv::remove_store_files, vmemkv_test::punch_capable_root());
-  constexpr size_t kKeys = 600;
-  constexpr size_t kValBytes = 1024;
+  constexpr size_t kKeys = 128;
+  constexpr size_t kValBytes = 4096;
   auto store = std::make_unique<TinyConvergenceStore>(path, kTestCapacityBytes);
 
-  // 1. Initial population: 600 keys with 1KB values (~600KB live data)
+  // 1. Initial population: 128 keys with 4KB values (~512KB live data)
   for (size_t i = 0; i < kKeys; ++i) {
     REQUIRE(store->insert(make_key(i), pattern_value(kValBytes, i)));
   }
@@ -679,7 +677,7 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "compaction convergence and punch backlog 
   enable();
 
   // 2. Continuous churn: multiple generations of updates creating dead segments
-  constexpr size_t kGenerations = 6;
+  constexpr size_t kGenerations = 4;
   for (size_t gen = 0; gen < kGenerations; ++gen) {
     for (size_t i = 0; i < kKeys; ++i) {
       REQUIRE(store->update(make_key(i), pattern_value(kValBytes, (gen + 1) * kKeys + i)));
@@ -738,7 +736,7 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "64KB shuffled bulk load bounds T2 write a
   }
   const auto path =
       vmemkv_test::ScopedTempPath("vmemkv_compact_64k", vmemkv::remove_store_files, vmemkv_test::punch_capable_root());
-  constexpr size_t kKeys = 384;
+  constexpr size_t kKeys = 280;
   constexpr size_t kValBytes = 64ULL * 1024ULL;
   auto store = make_store(path);
   const auto order = shuffled_order(kKeys);

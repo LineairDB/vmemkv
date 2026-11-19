@@ -15,8 +15,8 @@
 #include <span>
 #include <stdexcept>
 #include <vector>
-#include <vmemkv/api/utils.hpp>
 #include <vmemkv/core/env.hpp>
+#include <vmemkv/core/utils.hpp>
 #include <vmemkv/impl/hooks.hpp>
 #include <vmemkv/t1_index/t1_index.hpp>
 

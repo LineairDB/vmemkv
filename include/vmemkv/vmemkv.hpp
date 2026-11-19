@@ -16,32 +16,12 @@
 #include <vector>
 #include <vmemkv/scan_control.hpp>
 #include <vmemkv/stats.hpp>
+
 namespace vmemkv {
-// KVStore: the uniform interface every backend in this repository provides. Tests and
-// benchmarks are written generically against this contract, so all backends behave alike.
-//
-// Data model: keys are ordered byte strings, values are opaque bytes. Both sides accept
-// string-like arguments (anything convertible to std::string_view, including literals),
-// integral arguments (keys ordered numerically via big-endian encoding, values stored as
-// 8-byte little-endian), raw byte spans/vectors, and user types with an ADL serialize_kvs()
-// overload. A missing key reports false (get/remove/update) or an empty scan, never a
-// sentinel value.
-//
-// Callbacks observe borrowed spans: get()'s value and scan()'s key/value live only for the
-// duration of the callback. Copy the bytes out if they must outlive the call; a later
-// get()/scan() on the same thread may reuse the buffer.
-//
-// Operations: insert() fails (false) when the key exists; update()/remove() fail when it is
-// absent. scan() invokes its callback in ascending key order over the half-open [lower,
-// upper) range and returns the number of live entries visited. A callback may return
-// ScanControl::Continue to keep scanning or ScanControl::Stop to end after the current entry;
-// void callbacks continue. bulk_load() ingests generated entries fast: no per-write durability
-// and no concurrent access while it runs, so follow it with checkpoint() before relying on the
-// data.
-//
-// Maintenance: reorganize() merges only the in-memory index (no I/O); checkpoint() makes the
-// log durable and compacts it into a manifest.
-// get_statistics() snapshots the counters described in <vmemkv/stats.hpp>.
+
+// Ordered byte-key / opaque-value KVS interface. Keys/values accept string-like types,
+// integrals (sign-flipped big-endian keys, 8-byte little-endian values), byte spans/vectors,
+// or ADL `serialize_kvs(const T&)`. Get/scan callback spans remain valid only for the call.
 template <typename Store>
 concept KVStore = requires(Store store, std::span<const std::byte> key, std::span<const std::byte> value) {
   { store.insert(key, value) } -> std::same_as<bool>;
@@ -59,81 +39,10 @@ concept KVStore = requires(Store store, std::span<const std::byte> key, std::spa
   { store.checkpoint() } -> std::same_as<void>;
   { store.get_statistics() } -> std::same_as<VMemKVStatistics>;
 };
-// The remainder of this header is machinery for the templates above; callers implementing or
-// using KVStore need not read further.
-namespace detail {
-inline constexpr std::size_t kBitsPerByte = 8, kEncodedValueBytes = 8;
-template <typename T>
-inline constexpr bool is_bytes_v = std::is_same_v<std::decay_t<T>, std::span<const std::byte>> ||
-                                   std::is_same_v<std::decay_t<T>, std::vector<std::byte>>;
-template <typename T>
-inline constexpr bool is_str_v = std::convertible_to<std::decay_t<T>, std::string_view>;
-template <typename T>
-inline constexpr bool is_raw_v = is_bytes_v<T> || is_str_v<T>;
-template <typename I>
-inline auto encode_key(I value) noexcept -> std::array<std::byte, sizeof(I)> {
-  using Unsigned = std::make_unsigned_t<std::remove_cv_t<I>>;
-  static_assert(sizeof(I) <= sizeof(uint64_t));
-  auto encoded = static_cast<Unsigned>(value);
-  if constexpr (std::is_signed_v<I>) {
-    encoded ^= Unsigned{1} << (sizeof(I) * kBitsPerByte - 1);
-  }
-  if constexpr (std::endian::native == std::endian::little) {
-    encoded = std::byteswap(encoded);
-  }
-  std::array<std::byte, sizeof(I)> out{};
-  std::memcpy(out.data(), &encoded, sizeof(I));
-  return out;
-}
-template <typename I>
-inline auto encode_val(I value) noexcept -> std::array<std::byte, kEncodedValueBytes> {
-  auto encoded = static_cast<uint64_t>(value);
-  if constexpr (std::endian::native == std::endian::big) {
-    encoded = std::byteswap(encoded);
-  }
-  std::array<std::byte, kEncodedValueBytes> out{};
-  std::memcpy(out.data(), &encoded, kEncodedValueBytes);
-  return out;
-}
-template <typename T>
-inline auto to_span(const T &value) noexcept -> std::span<const std::byte> {
-  if constexpr (is_bytes_v<T>) {
-    return std::as_bytes(std::span(value));
-  } else {
-    return {reinterpret_cast<const std::byte *>(std::string_view(value).data()), std::string_view(value).size()};
-  }
-}
-template <typename T>
-inline auto serialize_key(const T &value) {
-  if constexpr (std::is_integral_v<std::decay_t<T>>) {
-    return encode_key(value);
-  } else if constexpr (is_raw_v<T>) {
-    return to_span(value);
-  } else {
-    return serialize_kvs(value);  // ADL
-  }
-}
-template <typename T>
-inline auto serialize_val(const T &value) {
-  if constexpr (std::is_integral_v<std::decay_t<T>>) {
-    return encode_val(value);
-  } else if constexpr (is_raw_v<T>) {
-    return to_span(value);
-  } else {
-    return serialize_kvs(value);  // ADL
-  }
-}
-}  // namespace detail
-// VMemKVStore: durable ordered KV store on a T2 file plus WAL/checkpoint files.
-// Data model is ordered byte-string keys with opaque byte-string values (2.1, 2.2).
-// Integral keys encode as sign-flipped big-endian (ordered); integral values as 8-byte
-// little-endian (opaque). Custom types use ADL:
-// e.g. std::span<const std::byte> serialize_kvs(const MyType&);
-// See docs/specification/low_level_design.md 2.1, 2.2, 3.2, 4.3.
+
+// Thread-safe durable ordered KV store backed by a T2 file, WAL, and T1 checkpoint files.
 class VMemKVStore {
  public:
-  // Opens path (T2 file to create or reopen); capacity is T2 bytes fixed at creation.
-  // Throws std::system_error on I/O failure.
   VMemKVStore(const std::filesystem::path &path, uint64_t capacity);
   ~VMemKVStore();
   VMemKVStore(VMemKVStore &&) noexcept;
@@ -141,61 +50,23 @@ class VMemKVStore {
   auto operator=(const VMemKVStore &) -> VMemKVStore & = delete;
   auto operator=(VMemKVStore &&) noexcept -> VMemKVStore &;
 
-  // Inserts key/value; false when the key exists. See docs/specification/low_level_design.md 3.2.
   template <typename K, typename V>
-  [[nodiscard]] auto insert(const K &key, V &&value) -> bool {
-    return insert_bytes(detail::serialize_key(key), detail::serialize_val(value));
-  }
-  // Updates value in place or by append; false when the key is absent.
-  // See docs/specification/low_level_design.md 3.3.
+  [[nodiscard]] auto insert(const K &key, const V &value) -> bool;
   template <typename K, typename V>
-  [[nodiscard]] auto update(const K &key, V &&value) -> bool {
-    return update_bytes(detail::serialize_key(key), detail::serialize_val(value));
-  }
-  // Removes key via tombstone; false when absent. See docs/specification/low_level_design.md 3.4.
+  [[nodiscard]] auto update(const K &key, const V &value) -> bool;
   template <typename K>
-  [[nodiscard]] auto remove(const K &key) -> bool {
-    return remove_bytes(detail::serialize_key(key));
-  }
-  // Gets value via callback; false when absent. Span lives for the callback only.
-  // See docs/specification/low_level_design.md 3.1.
+  [[nodiscard]] auto remove(const K &key) -> bool;
   template <typename K, typename C>
-  [[nodiscard]] auto get(const K &key, C callback) const -> bool {
-    auto key_span = detail::serialize_key(key);
-    return get_bytes(key_span, &callback, [](void *context, std::span<const std::byte> value) {
-      (*static_cast<C *>(context))(value);
-    });
-  }
-  // Scans ascending over half-open [lower, upper); STOP includes the current entry in the live count.
-  // See docs/specification/low_level_design.md 3.5.
+  [[nodiscard]] auto get(const K &key, C callback) const -> bool;
+  // Visits ascending entries in [lower, upper); returns live entries visited.
   template <typename L, typename H, typename C>
-  [[nodiscard]] auto scan(const L &lower, const H &upper, C callback) const -> size_t {
-    auto lower_span = detail::serialize_key(lower);
-    auto upper_span = detail::serialize_key(upper);
-    return scan_bytes(lower_span,
-                      upper_span,
-                      &callback,
-                      [](void *context, std::span<const std::byte> key, std::span<const std::byte> value) {
-                        return scan_detail::invoke_callback(*static_cast<C *>(context), key, value);
-                      });
-  }
-  // Ingests generated entries with no per-write durability; follow with checkpoint().
-  // See docs/specification/low_level_design.md 3.6.
+  [[nodiscard]] auto scan(const L &lower, const H &upper, C callback) const -> size_t;
+  // Fast non-durable ingestion with no concurrent callers; follow with checkpoint().
   template <typename KF, typename VF>
-  void bulk_load(std::size_t count, KF &&make_key, VF &&make_value) {
-    bulk_load_erased(
-        count,
-        [key_factory = std::forward<KF>(make_key)](std::size_t index) { return std::string(key_factory(index)); },
-        [value_factory = std::forward<VF>(make_value)](std::size_t index) {
-          return std::string(value_factory(index));
-        });
-  }
+  void bulk_load(std::size_t count, KF &&make_key, VF &&make_value);
 
-  // Merges only the in-memory index; no I/O. See docs/specification/low_level_design.md 4.2.
   void reorganize();
-  // Makes the log durable and compacts it into a manifest. See docs/specification/low_level_design.md 4.3, 5.3.
   void checkpoint();
-  // Snapshots the counters described in <vmemkv/stats.hpp>.
   [[nodiscard]] auto get_statistics() const noexcept -> VMemKVStatistics;
 
  private:
@@ -219,4 +90,119 @@ class VMemKVStore {
                         const std::function<std::string(std::size_t)> &make_value);
 };
 static_assert(KVStore<VMemKVStore>);
+
+namespace detail {
+inline constexpr std::size_t kBitsPerByte = 8, kEncodedValueBytes = 8;
+template <typename T>
+inline constexpr bool is_bytes_v = std::is_same_v<std::decay_t<T>, std::span<const std::byte>> ||
+                                   std::is_same_v<std::decay_t<T>, std::vector<std::byte>>;
+template <typename T>
+inline constexpr bool is_raw_v = is_bytes_v<T> || std::convertible_to<std::decay_t<T>, std::string_view>;
+
+template <typename I>
+inline auto encode_key(I value) noexcept -> std::array<std::byte, sizeof(I)> {
+  using Unsigned = std::make_unsigned_t<std::remove_cv_t<I>>;
+  static_assert(sizeof(I) <= sizeof(uint64_t));
+  auto encoded = static_cast<Unsigned>(value);
+  if constexpr (std::is_signed_v<I>) {
+    encoded ^= Unsigned{1} << (sizeof(I) * kBitsPerByte - 1);
+  }
+  if constexpr (std::endian::native == std::endian::little) {
+    encoded = std::byteswap(encoded);
+  }
+  std::array<std::byte, sizeof(I)> out{};
+  std::memcpy(out.data(), &encoded, sizeof(I));
+  return out;
+}
+
+template <typename I>
+inline auto encode_val(I value) noexcept -> std::array<std::byte, kEncodedValueBytes> {
+  auto encoded = static_cast<uint64_t>(value);
+  if constexpr (std::endian::native == std::endian::big) {
+    encoded = std::byteswap(encoded);
+  }
+  std::array<std::byte, kEncodedValueBytes> out{};
+  std::memcpy(out.data(), &encoded, kEncodedValueBytes);
+  return out;
+}
+
+template <typename T>
+inline auto to_span(const T &value) noexcept -> std::span<const std::byte> {
+  if constexpr (is_bytes_v<T>) {
+    return std::as_bytes(std::span(value));
+  } else {
+    std::string_view view(value);
+    return {reinterpret_cast<const std::byte *>(view.data()), view.size()};
+  }
+}
+
+template <bool IsKey, typename T>
+inline auto serialize(const T &value) {
+  if constexpr (std::is_integral_v<std::decay_t<T>>) {
+    if constexpr (IsKey) {
+      return encode_key(value);
+    } else {
+      return encode_val(value);
+    }
+  } else if constexpr (is_raw_v<T>) {
+    return to_span(value);
+  } else {
+    return serialize_kvs(value);  // ADL
+  }
+}
+
+template <typename T>
+inline auto serialize_key(const T &value) {
+  return serialize<true>(value);
+}
+
+template <typename T>
+inline auto serialize_val(const T &value) {
+  return serialize<false>(value);
+}
+}  // namespace detail
+
+template <typename K, typename V>
+auto VMemKVStore::insert(const K &key, const V &value) -> bool {
+  return insert_bytes(detail::serialize_key(key), detail::serialize_val(value));
+}
+
+template <typename K, typename V>
+auto VMemKVStore::update(const K &key, const V &value) -> bool {
+  return update_bytes(detail::serialize_key(key), detail::serialize_val(value));
+}
+
+template <typename K>
+auto VMemKVStore::remove(const K &key) -> bool {
+  return remove_bytes(detail::serialize_key(key));
+}
+
+template <typename K, typename C>
+auto VMemKVStore::get(const K &key, C callback) const -> bool {
+  auto key_span = detail::serialize_key(key);
+  return get_bytes(key_span, &callback, [](void *context, std::span<const std::byte> value) {
+    (*static_cast<C *>(context))(value);
+  });
+}
+
+template <typename L, typename H, typename C>
+auto VMemKVStore::scan(const L &lower, const H &upper, C callback) const -> size_t {
+  auto lower_span = detail::serialize_key(lower);
+  auto upper_span = detail::serialize_key(upper);
+  return scan_bytes(lower_span,
+                    upper_span,
+                    &callback,
+                    [](void *context, std::span<const std::byte> key, std::span<const std::byte> value) {
+                      return scan_detail::invoke_callback(*static_cast<C *>(context), key, value);
+                    });
+}
+
+template <typename KF, typename VF>
+void VMemKVStore::bulk_load(std::size_t count, KF &&make_key, VF &&make_value) {
+  bulk_load_erased(
+      count,
+      [key_factory = std::forward<KF>(make_key)](std::size_t index) { return std::string(key_factory(index)); },
+      [value_factory = std::forward<VF>(make_value)](std::size_t index) { return std::string(value_factory(index)); });
+}
+
 }  // namespace vmemkv

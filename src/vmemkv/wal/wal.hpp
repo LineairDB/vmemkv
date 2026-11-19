@@ -18,9 +18,9 @@
 #include <string_view>
 #include <type_traits>
 #include <vector>
-#include <vmemkv/api/utils.hpp>
-#include <vmemkv/checkpoint/paths.hpp>
 #include <vmemkv/core/io.hpp>
+#include <vmemkv/core/paths.hpp>
+#include <vmemkv/core/utils.hpp>
 
 namespace vmemkv {
 

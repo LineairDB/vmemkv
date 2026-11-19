@@ -22,11 +22,11 @@
 #include <mutex>
 #include <span>
 #include <vector>
-#include <vmemkv/api/utils.hpp>
-#include <vmemkv/checkpoint/paths.hpp>
 #include <vmemkv/core/background_poll.hpp>
 #include <vmemkv/core/env.hpp>
+#include <vmemkv/core/paths.hpp>
 #include <vmemkv/core/single_flight.hpp>
+#include <vmemkv/core/utils.hpp>
 #include <vmemkv/impl/read_path.hpp>
 #include <vmemkv/impl/t2_ownership.hpp>
 #include <vmemkv/t1_index/sharded_t1_index.hpp>

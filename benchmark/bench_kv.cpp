@@ -44,9 +44,9 @@
 #include <tuple>
 #include <type_traits>
 #include <vector>
-#include <vmemkv/checkpoint/paths.hpp>
 #include <vmemkv/core/env.hpp>
 #include <vmemkv/core/io.hpp>
+#include <vmemkv/core/paths.hpp>
 #include <vmemkv/variants.hpp>
 #include <vmemkv/wal/wal.hpp>
 

@@ -18,9 +18,9 @@
 #include <system_error>
 #include <thread>
 #include <vector>
-#include <vmemkv/api/utils.hpp>
 #include <vmemkv/core/io.hpp>
 #include <vmemkv/core/spin_backoff.hpp>
+#include <vmemkv/core/utils.hpp>
 #include <vmemkv/wal/wal.hpp>
 
 namespace vmemkv {

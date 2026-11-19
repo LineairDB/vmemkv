@@ -294,7 +294,7 @@ Entries inlined entry-level (2.1.1, 7.2) never touch Tier 2 and are outside this
 3. Immediately resume new appends (`resume_writers()`). In-place updates never stop during this procedure.
 4. Store `target` in the fuzzy `watermark_` and drain in-flight in-place writes to the target range with `InPlaceUpdateBarrier::wait_until_retired(target)`. Later in-place updates are allowed only at `offset >= read_only_offset` and `offset >= watermark_`.
 5. `msync(MS_SYNC)` `[old_read_only_offset, target)` in chunks of `kMsyncChunkBytes` (64 MiB), yielding (`std::this_thread::yield()`) between chunks. Round the start down to a page boundary; tolerate redundant re-syncs overlapping the previous cycle as idempotent.
-6. Per shard, merge `MemTable` into `sorted_run` via `checkpoint_all_shards()` (empty-MemTable sorted-dump shortcut, pause+retry mid-split), writing out dirty/coalesced T1 checkpoint chunk files (`VLK2`, temp + `rename`, 5.4). Pass the identity mapping that never rewrites `payload_bits`.
+6. Iterate T1 shards in `with_checkpoint_shards()` (`CheckpointContext`), merging dirty `MemTable`s into `sorted_run` (or dumping `sorted_run` directly when clean) and writing dirty/coalesced T1 checkpoint chunk files (`VLK2`, temp + `rename`, 5.4) with unchanged `payload_bits`.
 7. Write `target` with `checkpoint_lsn` and chunk metadata to `<t2>.manifest` (5.3).
 8. Atomically advance `read_only_offset` to `target`.
 9. Call `Wal::rotate_segment()` (5.5). No arguments. Generation-sequence switching only; `checkpoint_lsn` is not passed.
@@ -461,7 +461,7 @@ The table below defines concurrent-execution eligibility and handling per operat
 - `Serialized`: must serialize on the same key
 - `Single-flight`: on concurrent calls, elect exactly one executing thread (leader). Follower behavior differs by path: soft paths continue without waiting, hard paths wait for leader completion (atomic-flag controlled).
 
-`T1 reorganize` triggers inside `reorganize()` on the atomic pointer swap mechanism. `Checkpoint` completes on a different mechanism (brief new-append quiesce + `msync()`), but shares the same `trigger.running` single-flight lock for manifest-write exclusion.
+`T1 reorganize` triggers inside `reorganize()` on the atomic pointer swap mechanism. `Checkpoint` completes on a different mechanism (brief new-append quiesce + `msync()`), but shares the `checkpoint_.running` single-flight lock for manifest-write exclusion.
 
 | Operation A / B | Get | Scan | Insert | Update/Delete | T1 reorganize | Checkpoint |
 | --- | --- | --- | --- | --- | --- | --- |
