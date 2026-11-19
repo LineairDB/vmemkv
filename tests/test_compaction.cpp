@@ -7,7 +7,6 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
-#include <cstdlib>
 #include <filesystem>
 #include <memory>
 #include <numeric>
@@ -21,6 +20,7 @@
 #include <vmemkv/impl/t2_ownership.hpp>
 #include <vmemkv/t1_index/t1_codec.hpp>
 #include <vmemkv/variants.hpp>
+#include <vmemkv/wal/wal.hpp>
 
 #include "test_support.hpp"
 
@@ -67,30 +67,6 @@ struct TinyConvergenceImpl : vmemkv::VMemKVImpl {
 };
 using TinyConvergenceStore = vmemkv::StoreAdapter<TinyConvergenceImpl>;
 
-struct AutoCompactFixture {
-  AutoCompactFixture() {
-    if (const char *value = std::getenv("VMEMKV_SUPPRESS_AUTO_COMPACT"); value != nullptr) {
-      had_previous_value = true;
-      previous_value = value;
-    }
-    ::setenv("VMEMKV_SUPPRESS_AUTO_COMPACT", "1", 1);
-  }
-
-  ~AutoCompactFixture() {
-    if (had_previous_value) {
-      ::setenv("VMEMKV_SUPPRESS_AUTO_COMPACT", previous_value.c_str(), 1);
-    } else {
-      ::unsetenv("VMEMKV_SUPPRESS_AUTO_COMPACT");
-    }
-  }
-
-  void enable() const { ::unsetenv("VMEMKV_SUPPRESS_AUTO_COMPACT"); }
-
- private:
-  bool had_previous_value = false;
-  std::string previous_value;
-};
-
 auto make_store(const std::filesystem::path &path, size_t capacity = kTestCapacityBytes) -> std::unique_ptr<Store> {
   return std::make_unique<Store>(path, capacity);
 }
@@ -124,8 +100,8 @@ void wait_for_compaction(StoreT &store) {
 }
 
 template <typename StoreT>
-void drain_compaction(StoreT &store, const AutoCompactFixture &compaction) {
-  compaction.enable();
+void drain_compaction(StoreT &store) {
+  store->impl().set_auto_compact_enabled(true);
   wait_for_compaction(*store);
 }
 
@@ -214,7 +190,7 @@ auto t2_data_path(const std::filesystem::path &store_path) -> std::filesystem::p
 
 }  // namespace
 
-TEST_CASE_FIXTURE(AutoCompactFixture, "ordered dirty shard needs no T2 relocation") {
+TEST_CASE("ordered dirty shard needs no T2 relocation") {
   const auto path = vmemkv_test::ScopedTempPath("vmemkv_compact", vmemkv::remove_store_files);
   constexpr size_t kKeys = 3000;
   constexpr size_t kValBytes = 128;
@@ -225,7 +201,7 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "ordered dirty shard needs no T2 relocatio
   REQUIRE(store->get_statistics().t2_dirty_shard_count > 0);
   const uint64_t used_before = store->impl().t2().tail_offset();
   const uint64_t cycles_before = store->get_statistics().compaction_cycle_count;
-  enable();
+  store->impl().set_auto_compact_enabled(true);
   wait_for_compaction(*store);
   CHECK(store->impl().t2().tail_offset() == used_before);
   CHECK(store->get_statistics().compaction_cycle_count == cycles_before);
@@ -233,7 +209,7 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "ordered dirty shard needs no T2 relocatio
   CHECK(inversion_rate(store) == 0.0);
 }
 
-TEST_CASE_FIXTURE(AutoCompactFixture, "bulk load runs background compaction while ingesting") {
+TEST_CASE("bulk load runs background compaction while ingesting") {
   const auto path = vmemkv_test::ScopedTempPath("vmemkv_compact", vmemkv::remove_store_files);
   constexpr size_t kKeys = 10000;
   constexpr size_t kValBytes = 128;
@@ -242,7 +218,7 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "bulk load runs background compaction whil
   const auto order = shuffled_order(kKeys);
   uint64_t cycles_during_bulk_load = 0;
 
-  enable();
+  store->impl().set_auto_compact_enabled(true);
   store->bulk_load(
       kKeys,
       [&](size_t i) {
@@ -267,7 +243,7 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "bulk load runs background compaction whil
   CHECK(inversion_rate(store) == 0.0);
 }
 
-TEST_CASE_FIXTURE(AutoCompactFixture, "dirty shard repack preserves live values") {
+TEST_CASE("dirty shard repack preserves live values") {
   const auto path = vmemkv_test::ScopedTempPath("vmemkv_compact", vmemkv::remove_store_files);
   constexpr size_t kKeys = 10000;
   constexpr size_t kValBytes = 256;
@@ -280,7 +256,7 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "dirty shard repack preserves live values"
   REQUIRE(inversion_rate(store) > 0.3);
   store->checkpoint();
   const uint64_t cycles_before = store->get_statistics().compaction_cycle_count;
-  enable();
+  store->impl().set_auto_compact_enabled(true);
   wait_for_compaction(*store);
   CHECK(store->get_statistics().compaction_cycle_count > cycles_before);
   CHECK(store->get_statistics().t2_dirty_shard_count == 0);
@@ -291,7 +267,7 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "dirty shard repack preserves live values"
   }
 }
 
-TEST_CASE_FIXTURE(AutoCompactFixture, "dirty-segment evacuation preserves concurrent updates") {
+TEST_CASE("dirty-segment evacuation preserves concurrent updates") {
   const auto path = vmemkv_test::ScopedTempPath("vmemkv_compact", vmemkv::remove_store_files);
   constexpr size_t kKeys = 3000;
   constexpr size_t kValBytes = 128;
@@ -315,9 +291,9 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "dirty-segment evacuation preserves concur
   while (!writer_paused.load(std::memory_order_acquire)) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
-  enable();
+  store->impl().set_auto_compact_enabled(true);
   writer.join();
-  drain_compaction(store, *this);
+  drain_compaction(store);
   CHECK(store->get_statistics().t2_dirty_shard_count == 0);
   for (size_t i = 0; i < kKeys; ++i) {
     const auto got = vmemkv_test::get_optional_bytes(store, make_key(i));
@@ -326,7 +302,7 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "dirty-segment evacuation preserves concur
   }
 }
 
-TEST_CASE_FIXTURE(AutoCompactFixture, "T2 segment evacuation includes current versions of replaced keys") {
+TEST_CASE("T2 segment evacuation includes current versions of replaced keys") {
   const auto path = vmemkv_test::ScopedTempPath("vmemkv_compact_segment", vmemkv::remove_store_files);
   constexpr size_t kKeys = 2400;
   constexpr size_t kValBytes = 128;
@@ -367,7 +343,7 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "T2 segment evacuation includes current ve
       vmemkv::t2_detail::kPayloadOffsetMask;
   const uint64_t used_before_compact = store->impl().t2().tail_offset();
 
-  enable();
+  store->impl().set_auto_compact_enabled(true);
   wait_for_compaction(*store);
 
   const uint64_t moved_bytes = store->impl().t2().tail_offset() - used_before_compact;
@@ -387,7 +363,7 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "T2 segment evacuation includes current ve
       CHECK(new_offset >= updated_offset);
     }
   }
-  drain_compaction(store, *this);
+  drain_compaction(store);
   for (size_t i = 0; i < kKeys; ++i) {
     const auto got = vmemkv_test::get_optional_bytes(store, make_key(i));
     if (is_deleted_key(i)) {
@@ -408,7 +384,7 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "T2 segment evacuation includes current ve
 // two complete 8MiB segments and the update tail appends only beyond them, so the leading
 // segments fully evacuate once their records are updated away or removed, and the punches
 // become observable in st_blocks.
-TEST_CASE_FIXTURE(AutoCompactFixture, "overwrite and delete segment evacuation reclaims frozen segments") {
+TEST_CASE("overwrite and delete segment evacuation reclaims frozen segments") {
   if (vmemkv_test::punch_capable_root().empty()) {
     MESSAGE("skipped: no non-tmpfs temp root; hole punch unsupported");
     return;
@@ -428,7 +404,7 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "overwrite and delete segment evacuation r
     REQUIRE(store->remove(make_key(i)));
   }
   store->checkpoint();
-  drain_compaction(store, *this);
+  drain_compaction(store);
   const uint64_t blocks_after_drain = file_blocks(t2_data_path(path));
   store->checkpoint();
   wait_for_compaction(*store);
@@ -481,7 +457,7 @@ TEST_CASE("T2 garbage-segment selection ignores an unfrozen tail") {
   CHECK(own.garbage_segment_count(kTinySegmentBytes) == 1);
 }
 
-TEST_CASE_FIXTURE(AutoCompactFixture, "epoch gate defers punch by one checkpoint") {
+TEST_CASE("epoch gate defers punch by one checkpoint") {
   if (vmemkv_test::punch_capable_root().empty()) {
     MESSAGE("skipped: no non-tmpfs temp root; hole punch unsupported");
     return;
@@ -500,7 +476,7 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "epoch gate defers punch by one checkpoint
   for (size_t i = 0; i < kKeys; ++i) {
     REQUIRE(store->update(make_key(i), pattern_value(2 * kValBytes, kKeys + i)));
   }
-  drain_compaction(store, *this);
+  drain_compaction(store);
   const uint64_t blocks_after_drain = file_blocks(t2_data_path(path));
   // First post-evacuation checkpoint: eligible only after one MORE checkpoint,
   // because an evacuation finishing after a checkpoint's writer-stop resumes can
@@ -520,7 +496,7 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "epoch gate defers punch by one checkpoint
   }
 }
 
-TEST_CASE_FIXTURE(AutoCompactFixture, "punched evacuation survives restart") {
+TEST_CASE("punched evacuation survives restart") {
   if (vmemkv_test::punch_capable_root().empty()) {
     MESSAGE("skipped: no non-tmpfs temp root; hole punch unsupported");
     return;
@@ -542,7 +518,7 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "punched evacuation survives restart") {
     }
     store->checkpoint();
     const uint64_t blocks_before = file_blocks(t2_data_path(path));
-    drain_compaction(store, *this);
+    drain_compaction(store);
     store->checkpoint();
     store->checkpoint();
     wait_for([&] { return file_blocks(t2_data_path(path)) < blocks_before; });
@@ -567,7 +543,7 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "punched evacuation survives restart") {
   }
 }
 
-TEST_CASE_FIXTURE(AutoCompactFixture, "same-size in-place updates survive checkpoint and segment evacuation") {
+TEST_CASE("same-size in-place updates survive checkpoint and segment evacuation") {
   const auto path = vmemkv_test::ScopedTempPath("vmemkv_compact", vmemkv::remove_store_files);
   constexpr size_t kKeys = 5000;
   constexpr size_t kValBytes = 1024;
@@ -580,7 +556,7 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "same-size in-place updates survive checkp
     REQUIRE(store->update(make_key(i), pattern_value(kValBytes, kKeys + i)));
   }
   store->checkpoint();
-  drain_compaction(store, *this);
+  drain_compaction(store);
   for (size_t i = 0; i < kKeys; ++i) {
     const auto got = vmemkv_test::get_optional_bytes(store, make_key(i));
     REQUIRE(got.has_value());
@@ -588,7 +564,7 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "same-size in-place updates survive checkp
   }
 }
 
-TEST_CASE_FIXTURE(AutoCompactFixture, "restart rebuilds shard order and segment accounting") {
+TEST_CASE("restart rebuilds shard order and segment accounting") {
   const auto path = vmemkv_test::ScopedTempPath("vmemkv_compact", vmemkv::remove_store_files);
   constexpr size_t kKeys = 5000;
   constexpr size_t kValBytes = 256;
@@ -604,7 +580,7 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "restart rebuilds shard order and segment 
   {
     auto store = make_store(path);
     REQUIRE(store->get_statistics().t2_dirty_shard_count > 0);
-    enable();
+    store->impl().set_auto_compact_enabled(true);
     wait_for_compaction(*store);
     CHECK(store->get_statistics().t2_dirty_shard_count == 0);
     for (size_t i = 0; i < kKeys; ++i) {
@@ -615,7 +591,7 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "restart rebuilds shard order and segment 
   }
 }
 
-TEST_CASE_FIXTURE(AutoCompactFixture, "T1 shard splits preserve T2 dirty state") {
+TEST_CASE("T1 shard splits preserve T2 dirty state") {
   const auto path = vmemkv_test::ScopedTempPath("vmemkv_compact", vmemkv::remove_store_files);
   constexpr size_t kKeys = 2000;
   constexpr size_t kValBytes = 64;
@@ -630,7 +606,7 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "T1 shard splits preserve T2 dirty state")
   store->checkpoint();
   store->impl().t1().drain_maintenance();
   CHECK(store->get_statistics().t2_dirty_shard_count == store->impl().t1().shard_count());
-  enable();
+  store->impl().set_auto_compact_enabled(true);
   wait_for_compaction(*store);
   store->impl().t1().drain_maintenance();
   CHECK(store->get_statistics().t2_dirty_shard_count == 0);
@@ -656,7 +632,7 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "T1 shard splits preserve T2 dirty state")
   }
 }
 
-TEST_CASE_FIXTURE(AutoCompactFixture, "compaction convergence and punch backlog bounding under continuous churn") {
+TEST_CASE("compaction convergence and punch backlog bounding under continuous churn") {
   if (vmemkv_test::punch_capable_root().empty()) {
     MESSAGE("skipped: no non-tmpfs temp root; hole punch unsupported");
     return;
@@ -674,7 +650,7 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "compaction convergence and punch backlog 
   store->checkpoint();
 
   // Enable background compaction during continuous churn
-  enable();
+  store->impl().set_auto_compact_enabled(true);
 
   // 2. Continuous churn: multiple generations of updates creating dead segments
   constexpr size_t kGenerations = 4;
@@ -706,7 +682,7 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "compaction convergence and punch backlog 
   }
 }
 
-TEST_CASE_FIXTURE(AutoCompactFixture, "16-byte keys with shared upper 8 bytes detect inversions and repack") {
+TEST_CASE("16-byte keys with shared upper 8 bytes detect inversions and repack") {
   const auto path = vmemkv_test::ScopedTempPath("vmemkv_compact_16b", vmemkv::remove_store_files);
   constexpr size_t kKeys = 10000;
   constexpr size_t kValBytes = 128;
@@ -722,14 +698,14 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "16-byte keys with shared upper 8 bytes de
       [&](size_t i) { return make_key_16b(order[i]); },
       [&](size_t i) { return pattern_value(kValBytes, order[i]); });
   REQUIRE(inversion_rate(store) > 0.3);
-  enable();
+  store->impl().set_auto_compact_enabled(true);
   store->drain_compaction();
   wait_for_compaction(*store);
   CHECK(store->get_statistics().t2_dirty_shard_count == 0);
   CHECK(inversion_rate(store) == 0.0);
 }
 
-TEST_CASE_FIXTURE(AutoCompactFixture, "64KB shuffled bulk load bounds T2 write amplification and reclaims segments") {
+TEST_CASE("64KB shuffled bulk load bounds T2 write amplification and reclaims segments") {
   if (vmemkv_test::punch_capable_root().empty()) {
     MESSAGE("skipped: no non-tmpfs temp root; hole punch unsupported");
     return;
@@ -752,7 +728,7 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "64KB shuffled bulk load bounds T2 write a
   REQUIRE(used_after_load > 2 * vmemkv::T2Config::kSegmentBytes);
   store->checkpoint();
 
-  drain_compaction(store, *this);
+  drain_compaction(store);
   CHECK(store->get_statistics().t2_dirty_shard_count == 0);
   // Dirty shards compact independently in FIFO order, so only shard boundaries can invert.
   CHECK(count_inversions(store) < store->impl().t1().shard_count());
@@ -779,7 +755,7 @@ TEST_CASE_FIXTURE(AutoCompactFixture, "64KB shuffled bulk load bounds T2 write a
       REQUIRE(store->update(make_key(i), pattern_value(kGrownValBytes, kKeys + i)));
     }
   }
-  drain_compaction(store, *this);
+  drain_compaction(store);
   const uint64_t used_after_updates = store->impl().t2().tail_offset();
   CHECK((used_after_updates - used_before_updates) <= (used_after_load * 3) / 2);
 

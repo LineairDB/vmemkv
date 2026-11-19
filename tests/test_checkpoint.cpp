@@ -14,6 +14,7 @@
 #include <vector>
 #include <vmemkv/checkpoint/checkpoint.hpp>
 #include <vmemkv/t1_index/t1_index.hpp>
+#include <vmemkv/wal/wal.hpp>
 
 #include "test_support.hpp"
 

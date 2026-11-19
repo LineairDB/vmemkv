@@ -26,6 +26,7 @@
 #include <vmemkv/wal/wal.hpp>
 
 #include "test_support.hpp"
+#include "test_wal_corrupt.hpp"
 
 namespace {
 

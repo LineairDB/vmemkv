@@ -68,7 +68,7 @@ flowchart TB
 2. **Bounded `pread()` for Large Random Reads**:
    Random records exceeding one OS page (`page_size()`) rarely hit cached multi-page runs under LTM memory pressure. Using `::pread(pread_fd_, ..., len, offset)` avoids synchronous multi-page minor/major fault roundtrips across `VMA` boundaries and bounds SSD I/O to the caller-supplied upper limit (`std::min(max_bytes, limit - offset)`).
 3. **Cache Warming (`prefetch`)**:
-   `MappedReader::prefetch(offset, len)` issues `::madvise(random_mmap_ + offset, clamped, MADV_WILLNEED)` on `[offset, offset + len)` clamped to `capacity()`. Because the page cache is shared, warming via `random_mmap_` primes reads across all mappings and `pread_fd`.
+   `MappedReader::prefetch(offset, len)` rounds `offset` down to the OS page boundary (as required by Linux `madvise(2)`) and issues `::madvise(..., MADV_WILLNEED)` covering `[offset, offset + len)` clamped to `capacity()`. Because the page cache is shared, warming via `random_mmap_` primes reads across all mappings and `pread_fd`.
 4. **Thread Safety**:
    `const` read methods (`view_at_most`, `read`, `mapping_for`, `prefetch`) take no locks and share no mutable member state. Threads sharing one `MappedReader` are race-free provided each thread supplies its own `scratch` buffer (except `Policy::PreadOnly` with `scratch == nullptr`, which uses an internal `thread_local` buffer).
 

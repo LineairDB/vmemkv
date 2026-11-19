@@ -4,15 +4,12 @@
 #include <doctest/doctest.h>
 
 #include <cstring>
-#include <filesystem>
-#include <fstream>
 #include <span>
 #include <string>
 #include <vector>
-#include <vmemkv/api/store_adapter.hpp>  // needed by vmemkv_impl.hpp below (get_impl()'s inline-value path)
-#include <vmemkv/core/quadfecta.hpp>
+#include <vmemkv/core/utils.hpp>
+#include <vmemkv/impl/read_path.hpp>
 #include <vmemkv/t2_flat_file/t2_flat_file.hpp>
-#include <vmemkv/vmemkv_impl.hpp>  // for the free function vmemkv::read_t2_record_seqlock() only
 
 #include "test_support.hpp"
 
@@ -141,47 +138,4 @@ TEST_CASE(
                                  });
   CHECK(copied.size() == shrunk_value.size());
   CHECK(span_to_string(std::span<const std::byte>(copied.data(), copied.size())) == shrunk_value);
-}
-
-TEST_CASE("Quadfecta: standalone MappedReader serves small and large reads across all policies") {
-  const auto path = vmemkv_test::ScopedTempPath("quadfecta_standalone", vmemkv::remove_quiet);
-  const uint64_t page_size = quadfecta::MappedReader::page_size();
-  const size_t total_size = static_cast<size_t>(page_size * 4);
-  std::vector<std::byte> payload(total_size);
-  for (size_t i = 0; i < total_size; ++i) {
-    payload[i] = static_cast<std::byte>((i * 31 + 7) & 0xffU);
-  }
-  {
-    std::ofstream out(path.get(), std::ios::binary | std::ios::trunc);
-    REQUIRE(out.good());
-    out.write(reinterpret_cast<const char *>(payload.data()), static_cast<std::streamsize>(payload.size()));
-    REQUIRE(out.good());
-  }
-
-  auto reader = quadfecta::MappedReader::open_readonly(path.get());
-  CHECK(reader.capacity() == total_size);
-  CHECK(reader.random_mmap() != nullptr);
-  CHECK(reader.sequential_mmap() != nullptr);
-  CHECK(reader.normal_mmap() != nullptr);
-  CHECK(reader.pread_fd() >= 0);
-
-  std::vector<std::byte> scratch;
-  const uint64_t large_len = page_size + 256;
-  for (quadfecta::Policy policy : {quadfecta::Policy::Adaptive,
-                                   quadfecta::Policy::RandomOnly,
-                                   quadfecta::Policy::SeqOnly,
-                                   quadfecta::Policy::NormalOnly,
-                                   quadfecta::Policy::PreadOnly}) {
-    for (quadfecta::Access access : {quadfecta::Access::Random, quadfecta::Access::Sequential}) {
-      const auto small_view = reader.read(128, 64, access, &scratch, policy);
-      REQUIRE(small_view.has_value());
-      CHECK(std::memcmp(small_view->data(), payload.data() + 128, 64) == 0);
-
-      const auto large_view = reader.read(page_size, large_len, access, &scratch, policy);
-      REQUIRE(large_view.has_value());
-      CHECK(std::memcmp(large_view->data(), payload.data() + page_size, large_len) == 0);
-    }
-  }
-  CHECK_FALSE(reader.read(total_size, 1, quadfecta::Access::Random, &scratch).has_value());
-  reader.prefetch(0, page_size);
 }

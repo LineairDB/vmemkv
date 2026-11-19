@@ -12,6 +12,7 @@ set(VMEMKV_TEST_CASES
   test_t1_index.cpp
   test_sharded_t1_index.cpp
   test_t2_flat_file.cpp
+  test_quadfecta.cpp
   test_cgroup_throttle.cpp
   test_swap_check.cpp
   test_compaction.cpp

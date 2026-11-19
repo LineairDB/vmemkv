@@ -114,6 +114,8 @@ class VMemKVImpl {
     recover_from_wal();
     recovering_ = false;
     t2_own_.queue_empty_segments(t2_.get_memory()->read_only_offset.load(std::memory_order_acquire));
+    compact_.auto_compact_enabled.store(options_.auto_compact && !vmemkv::auto_compact_suppressed(),
+                                        std::memory_order_release);
     spawn_background_workers();
   }
 
@@ -157,6 +159,10 @@ class VMemKVImpl {
     }
     checkpoint_detail::run_checkpoint(
         checkpoint_, t1_, t2_, wal_, t2_own_, t2_path(), options_, NoOpPreStopHook{}, NoOpPreFinishHook{});
+  }
+
+  void set_auto_compact_enabled(bool enabled) noexcept {
+    compact_.auto_compact_enabled.store(enabled, std::memory_order_release);
   }
 
   // Drains in-flight background compaction, dirty segments, and dirty shards until clean.
@@ -588,7 +594,8 @@ class VMemKVImpl {
       next_compact_at = std::chrono::steady_clock::now();
     }
     const auto now = std::chrono::steady_clock::now();
-    if (vmemkv::auto_compact_suppressed() || now < next_compact_at || !has_compaction_work()) {
+    if (!compact_.auto_compact_enabled.load(std::memory_order_acquire) || now < next_compact_at ||
+        !has_compaction_work()) {
       return;
     }
     try {

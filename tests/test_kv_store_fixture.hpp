@@ -15,6 +15,7 @@
 #include <utility>
 #include <vector>
 #include <vmemkv/variants.hpp>
+#include <vmemkv/wal/wal.hpp>
 
 #include "test_support.hpp"
 
@@ -61,7 +62,9 @@ struct StoreFactory;
 
 // Helper to reserve temp path for T2 files
 static auto reserve_temp_path() -> std::filesystem::path {
-  return vmemkv_test::reserve_unique_temp_path("vmemkv_kv", /*also_remove_wal_sibling=*/true);
+  auto path = vmemkv_test::reserve_unique_temp_path("vmemkv_kv");
+  vmemkv::remove_store_files(path);
+  return path;
 }
 
 template <typename Impl>

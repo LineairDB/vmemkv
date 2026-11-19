@@ -1,4 +1,4 @@
-// test_wal_corrupt.hpp — WAL corruption helpers for tests (byte flips, torn headers).
+// test_wal_corrupt.hpp — WAL test helpers (segment cleanup, torn headers).
 #pragma once
 
 #include <doctest/doctest.h>
@@ -10,16 +10,8 @@
 
 namespace vmemkv_test {
 
-// Flips a single byte at `offset` in the file at `path`.
-inline void flip_byte_at(const std::filesystem::path &path, std::streamoff offset) {
-  std::fstream file(path, std::ios::binary | std::ios::in | std::ios::out);
-  file.seekg(offset);
-  char original = 0;
-  file.read(&original, 1);
-  const char flipped = static_cast<char>(~original);
-  file.seekp(offset);
-  file.write(&flipped, 1);
-}
+// ScopedTempPath cleanup for WAL-only test dirs.
+inline void cleanup_wal_segments(const std::filesystem::path &path) { vmemkv::remove_wal_segments(path); }
 
 // Resolves the WAL's active segment for either a WAL identity path or a T2 store path.
 inline auto resolve_active_wal_segment(const std::filesystem::path &path) -> std::filesystem::path {

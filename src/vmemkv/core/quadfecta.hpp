@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <optional>
 #include <span>
 #include <system_error>
@@ -30,6 +31,8 @@
 #include <vector>
 
 namespace quadfecta {
+
+static_assert(sizeof(off_t) >= sizeof(int64_t), "quadfecta requires 64-bit off_t");
 
 enum class Access : std::uint8_t {
   Random,      // Single-record point access (avoid readahead).
@@ -90,7 +93,15 @@ class MappedReader {
       if (::fstat(file_descriptor, &file_stat) != 0) {
         throw std::system_error(errno, std::generic_category(), "quadfecta fstat");
       }
+      if (!S_ISREG(file_stat.st_mode) || file_stat.st_size < 0) {
+        throw std::system_error(EINVAL, std::generic_category(), "quadfecta requires regular non-negative file");
+      }
       const auto file_bytes = static_cast<uint64_t>(file_stat.st_size);
+      if constexpr (sizeof(uint64_t) > sizeof(size_t)) {
+        if (file_bytes > std::numeric_limits<size_t>::max()) {
+          throw std::system_error(EOVERFLOW, std::generic_category(), "quadfecta file exceeds address space");
+        }
+      }
       std::byte *primary = nullptr;
       if (file_bytes > 0) {
         void *mapped = ::mmap(nullptr, static_cast<size_t>(file_bytes), PROT_READ, MAP_SHARED, file_descriptor, 0);
@@ -115,20 +126,26 @@ class MappedReader {
   }
 
   // Best-effort setup of secondary read views (normal_mmap, sequential_mmap, dup'd pread_fd).
-  // Safe to call at most once before publishing this reader across threads.
+  // Idempotent when called repeatedly; should complete before publishing this reader across threads.
   void open_secondary_handles(int file_descriptor) noexcept {
     if (capacity_ > 0) {
-      normal_mmap_ = best_effort_mmap_ro(static_cast<size_t>(capacity_), file_descriptor);
-      std::byte *seq = best_effort_mmap_ro(static_cast<size_t>(capacity_), file_descriptor);
-      if (seq != nullptr) {
-        if (::madvise(seq, static_cast<size_t>(capacity_), MADV_SEQUENTIAL) == 0) {
-          sequential_mmap_ = seq;
-        } else {
-          ::munmap(seq, static_cast<size_t>(capacity_));
+      if (normal_mmap_ == nullptr) {
+        normal_mmap_ = best_effort_mmap_ro(static_cast<size_t>(capacity_), file_descriptor);
+      }
+      if (sequential_mmap_ == nullptr) {
+        std::byte *seq = best_effort_mmap_ro(static_cast<size_t>(capacity_), file_descriptor);
+        if (seq != nullptr) {
+          if (::madvise(seq, static_cast<size_t>(capacity_), MADV_SEQUENTIAL) == 0) {
+            sequential_mmap_ = seq;
+          } else {
+            ::munmap(seq, static_cast<size_t>(capacity_));
+          }
         }
       }
     }
-    pread_fd_ = ::fcntl(file_descriptor, F_DUPFD_CLOEXEC, 0);
+    if (pread_fd_ < 0) {
+      pread_fd_ = ::fcntl(file_descriptor, F_DUPFD_CLOEXEC, 0);
+    }
   }
 
   [[nodiscard]] static auto page_size() noexcept -> uint64_t {
@@ -169,6 +186,9 @@ class MappedReader {
     if (offset > capacity_ || size > capacity_ - offset) {
       return std::nullopt;
     }
+    if (size == 0) {
+      return std::span<const std::byte>{};
+    }
     const auto window = view_at_most(offset, size, offset + size, access, scratch, policy);
     if (!window.has_value() || window->size() < size) {
       return std::nullopt;
@@ -193,7 +213,7 @@ class MappedReader {
     const bool is_small = max_bytes <= page_size();
 
     if (policy == Policy::PreadOnly) {
-      thread_local static std::vector<std::byte> tl_pread_scratch;
+      thread_local std::vector<std::byte> tl_pread_scratch;
       std::vector<std::byte> *target = scratch != nullptr ? scratch : &tl_pread_scratch;
       return pread_window(offset, std::min(max_bytes, limit - offset), *target);
     }
@@ -208,14 +228,18 @@ class MappedReader {
     return std::nullopt;
   }
 
-  // Issues MADV_WILLNEED on `[offset, offset + len)` clamped to capacity(). Best-effort no-op.
+  // Issues MADV_WILLNEED covering `[offset, offset + len)` clamped to capacity(), rounding
+  // start down to a page boundary as required by Linux madvise(2). Best-effort no-op.
   // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
   void prefetch(uint64_t offset, uint64_t len) const noexcept {
     if (random_mmap_ == nullptr || offset >= capacity_ || len == 0) {
       return;
     }
-    const uint64_t clamped = std::min(len, capacity_ - offset);
-    (void)::madvise(random_mmap_ + offset, static_cast<size_t>(clamped), MADV_WILLNEED);
+    const uint64_t page_mask = page_size() - 1;
+    const uint64_t aligned_start = offset & ~page_mask;
+    const uint64_t clamped_len = std::min(len, capacity_ - offset);
+    const uint64_t aligned_len = (offset - aligned_start) + clamped_len;
+    (void)::madvise(random_mmap_ + aligned_start, static_cast<size_t>(aligned_len), MADV_WILLNEED);
   }
 
   [[nodiscard]] auto random_mmap() const noexcept -> std::byte * { return random_mmap_; }
@@ -238,11 +262,26 @@ class MappedReader {
       return std::nullopt;
     }
     scratch.resize(static_cast<size_t>(len));
-    const ssize_t bytes_read = ::pread(pread_fd_, scratch.data(), static_cast<size_t>(len), static_cast<off_t>(offset));
-    if (bytes_read <= 0) {
+    size_t total = 0;
+    while (total < len) {
+      const ssize_t bytes_read = ::pread(
+          pread_fd_, scratch.data() + total, static_cast<size_t>(len) - total, static_cast<off_t>(offset + total));
+      if (bytes_read > 0) {
+        total += static_cast<size_t>(bytes_read);
+        continue;
+      }
+      if (bytes_read == 0) {
+        break;
+      }
+      if (errno == EINTR) {
+        continue;
+      }
       return std::nullopt;
     }
-    return std::span<const std::byte>(scratch.data(), static_cast<size_t>(bytes_read));
+    if (total == 0 && len > 0) {
+      return std::nullopt;
+    }
+    return std::span<const std::byte>(scratch.data(), total);
   }
 
   void reset() noexcept {

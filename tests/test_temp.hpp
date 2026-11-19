@@ -7,16 +7,25 @@
 
 #include <atomic>
 #include <filesystem>
+#include <fstream>
 #include <functional>
+#include <ios>
 #include <string>
 #include <string_view>
 #include <vmemkv/core/env.hpp>
-#include <vmemkv/wal/wal.hpp>
 
 namespace vmemkv_test {
 
-// ScopedTempPath cleanup for WAL-only test dirs (replaces a lambda pasted per call site).
-inline void cleanup_wal_segments(const std::filesystem::path &path) { vmemkv::remove_wal_segments(path); }
+// Flips a single byte at `offset` in the file at `path`.
+inline void flip_byte_at(const std::filesystem::path &path, std::streamoff offset) {
+  std::fstream file(path, std::ios::binary | std::ios::in | std::ios::out);
+  file.seekg(offset);
+  char original = 0;
+  file.read(&original, 1);
+  const char flipped = static_cast<char>(~original);
+  file.seekp(offset);
+  file.write(&flipped, 1);
+}
 
 // Base directory for test-created T2/WAL/checkpoint files. VMEMKV_TEST_TMPDIR overrides;
 // otherwise the default is the memory-backed /dev/shm when present, so store-heavy tests are
@@ -63,7 +72,6 @@ inline auto punch_capable_root() -> const std::filesystem::path & {
 
 // Builds a unique-per-process-per-call temp file path under `prefix`.
 inline auto reserve_unique_temp_path(std::string_view prefix,
-                                     bool also_remove_wal_sibling = false,
                                      const std::filesystem::path &root = test_temp_root()) -> std::filesystem::path {
   static std::atomic<uint64_t> counter{0};
   const uint64_t sequence_number = counter.fetch_add(1, std::memory_order_relaxed);
@@ -71,9 +79,6 @@ inline auto reserve_unique_temp_path(std::string_view prefix,
                                             "_" + std::to_string(sequence_number));
   std::error_code ignored;
   std::filesystem::remove(temp_path, ignored);
-  if (also_remove_wal_sibling) {
-    vmemkv::remove_wal_segments(vmemkv::derive_wal_path(temp_path));
-  }
   return temp_path;
 }
 
@@ -94,7 +99,7 @@ class ScopedTempPath {
   explicit ScopedTempPath(std::string_view prefix,
                           std::function<void(const std::filesystem::path &)> cleanup,
                           const std::filesystem::path &root = test_temp_root())
-      : path_(reserve_unique_temp_path(prefix, /*also_remove_wal_sibling=*/false, root)), cleanup_(std::move(cleanup)) {
+      : path_(reserve_unique_temp_path(prefix, root)), cleanup_(std::move(cleanup)) {
     cleanup_(path_);
   }
   ~ScopedTempPath() { cleanup_(path_); }

@@ -53,6 +53,7 @@ struct StoreOptions {
   uint64_t punch_backlog_checkpoint_cap_segments = T2Config::kPunchBacklogCheckpointCapSegments;
   size_t wal_max_bytes_since_checkpoint = WalConfig::kMaxBytesSinceCheckpoint;
   ReadPolicy read_policy = ReadPolicy::Adaptive;
+  bool auto_compact = true;
 };
 
 // X-macro: the checkpoint phase-breakdown fields of VMemKVStatistics below, and the

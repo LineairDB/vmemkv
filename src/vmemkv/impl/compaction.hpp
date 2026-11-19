@@ -44,6 +44,7 @@ inline auto auto_compact_suppressed() noexcept -> bool {
 }
 
 struct CompactionState {
+  std::atomic<bool> auto_compact_enabled{true};
   std::atomic<bool> running{false};
   std::atomic<uint64_t> cycle_count{0};
   std::atomic<bool> punch_probed{false};
