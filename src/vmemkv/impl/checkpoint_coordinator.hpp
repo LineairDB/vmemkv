@@ -147,7 +147,7 @@ inline void msync_target_range(const T2Memory *mem, uint64_t old_read_only_offse
   const uint64_t aligned_start = old_read_only_offset - (old_read_only_offset % page_size);
   for (uint64_t cur = aligned_start; cur < target;) {
     const uint64_t cur_len = std::min(T2Config::kMsyncChunkBytes, target - cur);
-    const int msync_rc = ::msync(mem->reads.random_mmap + cur, cur_len, MS_SYNC);
+    const int msync_rc = ::msync(mem->reads.random_mmap() + cur, cur_len, MS_SYNC);
     if (msync_rc != 0) {
       throw std::system_error(errno, std::generic_category(), "msync t2 checkpoint");
     }

@@ -3,8 +3,6 @@
 // range is safe to durabilize, punch, or rewrite in place.
 #pragma once
 
-#include <unistd.h>
-
 #include <algorithm>
 #include <atomic>
 #include <cassert>
@@ -15,6 +13,7 @@
 #include <stdexcept>
 #include <vector>
 #include <vmemkv/config.hpp>
+#include <vmemkv/core/quadfecta.hpp>
 #include <vmemkv/core/utils.hpp>
 #include <vmemkv/impl/hooks.hpp>
 #include <vmemkv/t1_index/t1_codec.hpp>
@@ -37,10 +36,7 @@ inline auto checked_block_count(uint64_t key_bytes, uint64_t value_bytes) -> uin
 }
 
 // OS page size for msync() range alignment and the small/large read threshold.
-inline auto os_page_size() noexcept -> uint64_t {
-  static const auto kCached = static_cast<uint64_t>(::sysconf(_SC_PAGESIZE));
-  return kCached;
-}
+inline auto os_page_size() noexcept -> uint64_t { return quadfecta::MappedReader::page_size(); }
 
 inline constexpr uint64_t kOsPageShift = 12;
 

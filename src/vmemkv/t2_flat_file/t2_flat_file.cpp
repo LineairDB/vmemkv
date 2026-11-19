@@ -101,12 +101,12 @@ auto T2FlatFile::append_default(const T2Memory *mem,
   uint64_t frontier = mem->tail_offset.load(std::memory_order_relaxed);
   while (true) {
     const uint64_t skip = page_skip_bytes(frontier, required);
-    if (frontier + skip + required > mem->capacity) {
+    if (frontier + skip + required > mem->reads.capacity()) {
       throw std::runtime_error("T2 storage capacity exceeded");
     }
     if (mem->tail_offset.compare_exchange_weak(frontier, frontier + skip + required, std::memory_order_relaxed)) {
       const uint64_t offset = frontier + skip;
-      write_record(mem->reads.random_mmap + offset, key, value);
+      write_record(mem->reads.random_mmap() + offset, key, value);
       return offset;
     }
   }
@@ -163,7 +163,7 @@ void T2FlatFile::map_file(const std::filesystem::path &path, uint64_t bytes_capa
   }
 
   auto *mem = new T2Memory(static_cast<std::byte *>(mapped), bytes_capacity, initial_bytes_used);
-  mem->setup_read_handles(file_descriptor.fd);
+  mem->reads.open_secondary_handles(file_descriptor.fd);
 
   file_descriptor.reset();
   t2_mem_.store(mem, std::memory_order_release);
@@ -193,7 +193,7 @@ auto T2FlatFile::punch_if_occupied(uint64_t offset, uint64_t len) const noexcept
     return PunchOutcome::AlreadyHollow;
   }
   const T2Memory *mem = get_memory();
-  if (offset + len > mem->capacity) {
+  if (offset + len > mem->reads.capacity()) {
     return PunchOutcome::Failed;
   }
   const int file_descriptor = ::open(vmemkv::derive_t2_chk_path(path_).c_str(), O_RDWR);
@@ -222,42 +222,8 @@ auto T2FlatFile::punch_if_occupied(uint64_t offset, uint64_t len) const noexcept
     return PunchOutcome::Failed;
   }
   // Punch zeroes file blocks but resident pages would keep serving stale bytes.
-  ::madvise(mem->reads.random_mmap + offset, static_cast<size_t>(len), MADV_DONTNEED);
+  ::madvise(mem->reads.random_mmap() + offset, static_cast<size_t>(len), MADV_DONTNEED);
   return PunchOutcome::Punched;
-}
-
-T2Memory::~T2Memory() noexcept {
-  if (reads.normal_mmap != nullptr) {
-    ::munmap(reads.normal_mmap, static_cast<size_t>(capacity));
-  }
-  if (reads.sequential_mmap != nullptr) {
-    ::munmap(reads.sequential_mmap, static_cast<size_t>(capacity));
-  }
-  if (reads.pread_fd >= 0) {
-    ::close(reads.pread_fd);
-  }
-  if ((reads.random_mmap != nullptr) && capacity > 0) {
-    ::munmap(reads.random_mmap, static_cast<size_t>(capacity));
-  }
-}
-
-void T2Memory::setup_read_handles(int file_descriptor) noexcept {
-  void *scan = best_effort_mmap_shared(static_cast<size_t>(capacity), file_descriptor, PROT_READ, 0);
-  if (scan != nullptr) {
-    reads.normal_mmap = static_cast<std::byte *>(scan);
-  }
-
-  void *scan_seq = best_effort_mmap_shared(static_cast<size_t>(capacity), file_descriptor, PROT_READ, 0);
-  if (scan_seq != nullptr) {
-    if (::madvise(scan_seq, static_cast<size_t>(capacity), MADV_SEQUENTIAL) == 0) {
-      reads.sequential_mmap = static_cast<std::byte *>(scan_seq);
-    } else {
-      ::munmap(scan_seq, static_cast<size_t>(capacity));
-    }
-  }
-
-  // Dup before the caller closes file_descriptor so the lifetime is self-contained.
-  reads.pread_fd = ::fcntl(file_descriptor, F_DUPFD_CLOEXEC, 0);
 }
 
 }  // namespace vmemkv

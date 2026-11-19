@@ -176,9 +176,9 @@ TEST_CASE("vmemkv: checkpoint() extends read_only_offset coverage across repeate
 
   const uint64_t boundary_after_first = store->impl().t2().get_memory()->read_only_offset;
   CHECK(boundary_after_first > 0);
-  CHECK(store->impl().t2().get_memory()->reads.normal_mmap != nullptr);
-  CHECK(store->impl().t2().get_memory()->reads.sequential_mmap != nullptr);
-  CHECK(store->impl().t2().get_memory()->reads.pread_fd >= 0);
+  CHECK(store->impl().t2().get_memory()->reads.normal_mmap() != nullptr);
+  CHECK(store->impl().t2().get_memory()->reads.sequential_mmap() != nullptr);
+  CHECK(store->impl().t2().get_memory()->reads.pread_fd() >= 0);
 
   // Insert more, then checkpoint again -- read_only_offset advances further in place.
   for (int i = 10; i < 20; ++i) {
@@ -262,9 +262,9 @@ TEST_CASE("vmemkv: checkpoint() on an empty store still establishes normal_mmap/
   auto store = std::make_unique<TestStore>(reserve_temp_path().string(), kStoreCapacityBytes);
 
   store->checkpoint();  // No-op promotion: zero live entries, read_only_offset stays at 0.
-  CHECK(store->impl().t2().get_memory()->reads.normal_mmap != nullptr);
-  CHECK(store->impl().t2().get_memory()->reads.sequential_mmap != nullptr);
-  CHECK(store->impl().t2().get_memory()->reads.pread_fd >= 0);
+  CHECK(store->impl().t2().get_memory()->reads.normal_mmap() != nullptr);
+  CHECK(store->impl().t2().get_memory()->reads.sequential_mmap() != nullptr);
+  CHECK(store->impl().t2().get_memory()->reads.pread_fd() >= 0);
   CHECK(store->impl().t2().get_memory()->read_only_offset == 0);
 
   const std::string value(kValue200Bytes, 'a');

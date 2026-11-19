@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <vmemkv/core/quadfecta.hpp>
 #include <vmemkv/stats.hpp>
 
 namespace vmemkv {
@@ -42,13 +43,7 @@ struct WalConfig {
 // Immutable-region T2 read policy (docs/specification/low_level_design.md 7.5):
 // - Adaptive: selects per-record across random_mmap, sequential_mmap, normal_mmap, and pread.
 // - RandomOnly / SeqOnly / NormalOnly / PreadOnly: pins every immutable read to one handle.
-enum class ReadPolicy : std::uint8_t {
-  Adaptive,
-  RandomOnly,
-  SeqOnly,
-  NormalOnly,
-  PreadOnly,
-};
+using ReadPolicy = quadfecta::Policy;
 
 struct StoreOptions {
   size_t memtable_capacity_entries = T1Config::kMemTableCapacityEntries;

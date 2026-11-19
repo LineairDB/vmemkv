@@ -9,6 +9,7 @@
 #include <span>
 #include <type_traits>
 #include <utility>
+#include <vmemkv/core/quadfecta.hpp>
 #include <vmemkv/core/reference_tracker.hpp>
 #include <vmemkv/core/spin_backoff.hpp>
 
@@ -39,28 +40,10 @@ inline auto make_record_view(const ValueRecordHeader *header) noexcept -> T2Reco
 
 namespace vmemkv {
 
-// Four handles over the same [0, capacity) bytes; the per-record choice is made by
-// try_read_immutable_record(). madvise is per mapping, hence one handle per readahead policy.
-struct T2ReadHandles {
-  // Primary read-write mapping, MADV_RANDOM. All appends/in-place updates land here;
-  // small gets read here (1-op-1-record random access never pays for readahead).
-  std::byte *random_mmap = nullptr;
-  // Read-only, MADV_SEQUENTIAL. Small scans: the wide window folds many small faults
-  // into few major faults.
-  std::byte *sequential_mmap = nullptr;
-  // Read-only, kernel default readahead. Used by large scans (> 1 page).
-  std::byte *normal_mmap = nullptr;
-  // dup()'d fd for bounded pread() of large Gets (> 1 page) or ReadPolicyPreadOnly. -1 when
-  // best-effort setup failed; readers fall back to random_mmap + seqlock.
-  int pread_fd = -1;
-};
-
-// Single T2 mapping for the store's lifetime. Readers use the raw pointer directly;
-// writers register via WriterGate below. See docs/specification/low_level_design.md 7.4-7.5 for the
-// read-path rationale.
+// Single T2 mapping for the store's lifetime. Readers use `reads` directly (Quadfecta);
+// writers register via WriterGate below. See docs/specification/low_level_design.md 7.4-7.5.
 struct T2Memory {
-  T2ReadHandles reads;
-  uint64_t capacity = 0;
+  quadfecta::MappedReader reads;
 
   // Monotonic append frontier (FASTER TailOffset). Mutable through const get_memory().
   mutable std::atomic<uint64_t> tail_offset{0};
@@ -69,19 +52,14 @@ struct T2Memory {
 
   // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
   T2Memory(std::byte *base_ptr, uint64_t capacity_bytes, uint64_t initial_tail_offset) noexcept
-      : capacity(capacity_bytes), tail_offset(initial_tail_offset), read_only_offset(initial_tail_offset) {
-    reads.random_mmap = base_ptr;
-  }
+      : reads(base_ptr, capacity_bytes), tail_offset(initial_tail_offset), read_only_offset(initial_tail_offset) {}
 
-  ~T2Memory() noexcept;
+  ~T2Memory() noexcept = default;
 
   T2Memory(const T2Memory &) = delete;
   auto operator=(const T2Memory &) -> T2Memory & = delete;
   T2Memory(T2Memory &&) = delete;
   auto operator=(T2Memory &&) -> T2Memory & = delete;
-
-  // Best-effort, never throws, at most once before publication.
-  void setup_read_handles(int file_descriptor) noexcept;
 };
 
 struct NoOpAcquireWriteHandleHook {
@@ -181,8 +159,8 @@ class T2FlatFile {
 
  private:
   static auto resolve_record(uint64_t payload, const T2Memory *mem) noexcept -> const std::byte * {
-    assert(payload < mem->capacity);
-    return mem->reads.random_mmap + payload;
+    assert(payload < mem->reads.capacity());
+    return mem->reads.random_mmap() + payload;
   }
 
   static void create_empty_file(const std::filesystem::path &path, uint64_t bytes_capacity);

@@ -37,17 +37,6 @@ inline void madvise_or_throw(void *address, size_t size, int advice, const char 
   }
 }
 
-// Best-effort shared mapping for read-only scan optimizations. Null on failure, never throws.
-// Deliberately without MAP_NORESERVE (unlike mmap_shared_or_throw's default): file-backed
-// read-only pages need no swap reservation, so the flag would change nothing.
-inline auto best_effort_mmap_shared(size_t size, int file_descriptor, int prot, off_t offset = 0) noexcept -> void * {
-  void *mapped = ::mmap(nullptr, size, prot, MAP_SHARED, file_descriptor, offset);
-  if (mapped == MAP_FAILED) {
-    return nullptr;
-  }
-  return mapped;
-}
-
 // RAII owner of one mmap region. Unmaps on destruction, movable, non-copyable.
 class MmapGuard {
  public:

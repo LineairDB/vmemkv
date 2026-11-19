@@ -10,7 +10,6 @@
 
 #include <fcntl.h>
 #include <linux/magic.h>
-#include <sys/mman.h>
 #include <sys/statfs.h>
 #include <sys/vfs.h>
 
@@ -316,10 +315,10 @@ inline auto payloads_overlap_garbage_segment(std::span<const uint64_t> payloads,
 inline void prefetch_payload_batch(std::span<const uint64_t> batch,
                                    const vmemkv::T2Memory *mem,
                                    uint64_t upper_bound) noexcept {
-  if (batch.empty() || mem == nullptr || mem->reads.random_mmap == nullptr) {
+  if (batch.empty() || mem == nullptr || mem->reads.random_mmap() == nullptr) {
     return;
   }
-  const uint64_t limit = std::min(upper_bound, mem->capacity);
+  const uint64_t limit = std::min(upper_bound, mem->reads.capacity());
   const uint64_t page_size = t2_detail::os_page_size();
   const uint64_t page_mask = page_size - 1;
   struct PageRange {
@@ -336,7 +335,7 @@ inline void prefetch_payload_batch(std::span<const uint64_t> batch,
     const uint64_t hint = t2_detail::payload_hint_bytes(payload, t2_detail::kImmutableSizeHintMargin);
     const uint64_t raw_end = off + std::min<uint64_t>(hint, limit - off);
     const uint64_t pg_start = off & ~page_mask;
-    const uint64_t pg_end = std::min<uint64_t>((raw_end + page_mask) & ~page_mask, mem->capacity);
+    const uint64_t pg_end = std::min<uint64_t>((raw_end + page_mask) & ~page_mask, mem->reads.capacity());
     if (pg_end > pg_start) {
       ranges.push_back({pg_start, pg_end});
     }
@@ -354,11 +353,11 @@ inline void prefetch_payload_batch(std::span<const uint64_t> batch,
       cur_end = std::max(cur_end, ranges[i].end);
       continue;
     }
-    (void)::madvise(mem->reads.random_mmap + cur_start, static_cast<size_t>(cur_end - cur_start), MADV_WILLNEED);
+    mem->reads.prefetch(cur_start, cur_end - cur_start);
     cur_start = ranges[i].start;
     cur_end = ranges[i].end;
   }
-  (void)::madvise(mem->reads.random_mmap + cur_start, static_cast<size_t>(cur_end - cur_start), MADV_WILLNEED);
+  mem->reads.prefetch(cur_start, cur_end - cur_start);
 }
 
 inline constexpr size_t kPrefetchBatchSize = 256;
@@ -543,10 +542,10 @@ auto compact_cycle(CompactionState &state,
   // Flush this cycle's relocated T2 range to disk without waiting for background writeback
   // timers, keeping dirty page-cache buildup bounded and naturally pacing compaction to
   // storage write bandwidth. Crash durability stays governed by the WAL and checkpoint msync().
-  if (progress.did_relocate && mem != nullptr && mem->reads.pread_fd >= 0) {
+  if (progress.did_relocate && mem != nullptr && mem->reads.pread_fd() >= 0) {
     const uint64_t sync_end = mem->tail_offset.load(std::memory_order_acquire);
     if (sync_end > sync_begin) {
-      (void)::sync_file_range(mem->reads.pread_fd,
+      (void)::sync_file_range(mem->reads.pread_fd(),
                               static_cast<off_t>(sync_begin),
                               static_cast<off_t>(sync_end - sync_begin),
                               SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER);
