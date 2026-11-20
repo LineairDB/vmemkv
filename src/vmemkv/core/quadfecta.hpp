@@ -484,7 +484,7 @@ class MappedReader {
 };
 
 // Positional sequential stream cursor over a MappedReader (Access::Sequential).
-// Fits cursor-oriented scans (e.g. Lucene IndexInput, RocksDB BlobLogSequentialReader, Git packs).
+// Fits cursor-oriented sequential container and index scans.
 class Cursor {
  public:
   Cursor() noexcept = default;
