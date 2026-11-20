@@ -4,7 +4,8 @@
 // (Access, size <= page_size, Policy):
 // - Random          + <= page: MADV_RANDOM mmap (zero-copy, no readahead pollution)
 // - Random          +  > page: bounded pread() via independent fd + POSIX_FADV_RANDOM
-// - Sequential      +     any: MADV_SEQUENTIAL mmap (wide kernel readahead + dropbehind, lazy VMA)
+// - Sequential      + <= page: MADV_SEQUENTIAL mmap (immediate 128 KiB RA + dropbehind, lazy VMA)
+// - Sequential      +  > page: MADV_NORMAL mmap (expanded adaptive RA + fewer faults, lazy VMA)
 // - SequentialReuse +     any: MADV_NORMAL mmap (adaptive readahead + page retention, lazy VMA)
 //
 // Dependencies: C++20/23 STL + Linux POSIX (<fcntl.h>, <sys/mman.h>, <sys/stat.h>, <unistd.h>).
@@ -45,8 +46,8 @@ static_assert(sizeof(size_t) >= sizeof(uint64_t), "quadfecta requires 64-bit siz
 
 enum class Access : std::uint8_t {
   Random,           // Single-record point access (avoid readahead).
-  Sequential,       // One-shot contiguous range scan (MADV_SEQUENTIAL across all sizes).
-  SequentialReuse,  // Repeatedly scanned contiguous working set (MADV_NORMAL to retain pages).
+  Sequential,       // Contiguous scan: <= page -> MADV_SEQUENTIAL; > page -> MADV_NORMAL.
+  SequentialReuse,  // Reused or multi-MiB sequential working set (always MADV_NORMAL).
 };
 
 enum class Policy : std::uint8_t {
@@ -148,7 +149,7 @@ class MappedReader {
       case Access::Random:
         return is_small ? random_mmap_ : nullptr;
       case Access::Sequential: {
-        std::byte *seq = ensure_sequential_mmap();
+        std::byte *seq = is_small ? ensure_sequential_mmap() : ensure_normal_mmap();
         return seq != nullptr ? seq : random_mmap_;
       }
       case Access::SequentialReuse: {

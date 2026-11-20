@@ -64,20 +64,28 @@ TEST_CASE("Quadfecta: open_readonly serves small and large reads across all poli
 
   std::vector<std::byte> scratch;
   const uint64_t large_len = page_size + 256;
-  // Adaptive Sequential (both small and large) lazily maps sequential_mmap only, leaving normal_mmap unmapped.
-  for (uint64_t seq_len : {uint64_t{64}, large_len}) {
-    const auto seq_view = reader.read(page_size, seq_len, quadfecta::Access::Sequential, &scratch);
-    REQUIRE(seq_view.has_value());
-    CHECK(std::memcmp(seq_view->data(), payload.data() + page_size, seq_len) == 0);
-  }
+  // Adaptive Sequential <= page lazily maps sequential_mmap only, leaving normal_mmap unmapped.
+  const auto small_seq = reader.read(page_size, 64, quadfecta::Access::Sequential, &scratch);
+  REQUIRE(small_seq.has_value());
+  CHECK(std::memcmp(small_seq->data(), payload.data() + page_size, 64) == 0);
   CHECK(reader.peek_sequential_mmap() != nullptr);
   CHECK(reader.peek_normal_mmap() == nullptr);
 
-  // Adaptive SequentialReuse lazily maps normal_mmap regardless of request size.
-  const auto reuse_view = reader.read(128, 64, quadfecta::Access::SequentialReuse, &scratch);
-  REQUIRE(reuse_view.has_value());
-  CHECK(std::memcmp(reuse_view->data(), payload.data() + 128, 64) == 0);
+  // Adaptive Sequential > page lazily maps normal_mmap.
+  const auto large_seq = reader.read(page_size, large_len, quadfecta::Access::Sequential, &scratch);
+  REQUIRE(large_seq.has_value());
+  CHECK(std::memcmp(large_seq->data(), payload.data() + page_size, large_len) == 0);
   CHECK(reader.peek_normal_mmap() != nullptr);
+
+  // Adaptive SequentialReuse lazily maps normal_mmap even for sub-page reads, leaving sequential_mmap unmapped.
+  {
+    auto reuse_reader = quadfecta::MappedReader::open_readonly(path.get());
+    const auto reuse_view = reuse_reader.read(128, 64, quadfecta::Access::SequentialReuse, &scratch);
+    REQUIRE(reuse_view.has_value());
+    CHECK(std::memcmp(reuse_view->data(), payload.data() + 128, 64) == 0);
+    CHECK(reuse_reader.peek_sequential_mmap() == nullptr);
+    CHECK(reuse_reader.peek_normal_mmap() != nullptr);
+  }
 
   for (quadfecta::Policy policy : {quadfecta::Policy::Adaptive,
                                    quadfecta::Policy::RandomOnly,

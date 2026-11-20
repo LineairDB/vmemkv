@@ -22,14 +22,14 @@ Quadfecta eliminates this trade-off by aliasing the same physical file across th
 
 ## 2. Access Routing Specification
 
-In `Policy::Adaptive` (default), `quadfecta::MappedReader` selects one of four read handles by **access pattern** (`Access::Random`, `Access::Sequential`, `Access::SequentialReuse`) and **size threshold** (`max_bytes <= page_size()` vs `> page_size()` for random reads):
+In `Policy::Adaptive` (default), `quadfecta::MappedReader` selects one of four read handles by **access pattern** (`Access::Random`, `Access::Sequential`, `Access::SequentialReuse`) and **size threshold** (`max_bytes <= page_size()` vs `> page_size()`):
 
 | Access Pattern | Record Size | Selected Handle | Kernel / Syscall Behavior |
 | --- | --- | --- | --- |
 | `Access::Random` | `<= page_size()` | `random_mmap` (`MADV_RANDOM`) | Zero-copy read; kernel readahead disabled (`VM_RAND_READ`) |
 | `Access::Random` | `> page_size()` | `pread_fd` (`::pread()`) | Single bounded `::pread()` into caller buffer via independent `POSIX_FADV_RANDOM` fd; skips page faults |
-| `Access::Sequential` | Any (One-Shot) | `sequential_mmap` (`MADV_SEQUENTIAL`) | Zero-copy read; aggressive kernel readahead + dropbehind (`VM_SEQ_READ`) |
-| `Access::SequentialReuse` | Any (Reused) | `normal_mmap` (default advice) | Zero-copy read; standard adaptive kernel readahead + page cache retention |
+| `Access::Sequential` | `<= page_size()` | `sequential_mmap` (`MADV_SEQUENTIAL`) | Zero-copy read; immediate `128 KiB` kernel readahead + dropbehind (`VM_SEQ_READ`) for short scans |
+| `Access::Sequential` / `SequentialReuse` | `> page_size()` (or `SequentialReuse`) | `normal_mmap` (default advice) | Zero-copy read; expanded adaptive kernel readahead (`> 128 KiB`) + page cache retention |
 
 ```mermaid
 flowchart TB
@@ -40,10 +40,12 @@ flowchart TB
     P -->|NormalOnly| NM["normal_mmap (fallback: random_mmap)"]
     P -->|Adaptive| A{Access}
     A -->|Random| RS{max_bytes <= page_size}
-    A -->|Sequential One-Shot| SM
+    A -->|Sequential| SS{max_bytes <= page_size}
     A -->|SequentialReuse| NM
     RS -->|Yes| RM
     RS -->|No| PR2["pread_fd (POSIX_FADV_RANDOM)"]
+    SS -->|Yes| SM
+    SS -->|No| NM
 ```
 
 ### Policy Overrides & Best-Effort Fallbacks
@@ -55,7 +57,7 @@ flowchart TB
 - `Policy::NormalOnly`: Returns `normal_mmap` (lazily mapped on first use), falling back to `random_mmap` if secondary setup failed.
 - `Policy::PreadOnly`: Always executes `::pread()` via the independent `POSIX_FADV_RANDOM` `pread_fd` (using caller `scratch`, or a `thread_local` scratch vector if `scratch == nullptr`).
 - Under `Policy::Adaptive`:
-  - `Access::Sequential` (one-shot scan across any record size) lazily materializes `sequential_mmap`, and `Access::SequentialReuse` (reused sequential working set) lazily materializes `normal_mmap`; both fall back to `random_mmap` if the preferred secondary mapping is `nullptr`.
+  - `Access::Sequential` lazily materializes `sequential_mmap` for `<= page_size()` reads and `normal_mmap` for `> page_size()` reads; `Access::SequentialReuse` lazily materializes `normal_mmap` across all sizes. All fall back to `random_mmap` if the preferred secondary mapping is `nullptr`.
   - `Access::Random` with `max_bytes > page_size()` executes bounded `::pread()` via `pread_fd` (using caller `scratch`, or a `thread_local` fallback vector if `scratch == nullptr`). Use `read_into()` to write directly into a caller buffer without scratch copies.
 
 ---
