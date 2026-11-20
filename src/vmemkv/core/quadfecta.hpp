@@ -2,10 +2,10 @@
 //
 // Maintains up to four OS views over the same backing file, selecting one per read by
 // (Access, size <= page_size, Policy):
-// - Random     + <= page: MADV_RANDOM mmap (zero-copy, no readahead pollution)
-// - Random     +  > page: bounded pread() via independent fd + POSIX_FADV_RANDOM
-// - Sequential + <= page: MADV_SEQUENTIAL mmap (wide kernel readahead, lazy VMA)
-// - Sequential +  > page: normal mmap (default kernel readahead, lazy VMA)
+// - Random          + <= page: MADV_RANDOM mmap (zero-copy, no readahead pollution)
+// - Random          +  > page: bounded pread() via independent fd + POSIX_FADV_RANDOM
+// - Sequential      +     any: MADV_SEQUENTIAL mmap (wide kernel readahead + dropbehind, lazy VMA)
+// - SequentialReuse +     any: MADV_NORMAL mmap (adaptive readahead + page retention, lazy VMA)
 //
 // Dependencies: C++20/23 STL + Linux POSIX (<fcntl.h>, <sys/mman.h>, <sys/stat.h>, <unistd.h>).
 // Thread safety: all const read methods are lock-free on the hot path and thread-safe when callers
@@ -44,8 +44,9 @@ static_assert(sizeof(off_t) >= sizeof(int64_t), "quadfecta requires 64-bit off_t
 static_assert(sizeof(size_t) >= sizeof(uint64_t), "quadfecta requires 64-bit size_t");
 
 enum class Access : std::uint8_t {
-  Random,      // Single-record point access (avoid readahead).
-  Sequential,  // Contiguous range scan (benefit from readahead).
+  Random,           // Single-record point access (avoid readahead).
+  Sequential,       // One-shot contiguous range scan (MADV_SEQUENTIAL across all sizes).
+  SequentialReuse,  // Repeatedly scanned contiguous working set (MADV_NORMAL to retain pages).
 };
 
 enum class Policy : std::uint8_t {
@@ -143,11 +144,19 @@ class MappedReader {
       case Policy::Adaptive:
         break;
     }
-    if (access == Access::Sequential) {
-      std::byte *preferred = is_small ? ensure_sequential_mmap() : ensure_normal_mmap();
-      return preferred != nullptr ? preferred : random_mmap_;
+    switch (access) {
+      case Access::Random:
+        return is_small ? random_mmap_ : nullptr;
+      case Access::Sequential: {
+        std::byte *seq = ensure_sequential_mmap();
+        return seq != nullptr ? seq : random_mmap_;
+      }
+      case Access::SequentialReuse: {
+        std::byte *norm = ensure_normal_mmap();
+        return norm != nullptr ? norm : random_mmap_;
+      }
     }
-    return is_small ? random_mmap_ : nullptr;
+    return nullptr;
   }
 
   // Reads exactly `size` bytes at `offset`. Uses zero-copy mmap when selected, or copies into

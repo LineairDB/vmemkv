@@ -64,12 +64,28 @@ TEST_CASE("Quadfecta: open_readonly serves small and large reads across all poli
 
   std::vector<std::byte> scratch;
   const uint64_t large_len = page_size + 256;
+  // Adaptive Sequential (both small and large) lazily maps sequential_mmap only, leaving normal_mmap unmapped.
+  for (uint64_t seq_len : {uint64_t{64}, large_len}) {
+    const auto seq_view = reader.read(page_size, seq_len, quadfecta::Access::Sequential, &scratch);
+    REQUIRE(seq_view.has_value());
+    CHECK(std::memcmp(seq_view->data(), payload.data() + page_size, seq_len) == 0);
+  }
+  CHECK(reader.peek_sequential_mmap() != nullptr);
+  CHECK(reader.peek_normal_mmap() == nullptr);
+
+  // Adaptive SequentialReuse lazily maps normal_mmap regardless of request size.
+  const auto reuse_view = reader.read(128, 64, quadfecta::Access::SequentialReuse, &scratch);
+  REQUIRE(reuse_view.has_value());
+  CHECK(std::memcmp(reuse_view->data(), payload.data() + 128, 64) == 0);
+  CHECK(reader.peek_normal_mmap() != nullptr);
+
   for (quadfecta::Policy policy : {quadfecta::Policy::Adaptive,
                                    quadfecta::Policy::RandomOnly,
                                    quadfecta::Policy::SeqOnly,
                                    quadfecta::Policy::NormalOnly,
                                    quadfecta::Policy::PreadOnly}) {
-    for (quadfecta::Access access : {quadfecta::Access::Random, quadfecta::Access::Sequential}) {
+    for (quadfecta::Access access :
+         {quadfecta::Access::Random, quadfecta::Access::Sequential, quadfecta::Access::SequentialReuse}) {
       const auto small_view = reader.read(128, 64, access, &scratch, policy);
       REQUIRE(small_view.has_value());
       CHECK(std::memcmp(small_view->data(), payload.data() + 128, 64) == 0);
@@ -79,8 +95,6 @@ TEST_CASE("Quadfecta: open_readonly serves small and large reads across all poli
       CHECK(std::memcmp(large_view->data(), payload.data() + page_size, large_len) == 0);
     }
   }
-  CHECK(reader.peek_sequential_mmap() != nullptr);
-  CHECK(reader.peek_normal_mmap() != nullptr);
   CHECK(reader.sequential_mmap() != nullptr);
   CHECK(reader.normal_mmap() != nullptr);
 
@@ -192,7 +206,7 @@ TEST_CASE("Quadfecta: open_readonly handles missing and empty files and primary-
 
   quadfecta::MappedReader primary_only(bytes, cap);
   CHECK(primary_only.mapping_for(quadfecta::Access::Sequential, true, quadfecta::Policy::Adaptive) == bytes);
-  CHECK(primary_only.mapping_for(quadfecta::Access::Sequential, false, quadfecta::Policy::Adaptive) == bytes);
+  CHECK(primary_only.mapping_for(quadfecta::Access::SequentialReuse, false, quadfecta::Policy::Adaptive) == bytes);
   CHECK(primary_only.mapping_for(quadfecta::Access::Random, true, quadfecta::Policy::SeqOnly) == bytes);
   CHECK(primary_only.mapping_for(quadfecta::Access::Random, true, quadfecta::Policy::NormalOnly) == bytes);
   CHECK_FALSE(primary_only.read(0, 32, quadfecta::Access::Random, &scratch, quadfecta::Policy::PreadOnly).has_value());

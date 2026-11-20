@@ -561,9 +561,9 @@ T2's Immutable Region (`< read_only_offset`, 2.2) never changes after writing, s
 - **Premise**: Immutable/Mutable split (2.2) and forced immutable-region COW detour for in-place updates (3.3).
 - **One record's own length (2.1's Embedded Block Count) selects among the 3 mmap paths plus `pread_fd`**. `madvise` is a VMA (whole-mapping) attribute, not a per-read one, so serving both small and large records well takes multiple paths. Every path points at the same byte run, so a wrong choice only mismatches the readahead policy — data never corrupts:
   - `random_mmap` (main mmap, `MADV_RANDOM`): Get reads of sub-page records. One-op-one-record random access never pays readahead back, so read directly with no seqlock or pread.
-  - `sequential_mmap` (read-only mmap, `MADV_SEQUENTIAL`): Scan reads of sub-page records. A wide readahead window folds many small records' faults into few major faults. Get's read-policy ablation (`SeqOnly`) also pins here.
-  - `normal_mmap` (read-only mmap, kernel default adaptive readahead policy): Scan reads of over-page records.
-  - `pread_fd` (via a `dup()`ed file descriptor, `pread()`): `get_impl()` large-record reads (`> 1 page`), issuing a single bounded read sized by the T1 size hint instead of multi-page synchronous faults.
+  - `sequential_mmap` (read-only mmap, `MADV_SEQUENTIAL`): One-shot contiguous scan reads (`Access::Sequential`, across all record sizes). A wide readahead window folds faults into few major faults and encourages drop-behind. Get's read-policy ablation (`SeqOnly`) also pins here.
+  - `normal_mmap` (read-only mmap, kernel default adaptive readahead policy): Repeatedly accessed sequential working sets (`Access::SequentialReuse`), retaining scanned pages in cache.
+  - `pread_fd` (via an independent `O_RDONLY | O_CLOEXEC` file description with `POSIX_FADV_RANDOM`, `pread()`): `get_impl()` large-record reads (`> 1 page`), issuing a single bounded read sized by the T1 size hint instead of multi-page synchronous faults.
 - Read-policy pins (`ReadPolicy::RandomOnly`, `ReadPolicy::SeqOnly`, `ReadPolicy::NormalOnly`, `ReadPolicy::PreadOnly`) force every immutable-region read through one handle for ablation: `NormalOnly` always uses the plain mapping, `PreadOnly` always preads into a thread-local scratch buffer (falling back to the seqlock path only when pread itself is unavailable). Mutable-region reads keep the seqlock path under every policy.
 - `Scan` uses the master corpus shared with other Ops.
 
